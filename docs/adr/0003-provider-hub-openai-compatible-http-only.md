@@ -1,0 +1,3 @@
+# Provider Hub: OpenAI-compatible HTTP only
+
+All LLM traffic goes through a single Provider Hub — one `reqwest` client, configurable `base_url` + `api_key`, OpenAI chat-completions format, streaming. This covers Ollama, LM Studio, ToshLLM, OpenAI, and Gemini's OpenAI-compat endpoint. Native in-process `llama-cpp-rs` is deferred: it is a second code path with its own model loading and memory management, for a benefit (zero network latency) that does not matter when the user already runs Ollama locally. The Provider trait is the seam where native inference can drop in later without changing the agent loop.

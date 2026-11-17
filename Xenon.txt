@@ -1,0 +1,148 @@
+Xenon
+https://github.com/laiye-ai/open-apa
+https://github.com/cskwork/pet-mochi
+https://github.com/Pranjal578/Personal-AI-Jarvis
+
+# 🚀 Product Requirements Document (PRD): Project Xenon
+**Version:** 1.0 | **Status:** Draft | **Target Architecture:** 100% Rust
+
+## 1. Executive Summary
+**Project Xenon** is a hyper-lightweight, highly intelligent desktop companion designed to rival the fluid UI of *pet-mochi*, the audio fidelity of *Jarvis*, and the agentic capabilities of *Open-APA*. Unlike existing solutions that stitch together heavy Python backends and Electron wrappers, Xenon is engineered from the ground up in **Rust**. This guarantees memory safety, zero-cost abstractions, and a baseline RAM footprint of under 100MB, while maintaining sub-millisecond UI responsiveness and high-fidelity local audio processing.
+
+## 2. Technical Architecture & Stack (100% Rust)
+To achieve the "lightweight yet smart" mandate, Xenon avoids Python entirely. The architecture relies on the modern Rust async ecosystem (`tokio`) and high-performance C/C++ FFI bindings for AI workloads.
+
+| Component | Technology / Crate | Purpose |
+| :--- | :--- | :--- |
+| **Core Runtime** | `tokio` + `async-channel` | Asynchronous task scheduling for UI, Audio, and Agent loops. |
+| **UI Engine** | **Tauri v2** + `Canvas/WebGL` (Minimal JS) | Transparent, always-on-top window. Tauri handles the OS integration in Rust; a tiny web canvas renders the 2D sprite animations to ensure 60FPS fluidity. |
+| **Speech-to-Text (STT)** | **`whisper-rs`** | Rust bindings to `whisper.cpp` [[10]]. Runs locally on CPU/GPU with near-zero latency and no Python overhead. |
+| **Text-to-Speech (TTS)** | **`kalosm-sound`** or `piper-tts` (via FFI) | Local neural TTS engine for human-like, low-latency voice synthesis. |
+| **Agentic Brain** | **`kalosm`** | A local-first AI meta-framework for Rust [[1]]. Handles prompt management, tool calling, and agent memory. |
+| **Computer Vision** | **`xcap`** | Cross-platform screen capture (macOS, Windows, Linux/X11/Wayland) [[16]]. |
+| **Computer Control** | **`enigo`** | Cross-platform simulation of mouse and keyboard events [[25]]. |
+| **LLM Provider Hub** | `reqwest` + `llama-cpp-rs` | Connects to OpenAI-compatible local APIs (Ollama, ToshLLM, LM Studio) or runs `llama.cpp` natively in-process. |
+
+---
+
+## 3. Core Feature Specifications
+
+### 3.1. The "Mochi-Level" Transparent UI
+*   **Requirement:** A frameless, transparent, click-through (when idle) overlay that renders 2D sprite animations.
+*   **Implementation:** Tauri v2 manages the window borders (`decorations: false`, `transparent: true`). The UI layer uses a lightweight `Svelte` or `Vanilla JS` Canvas to draw sprite sheets based on state changes emitted by the Rust backend via WebSockets/Tauri Events.
+*   **States:** `Idle`, `Listening` (Waveform animation), `Thinking` (Pulsing/Processing), `Speaking` (Lip-sync), `Agentic` (Eyes tracking mouse/screenshot activity).
+
+### 3.2. "Jarvis-Level" Audio Pipeline
+*   **Requirement:** Full-duplex audio with Voice Activity Detection (VAD), local STT, and streaming TTS.
+*   **Implementation:**
+    *   **Capture:** `cpal` (Cross-Platform Audio) captures raw PCM streams.
+    *   **VAD:** `webrtcvad-rs` detects when the user starts/stops speaking to trigger the STT engine, saving CPU cycles.
+    *   **STT:** `whisper-rs` transcribes the audio buffer [[10]].
+    *   **TTS:** As the LLM streams tokens, the TTS engine synthesizes audio chunks on the fly, allowing the pet to start speaking before the LLM finishes generating the full sentence.
+
+### 3.3. The "Xen-Agent" (Open-APA Rust Equivalent)
+Open-APA is a Computer-Use Agent (CUA) that takes screenshots, reasons, and clicks. Xenon replicates this via a pure Rust **ReAct (Reasoning + Acting) Loop**:
+1.  **Perception:** When the user asks Xenon to "Open Spotify and play my playlist," the agent triggers `xcap` to take a screenshot [[16]].
+2.  **Grounding (Vision):** The screenshot is base64-encoded and sent to a local Vision-Language Model (VLM) via the provider hub. The VLM returns JSON coordinates (e.g., `{"target": "Spotify Icon", "x": 120, "y": 450}`).
+3.  **Action:** Xenon uses `enigo` to move the mouse and click the coordinates [[25]].
+4.  **Verification:** `xcap` takes a follow-up screenshot to verify the app opened, feeding the result back into the agent's memory context.
+
+### 3.4. Universal Provider Hub
+Xenon must support both local and cloud inference without code changes:
+*   **Local APIs:** Connects to `http://localhost:11434` (Ollama) or ToshLLM endpoints using the standard OpenAI chat-completions format via `reqwest`.
+*   **Native Inference:** Uses `llama-cpp-rs` to load GGUF models directly into memory for maximum privacy and zero network latency.
+*   **Cloud Fallback:** Supports API keys for Gemini, Claude, or OpenAI for heavy vision tasks if local hardware is insufficient.
+
+---
+
+## 4. System Design: The Xenon Pipeline
+
+```rust
+// High-level Tokio Task Architecture
+#[tokio::main]
+async fn main() {
+    let (audio_tx, audio_rx) = async_channel::bounded(32);
+    let (agent_tx, agent_rx) = async_channel::bounded(32);
+
+    // 1. Audio Listener Thread (Non-blocking)
+    tokio::spawn(audio_pipeline(audio_tx));
+    
+    // 2. Agent Brain Thread (CPU Intensive)
+    tokio::spawn(xen_agent_brain(audio_rx, agent_tx));
+    
+    // 3. TTS & UI Sync Thread
+    tokio::spawn(tts_and_ui_sync(agent_rx));
+}
+```
+
+### The Agentic Loop (Rust Implementation Concept)
+```rust
+async fn xen_agent_brain(rx: Receiver<AudioEvent>, tx: Sender<AgentAction>) {
+    let agent = kalosm::Agent::builder()
+        .system_prompt("You are Xenon, a helpful desktop agent. Use tools to control the OS.")
+        .tool(Tool::new("take_screenshot", take_screenshot))
+        .tool(Tool::new("click_mouse", click_mouse))
+        .build();
+
+    while let Ok(event) = rx.recv().await {
+        if let AudioEvent::Speech(text) = event {
+            let mut stream = agent.run(&text).await;
+            while let Some(token) = stream.next().await {
+                // Stream tokens directly to TTS and UI for lip-sync
+                tx.send(AgentAction::Speak(token)).await;
+            }
+        }
+    }
+}
+```
+
+---
+
+## 5. Performance & Resource Budget
+To maintain the "lightweight" promise, Xenon enforces strict memory budgets:
+
+| Component | Idle RAM | Active RAM | Notes |
+| :--- | :--- | :--- | :--- |
+| **Tauri UI + Canvas** | ~25 MB | ~30 MB | Minimal DOM, WebGL for sprites. |
+| **Audio Pipeline (cpal + VAD)** | ~5 MB | ~15 MB | `whisper-rs` only loads model into RAM when VAD triggers. |
+| **Agentic Core (kalosm)** | ~10 MB | ~15 MB | Excludes LLM weights. |
+| **LLM Weights (Local)** | 0 MB | ~4-8 GB | Managed by Ollama/ToshLLM or `llama-cpp-rs` (offloaded when idle). |
+| **Total Baseline (Idle)** | **< 40 MB** | **N/A** | *Massively lighter than Electron/Python equivalents.* |
+
+---
+
+## 6. Development Roadmap
+
+### Phase 1: The Core Shell (Weeks 1-2)
+*   Initialize Tauri v2 workspace.
+*   Implement transparent overlay window and basic 2D sprite rendering.
+*   Build the Provider Hub (`reqwest` wrapper for Ollama/OpenAI APIs).
+
+### Phase 2: The Audio Pipeline (Weeks 3-4)
+*   Integrate `cpal` for microphone capture.
+*   Implement `whisper-rs` for STT and `kalosm-sound`/`piper` for TTS.
+*   Build the WebSocket bridge to sync TTS audio timestamps with sprite lip-sync animations.
+
+### Phase 3: The Xen-Agent (Weeks 5-7)
+*   Integrate `xcap` for screenshots and `enigo` for input simulation.
+*   Build the ReAct loop using `kalosm` to allow the LLM to decide when to take a screenshot or click.
+*   Implement the "Grounding" prompt to parse JSON coordinates from the VLM.
+
+### Phase 4: Optimization & Polish (Weeks 8-9)
+*   Implement VAD (Voice Activity Detection) to stop the STT engine from processing silence.
+*   Add global hotkeys (e.g., `Cmd+Shift+Space` to force-listen).
+*   Optimize Tauri build size and memory footprint.
+
+---
+
+## 7. SWE Challenges & Mitigations
+
+1.  **Challenge:** *Cross-Platform Permissions (macOS/Windows)*
+    *   *Mitigation:* Tauri handles most OS permission prompts, but `enigo` (mouse/keyboard control) requires explicit Accessibility permissions on macOS. The app must include a graceful onboarding flow to guide users to System Settings.
+2.  **Challenge:** *Vision Model Latency*
+    *   *Mitigation:* Sending high-res screenshots to a local VLM can be slow. Xenon must downscale screenshots to `512x512` before base64 encoding to speed up inference while retaining enough detail for UI element grounding.
+3.  **Challenge:** *Rust AI Ecosystem Maturity*
+    *   *Mitigation:* While `kalosm` and `whisper-rs` are powerful [[1]], they may lack the massive community support of Python's `LangChain`. Rely on strict OpenAI-compatible JSON schemas for tool calling to ensure stability.
+
+## 8. Conclusion
+By leveraging **Rust** for the entire pipeline—from the Tauri UI to the `xcap`/`enigo` computer-use agents [[16]]—**Project Xenon** will be the most performant, privacy-respecting, and fluid desktop companion available. It successfully merges the aesthetic of *pet-mochi*, the audio quality of *Jarvis*, and the agentic power of *Open-APA* into a single, sub-100MB executable.

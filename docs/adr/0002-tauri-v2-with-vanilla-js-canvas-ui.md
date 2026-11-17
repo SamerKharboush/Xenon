@@ -1,0 +1,3 @@
+# Tauri v2 + vanilla JS + Canvas for the pet UI
+
+The pet UI is a transparent, frameless, always-on-top Tauri v2 window. The frontend is vanilla JS + Canvas 2D (`requestAnimationFrame`), no Svelte/Vue/React. Five sprite states (Idle/Listening/Thinking/Speaking/Agentic) are driven by Tauri events from the Rust runtime. Svelte was considered and rejected for the vertical slice: the UI is a 5-state sprite, not a complex reactive app, and avoiding a JS build step keeps the bundle minimal. The window uses `decorations: false`, `transparent: true`, `alwaysOnTop: true`, and click-through is toggled at runtime via `set_ignore_cursor_events` (not a config key). `macos-private-api` / `macOSPrivateApi` are no-ops in Tauri 2.12.1+ and are not set.

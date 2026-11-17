@@ -1,0 +1,3 @@
+# Hand-rolled ReAct agent loop, not a framework
+
+The agent loop is written by hand in Rust: call the Provider with a tools schema, parse the tool call, execute it, feed the result back, repeat until a final spoken response. We do not use kalosm, rig, or any agent framework. Two reasons: (1) kalosm has no `Agent` or tool-calling API — the PRD's `kalosm::Agent::builder().tool(...)` is fictional; the actual kalosm surface is completion/chat streams with structured generation, so we would build the loop anyway. (2) The loop is genuinely small (~150 lines) and keeping it ours means the Provider Hub stays the single integration point, with no framework lock-in. A framework for one agent is an unrequested abstraction.

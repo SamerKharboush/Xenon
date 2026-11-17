@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Xenon needs access to the microphone to listen to your voice commands and provide voice assistance.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Xenon needs to capture screenshots to understand what's on your screen and help you with tasks.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Xenon needs to control applications to help you automate tasks and open apps.</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+</dict>
+</plist>

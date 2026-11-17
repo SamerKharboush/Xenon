@@ -1,0 +1,76 @@
+[package]
+name = "xenon"
+version = "0.1.0"
+description = "Project Xenon - Lightweight local-first desktop companion"
+authors = ["Xenon Team"]
+license = "MIT"
+repository = "https://github.com/your-org/xenon"
+edition = "2021"
+rust-version = "1.75"
+
+[lib]
+name = "xenon_lib"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.12" }
+
+# Runtime
+tokio = { version = "1.0", features = ["full"] }
+async-channel = "2.3"
+
+# Audio
+cpal = "0.16"
+whisper-rs = { version = "0.16", features = ["metal"] }
+sherpa-onnx = "2.0.1"
+
+# Enigo for mouse/keyboard
+enigo = "0.6.1"
+
+# HTTP / LLM
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+futures-core = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Image processing
+image = "0.25"
+
+# Async trait
+async-trait = "0.1"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# UUID for IDs
+uuid = { version = "1.0", features = ["v4"] }
+
+# Date/time for filenames
+chrono = "0.4"
+
+# Base64 for images
+base64 = "0.22"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[[bin]]
+name = "xenon"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
