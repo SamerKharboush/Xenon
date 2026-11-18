@@ -14,7 +14,10 @@ use tauri::Manager;
 use runtime::Runtime;
 
 fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let tokio_runtime = tokio::runtime::Runtime::new()?;
+    let _guard = tokio_runtime.enter();
 
     let runtime = Arc::new(Runtime::new()?);
 
@@ -28,14 +31,12 @@ fn main() -> Result<()> {
     tauri::Builder::default()
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();
-
             ui::setup_window(&window)?;
-
             app.manage(ui::AppState::new());
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ui::frontend_ready,
             ui::set_click_through,
             ui::get_pet_state,
             ui::trigger_listen,

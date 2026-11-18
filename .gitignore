@@ -1,0 +1,23 @@
+# Build artifacts
+target/
+gen/
+
+# macOS
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log
+
+# Runtime
+*.dmg
+*.app
+
+# Models (user-provided)
+models/

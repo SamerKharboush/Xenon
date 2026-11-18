@@ -1,5 +1,7 @@
 use anyhow::Result;
-use tauri::{Manager, State, Window};
+use serde::{Deserialize, Serialize};
+use tauri::{Emitter, State, WebviewWindow, Window};
+
 use crate::events::PetState;
 
 pub struct AppState {
@@ -14,9 +16,37 @@ impl AppState {
     }
 }
 
+/// Reported by the frontend on startup so rendering can be verified without
+/// screen capture (which needs Screen Recording permission).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FrontendReady {
+    pub width: u32,
+    pub height: u32,
+    pub opaque_pixels: u32,
+}
+
+#[tauri::command]
+pub fn frontend_ready(report: FrontendReady) {
+    eprintln!(
+        "XENON_FRONTEND_READY canvas={}x{} opaque={}",
+        report.width, report.height, report.opaque_pixels
+    );
+    log::info!(
+        "frontend ready: canvas {}x{}, {} opaque pixels",
+        report.width,
+        report.height,
+        report.opaque_pixels
+    );
+    if report.opaque_pixels == 0 {
+        log::error!("frontend canvas drew nothing");
+    }
+}
+
 #[tauri::command]
 pub fn set_click_through(window: Window, ignore: bool) -> Result<(), String> {
-    window.set_ignore_cursor_events(ignore).map_err(|e| e.to_string())
+    window
+        .set_ignore_cursor_events(ignore)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -26,15 +56,17 @@ pub fn get_pet_state(state: State<'_, AppState>) -> PetState {
 
 #[tauri::command]
 pub async fn trigger_listen(window: Window) -> Result<(), String> {
-    window.emit("pet-state", PetState::Listening).map_err(|e| e.to_string())
+    window
+        .emit("pet-state", PetState::Listening)
+        .map_err(|e| e.to_string())
 }
 
-pub fn setup_window(window: &Window) -> Result<()> {
-    let _ = window.set_always_on_top(true);
-    let _ = window.set_decorations(false);
-    let _ = window.set_transparent(true);
-    let _ = window.set_ignore_cursor_events(true);
-
+pub fn setup_window(window: &WebviewWindow) -> Result<()> {
+    window.set_always_on_top(true)?;
+    window.set_decorations(false)?;
+    // Idle pet is click-through so it never blocks work underneath.
+    window.set_ignore_cursor_events(true)?;
+    window.show()?;
     Ok(())
 }
 
@@ -48,10 +80,19 @@ mod tests {
         assert!(matches!(state.current_state, PetState::Idle));
     }
 
+    /// Ticket 09: window config must stay transparent, frameless, always-on-top.
     #[test]
-    fn test_click_through_command_exists() {
-        let _ = set_click_through;
-        let _ = get_pet_state;
-        let _ = trigger_listen;
+    fn test_window_config_matches_spec() {
+        let raw = include_str!("../tauri.conf.json");
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let win = &value["app"]["windows"][0];
+
+        assert_eq!(win["transparent"], true);
+        assert_eq!(win["decorations"], false);
+        assert_eq!(win["alwaysOnTop"], true);
+        assert_eq!(win["visible"], true);
+        assert_eq!(win["backgroundColor"], serde_json::json!([0, 0, 0, 0]));
+        assert_eq!(value["app"]["withGlobalTauri"], true);
+        assert_eq!(value["build"]["frontendDist"], "../src");
     }
 }

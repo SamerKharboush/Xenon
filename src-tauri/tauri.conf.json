@@ -9,19 +9,18 @@
     "frontendDist": "../src"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
         "title": "Xenon",
         "width": 200,
         "height": 200,
-        "x": 50,
-        "y": 50,
         "resizable": false,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,
-        "visible": false,
+        "visible": true,
         "skipTaskbar": true,
         "acceptFirstMouse": true,
         "backgroundColor": [0, 0, 0, 0]

@@ -16,7 +16,7 @@ path = "src/lib.rs"
 tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
-tauri = { version = "2.12" }
+tauri = { version = "2.12", features = [] }
 
 # Runtime
 tokio = { version = "1.0", features = ["full"] }
@@ -27,11 +27,13 @@ cpal = "0.16"
 whisper-rs = { version = "0.16", features = ["metal"] }
 sherpa-onnx = "2.0.1"
 
-# Enigo for mouse/keyboard
+# Computer control
+xcap = "0.9.10"
 enigo = "0.6.1"
 
 # HTTP / LLM
 reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = "0.3"
 futures-util = "0.3"
 futures-core = "0.3"
 serde = { version = "1.0", features = ["derive"] }

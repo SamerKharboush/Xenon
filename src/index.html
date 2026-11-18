@@ -4,29 +4,25 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Xenon</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        html, body {
-            width: 100%;
-            height: 100%;
-            background: transparent;
-            overflow: hidden;
-        }
-
-        #canvas {
-            display: block;
-            width: 100%;
-            height: 100%;
-        }
-    </style>
+    <link rel="stylesheet" href="/style.css">
+    <script>
+        // Probe A: proves the HTML loaded and the Tauri global exists,
+        // independent of main.js. opaquePixels -1 = HTML only.
+        window.addEventListener('load', function () {
+            try {
+                window.__TAURI__.event.invoke('frontend_ready', {
+                    width: window.innerWidth,
+                    height: window.innerHeight,
+                    opaquePixels: -1
+                });
+            } catch (e) {
+                window.__XENON_PROBE_ERROR__ = String(e);
+            }
+        });
+    </script>
 </head>
 <body>
     <canvas id="canvas"></canvas>
-    <script type="module" src="/src/main.js"></script>
+    <script src="/main.js"></script>
 </body>
 </html>
