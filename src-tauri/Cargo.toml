@@ -1,10 +1,9 @@
 [package]
 name = "xenon"
-version = "0.1.0"
-description = "Project Xenon - Lightweight local-first desktop companion"
-authors = ["Xenon Team"]
+version = "0.2.0"
+description = "Xenon - lightweight local-first desktop companion for macOS"
+authors = ["Xenon contributors"]
 license = "MIT"
-repository = "https://github.com/your-org/xenon"
 edition = "2021"
 rust-version = "1.75"
 

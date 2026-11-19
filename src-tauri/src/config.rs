@@ -271,8 +271,26 @@ impl XenonConfig {
         let path = Self::config_path();
         if path.exists() {
             let mut cfg: XenonConfig = match fs::read_to_string(&path) {
-                Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-                Err(_) => Self::default(),
+                Ok(content) => match serde_json::from_str(&content) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        // A corrupt config would silently wipe every setting
+                        // (API keys, provider profiles, hotkeys) on
+                        // unwrap_or_default. Keep a copy for manual recovery
+                        // and start fresh instead.
+                        let backup = path.with_extension("json.bak");
+                        let _ = fs::copy(&path, &backup);
+                        log::error!(
+                            "config parse failed ({e}); backed up to {} and using defaults",
+                            backup.display()
+                        );
+                        Self::default()
+                    }
+                },
+                Err(e) => {
+                    log::error!("config read failed ({e}); using defaults");
+                    Self::default()
+                }
             };
             cfg.migrate();
             cfg
