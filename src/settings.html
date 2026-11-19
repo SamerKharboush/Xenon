@@ -10,137 +10,138 @@
             padding: 0;
             box-sizing: border-box;
         }
-        
+
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: rgba(20, 20, 30, 0.95);
-            backdrop-filter: blur(20px);
-            color: #e0e0e0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: linear-gradient(160deg, #fffdf7 0%, #fff1e0 100%);
+            color: #3a2b34;
             padding: 20px;
             min-height: 100vh;
         }
-        
+
         .container {
             max-width: 600px;
             margin: 0 auto;
         }
-        
+
         h1 {
             font-size: 24px;
             margin-bottom: 20px;
-            color: #64c8ff;
+            color: #ff7aa1;
         }
-        
+
         .section {
-            background: rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 0.75);
             border-radius: 12px;
             padding: 20px;
             margin-bottom: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 170, 190, 0.35);
         }
-        
+
         .section h2 {
             font-size: 16px;
             margin-bottom: 15px;
-            color: #64c8ff;
+            color: #ff7aa1;
         }
-        
+
         .field {
             margin-bottom: 15px;
         }
-        
+
         .field label {
             display: block;
             margin-bottom: 5px;
             font-size: 14px;
-            color: #b0b0b0;
+            color: #6a5a6a;
         }
-        
+
         .field input,
         .field textarea,
         .field select {
             width: 100%;
             padding: 10px;
-            background: rgba(0, 0, 0, 0.3);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 6px;
-            color: #e0e0e0;
+            background: #ffffff;
+            border: 1px solid #e7d1da;
+            border-radius: 8px;
+            color: #3a2b34;
             font-size: 14px;
             font-family: inherit;
         }
-        
+
         .field textarea {
             min-height: 100px;
             resize: vertical;
         }
-        
+
         .field input:focus,
         .field textarea:focus,
         .field select:focus {
             outline: none;
-            border-color: #64c8ff;
+            border-color: #ff8aa6;
         }
-        
+
         .checkbox-field {
             display: flex;
             align-items: center;
             margin-bottom: 15px;
         }
-        
+
         .checkbox-field input[type="checkbox"] {
             width: auto;
             margin-right: 10px;
         }
-        
+
         .checkbox-field label {
             margin-bottom: 0;
         }
-        
+
         .button-group {
             display: flex;
             gap: 10px;
             justify-content: flex-end;
         }
-        
+
         button {
             padding: 10px 20px;
             border: none;
-            border-radius: 6px;
+            border-radius: 999px;
             font-size: 14px;
             cursor: pointer;
             font-family: inherit;
             transition: all 0.2s;
+            min-height: 32px;
         }
-        
+
         button.primary {
-            background: #64c8ff;
-            color: #000;
+            background: #ff7aa1;
+            color: #ffffff;
         }
-        
+
         button.primary:hover {
-            background: #84d8ff;
+            background: #ff5a85;
         }
-        
+
         button.secondary {
-            background: rgba(255, 255, 255, 0.1);
-            color: #e0e0e0;
+            background: rgba(255, 255, 255, 0.8);
+            color: #3a2b34;
+            border: 1px solid #e7d1da;
         }
-        
+
         button.secondary:hover {
-            background: rgba(255, 255, 255, 0.2);
+            background: rgba(255, 255, 255, 1);
         }
-        
+
         .hint {
             font-size: 12px;
-            color: #888;
+            color: #9a8a9a;
             margin-top: 5px;
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>⚙️ Xenon Settings</h1>
-        
+        <h1>Xenon Settings</h1>
+
         <div class="section">
             <h2>Identity</h2>
             <div class="field">
@@ -154,7 +155,7 @@
                 <div class="hint">Say this to get Xenon's attention</div>
             </div>
         </div>
-        
+
         <div class="section">
             <h2>AI Provider</h2>
             <div class="field">
@@ -173,7 +174,7 @@
                 <div class="hint">Model identifier (use /v1/models to list available)</div>
             </div>
         </div>
-        
+
         <div class="section">
             <h2>Personality</h2>
             <div class="field">
@@ -182,9 +183,9 @@
                 <div class="hint">Customize Xenon's personality and behavior</div>
             </div>
         </div>
-        
+
         <div class="section">
-            <h2>Voice & Audio</h2>
+            <h2>Voice &amp; Audio</h2>
             <div class="checkbox-field">
                 <input type="checkbox" id="voice_enabled">
                 <label for="voice_enabled">Voice output enabled</label>
@@ -225,16 +226,16 @@
                 <input type="text" id="vad_model_path" placeholder="~/models/whisper/ggml-silero-v6.2.0.bin">
             </div>
         </div>
-        
+
         <div class="button-group">
             <button class="secondary" id="cancel">Cancel</button>
             <button class="primary" id="save">Save Settings</button>
         </div>
     </div>
-    
+
     <script>
         const { invoke } = window.__TAURI__.core;
-        
+
         async function loadConfig() {
             try {
                 const config = await invoke('get_config');
@@ -256,7 +257,7 @@
                 console.error('Failed to load config:', e);
             }
         }
-        
+
         async function saveConfig() {
             const newConfig = {
                 pet_name: document.getElementById('pet_name').value,
@@ -274,7 +275,7 @@
                 whisper_model_path: document.getElementById('whisper_model_path').value.trim(),
                 vad_model_path: document.getElementById('vad_model_path').value.trim(),
             };
-            
+
             try {
                 await invoke('update_config', { newConfig });
                 window.close();
@@ -282,10 +283,10 @@
                 alert('Failed to save: ' + e);
             }
         }
-        
+
         document.getElementById('save').addEventListener('click', saveConfig);
         document.getElementById('cancel').addEventListener('click', () => window.close());
-        
+
         loadConfig();
     </script>
 </body>

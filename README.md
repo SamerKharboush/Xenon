@@ -71,6 +71,10 @@ src/
   main.js         - Sprite renderer (5 pet states)
 ```
 
+## Credits
+
+Pet sprite artwork (`src/sprites/`) is from [pet-mochi](https://github.com/cskwork/pet-mochi) (MIT License, Copyright (c) 2026 cskwork). See `THIRD_PARTY_NOTICES.md` for full license text.
+
 ## License
 
 MIT
