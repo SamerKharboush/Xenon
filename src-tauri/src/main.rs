@@ -10,7 +10,7 @@ mod tts;
 mod ui;
 
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Manager, Runtime as TauriRuntime};
 use tokio::sync::RwLock;
 
 use runtime::Runtime;
@@ -46,6 +46,9 @@ fn main() -> anyhow::Result<()> {
             // Keep the runtime alive for the lifetime of the app.
             app.manage(runtime);
 
+            // macOS menu-bar tray (skipTaskbar means the Dock is hidden).
+            setup_tray(app)?;
+
             // `xenon --debug-open-settings` opens the settings window at
             // startup; used to verify it renders without needing a real click.
             if std::env::args().any(|a| a == "--debug-open-settings") {
@@ -67,8 +70,76 @@ fn main() -> anyhow::Result<()> {
             ui::update_config,
             ui::open_settings,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, _event| {});
 
     Ok(())
+}
+
+fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let show_item = MenuItem::with_id(app, "show", "Show Pet", true, None::<&str>)?;
+    let talk_item = MenuItem::with_id(app, "talk", "Talk", true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(app, &[&show_item, &talk_item, &settings_item, &sep, &quit_item])?;
+
+    let mut builder = TrayIconBuilder::with_id("main")
+        .tooltip("Xenon")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .icon_as_template(true);
+
+    if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png")) {
+        builder = builder.icon(icon);
+    }
+
+    builder
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => toggle_pet_visibility(app, true),
+            "talk" => {
+                if let Some(state) = app.try_state::<ui::AppState>() {
+                    let _ = state.audio_tx.try_send(events::AudioEvent::Greet);
+                }
+            }
+            "settings" => {
+                let _ = ui::open_settings(app.app_handle().clone());
+            }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_pet_visibility(tray.app_handle(), false);
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
+
+fn toggle_pet_visibility<R: TauriRuntime>(app: &tauri::AppHandle<R>, show: bool) {
+    if let Some(window) = app.get_webview_window("main") {
+        let visible = window.is_visible().unwrap_or(true);
+        if show && !visible {
+            let _ = window.show();
+            let _ = window.set_focus();
+        } else if !show && visible {
+            let _ = window.hide();
+        } else if !show && !visible {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
 }

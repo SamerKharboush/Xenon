@@ -6,14 +6,14 @@
     <title>Xenon</title>
     <link rel="stylesheet" href="/style.css">
     <script>
-        // Probe A: proves the HTML loaded and the Tauri global exists,
-        // independent of main.js. opaquePixels -1 = HTML only.
         window.addEventListener('load', function () {
             try {
                 window.__TAURI__.core.invoke('frontend_ready', {
-                    width: window.innerWidth,
-                    height: window.innerHeight,
-                    opaquePixels: -1
+                    report: {
+                        width: window.innerWidth,
+                        height: window.innerHeight,
+                        opaquePixels: -1
+                    }
                 });
             } catch (e) {
                 window.__XENON_PROBE_ERROR__ = String(e);
@@ -23,6 +23,6 @@
 </head>
 <body>
     <canvas id="canvas"></canvas>
-    <script src="/main.js"></script>
+    <script type="module" src="/pet/renderer.js"></script>
 </body>
 </html>

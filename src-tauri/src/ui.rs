@@ -24,6 +24,7 @@ impl AppState {
 /// Reported by the frontend on startup so rendering can be verified without
 /// screen capture (which needs Screen Recording permission).
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FrontendReady {
     pub width: u32,
     pub height: u32,
@@ -148,12 +149,14 @@ fn spawn_hit_test(window: WebviewWindow) {
             };
 
             let cx = wx + size.0 / 2.0;
-            let cy = wy + size.1 / 2.0;
+            // Pet is anchored bottom-center; its feet sit ~30px above the
+            // window bottom. Center hit-test on that lower region.
+            let cy = wy + size.1 - 100.0;
             let dx = cursor.x - cx;
             let dy = cursor.y - cy;
 
-            // Pet body is ~30px radius; pad it so the glow is clickable too.
-            let hit_radius = (size.0.min(size.1) / 2.0).max(48.0);
+            // Pet body is ~120px tall / ~120px wide when drawn at 240px sprite.
+            let hit_radius = 90.0_f64.max(size.0.min(size.1) / 2.0);
             let over_pet = (dx * dx + dy * dy) <= hit_radius * hit_radius;
 
             let should_ignore = !over_pet;
@@ -212,5 +215,11 @@ mod tests {
         assert_eq!(win["backgroundColor"], serde_json::json!([0, 0, 0, 0]));
         assert_eq!(value["app"]["withGlobalTauri"], true);
         assert_eq!(value["build"]["frontendDist"], "../src");
+
+        // Task 5: enlarged to 320x300 so the pet + speech bubble fit above.
+        let width = win["width"].as_u64().expect("width");
+        let height = win["height"].as_u64().expect("height");
+        assert!(width >= 320, "window too narrow for pet + bubble: {width}");
+        assert!(height >= 280, "window too short for pet + bubble: {height}");
     }
 }

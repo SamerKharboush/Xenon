@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "Xenon",
-        "width": 200,
-        "height": 200,
+        "width": 320,
+        "height": 300,
         "resizable": false,
         "decorations": false,
         "transparent": true,
