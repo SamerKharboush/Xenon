@@ -8,12 +8,16 @@ impl TtsEngine {
     }
 
     pub fn synthesize(&self, text: &str) -> Result<Vec<f32>> {
-        let _ = text;
+        log::info!("TTS: {}", text);
+        // Placeholder: needs sherpa-onnx TTS integration
+        // For now, just log and return silence
         Ok(vec![0.0; 1000])
     }
 
     pub fn speak(&self, text: &str) -> Result<()> {
+        log::info!("Speaking: {}", text);
         let _ = self.synthesize(text)?;
+        // Placeholder: needs cpal output stream + audio playback
         Ok(())
     }
 }

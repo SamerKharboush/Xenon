@@ -62,6 +62,13 @@ chrono = "0.4"
 # Base64 for images
 base64 = "0.22"
 
+# Config directory
+dirs = "5.0"
+
+# Global cursor position for click-through hit-testing.
+# CGEventGetLocation needs no Accessibility grant (unlike enigo input synthesis).
+core-graphics = "0.24"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

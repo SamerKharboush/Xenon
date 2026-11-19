@@ -1,12 +1,11 @@
-use anyhow::Result;
 use async_channel::{bounded, Receiver, Sender};
 use std::sync::Arc;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
 
 use crate::agent::Agent;
-use crate::audio::AudioPipeline;
+use crate::config::XenonConfig;
 use crate::events::{AgentAction, AudioEvent, PetState};
-use crate::grounding;
 use crate::provider::{OpenAICompatProvider, Provider};
 use crate::tools;
 use crate::tts::TtsEngine;
@@ -14,149 +13,240 @@ use crate::tts::TtsEngine;
 pub struct Runtime {
     audio_tx: Sender<AudioEvent>,
     audio_rx: Receiver<AudioEvent>,
-    agent_tx: Sender<AgentAction>,
-    agent_rx: Receiver<AgentAction>,
+    action_tx: Sender<AgentAction>,
+    action_rx: Receiver<AgentAction>,
     state: Arc<RwLock<PetState>>,
-    provider: Arc<dyn Provider>,
-    tools: Vec<Box<dyn tools::Tool>>,
+    config: Arc<RwLock<XenonConfig>>,
+    /// `None` in tests (no Tauri app), `Some` in production.
+    app: Option<AppHandle>,
     tts: Arc<TtsEngine>,
 }
 
 impl Runtime {
-    pub fn new() -> Result<Self> {
+    pub fn new(config: Arc<RwLock<XenonConfig>>) -> Self {
         let (audio_tx, audio_rx) = bounded(32);
-        let (agent_tx, agent_rx) = bounded(32);
+        let (action_tx, action_rx) = bounded(32);
 
-        let provider: Arc<dyn Provider> = Arc::new(OpenAICompatProvider::from_env()?);
-
-        let default_tools = tools::create_default_tools();
-
-        let tts = Arc::new(TtsEngine::new());
-
-        Ok(Self {
+        Self {
             audio_tx,
             audio_rx,
-            agent_tx,
-            agent_rx,
+            action_tx,
+            action_rx,
             state: Arc::new(RwLock::new(PetState::Idle)),
-            provider,
-            tools: default_tools,
-            tts,
-        })
+            config,
+            app: None,
+            tts: Arc::new(TtsEngine::new()),
+        }
     }
 
-    pub async fn start(&self) -> Result<()> {
-        let audio_pipeline = AudioPipeline::new(self.audio_tx.clone());
-        audio_pipeline.start().await?;
+    /// Attach the Tauri AppHandle so the presentation loop can emit
+    /// `pet-state` / `pet-speech` events to the frontend.
+    pub fn attach_app(&mut self, app: AppHandle) {
+        self.app = Some(app);
+    }
 
-        let agent_rx = self.agent_rx.clone();
-        let agent_tx = self.agent_tx.clone();
-        let provider = self.provider.clone();
-        let tools = self.tools.clone();
+    /// Spawn the presentation and audio loops.  Call once after
+    /// `attach_app`.
+    pub fn start(&self) {
+        let action_rx = self.action_rx.clone();
+        let state = self.state.clone();
+        let app = self.app.clone();
         let tts = self.tts.clone();
-
-        tokio::spawn(async move {
-            Self::agent_loop(agent_rx, agent_tx, provider, tools, tts).await;
+        tauri::async_runtime::spawn(async move {
+            Self::presentation_loop(action_rx, state, app, tts).await;
         });
 
         let audio_rx = self.audio_rx.clone();
-        let agent_tx = self.agent_tx.clone();
-        let provider = self.provider.clone();
-        let tools = self.tools.clone();
-
-        tokio::spawn(async move {
-            Self::audio_loop(audio_rx, agent_tx, provider, tools).await;
+        let action_tx = self.action_tx.clone();
+        let config = self.config.clone();
+        tauri::async_runtime::spawn(async move {
+            Self::audio_loop(audio_rx, action_tx, config).await;
         });
-
-        Ok(())
     }
 
-    async fn agent_loop(
-        agent_rx: Receiver<AgentAction>,
-        agent_tx: Sender<AgentAction>,
-        _provider: Arc<dyn Provider>,
-        _tools: Vec<Box<dyn tools::Tool>>,
+    /// Consume `AgentAction`s, update shared pet state, emit `pet-state` /
+    /// `pet-speech` to the frontend, and drive the TTS seam.
+    async fn presentation_loop(
+        action_rx: Receiver<AgentAction>,
+        state: Arc<RwLock<PetState>>,
+        app: Option<AppHandle>,
         tts: Arc<TtsEngine>,
     ) {
-        while let Ok(action) = agent_rx.recv().await {
-            match action {
-                AgentAction::Speak(text) => {
-                    let _ = tts.speak(&text);
-                    let _ = agent_tx.send(AgentAction::SetPetState(PetState::Speaking)).await;
+        while let Ok(action) = action_rx.recv().await {
+            let next = match &action {
+                AgentAction::Speak(_) => Some(PetState::Speaking),
+                AgentAction::SetPetState(s) => Some(s.clone()),
+                AgentAction::ExecuteTool(_) => Some(PetState::Agentic),
+                AgentAction::ToolResult(_) => Some(PetState::Thinking),
+                AgentAction::TurnFinished => Some(PetState::Idle),
+            };
+
+            if let Some(new_state) = next {
+                let mut guard = state.write().await;
+                if *guard != new_state {
+                    *guard = new_state.clone();
+                    drop(guard);
+                    if let Some(app) = &app {
+                        let _ = app.emit("pet-state", &new_state);
+                    }
+                } else {
+                    drop(guard);
                 }
-                AgentAction::SetPetState(state) => {
-                    let _ = agent_tx.send(AgentAction::SetPetState(state)).await;
-                }
-                AgentAction::ExecuteTool(_) => {
-                    let _ = agent_tx.send(AgentAction::SetPetState(PetState::Agentic)).await;
-                }
-                AgentAction::ToolResult(_) => {
-                    let _ = agent_tx.send(AgentAction::SetPetState(PetState::Thinking)).await;
+            }
+
+            if let AgentAction::Speak(text) = &action {
+                // TTS seam: real synthesis is a future task.
+                let _ = tts.speak(text);
+                if let Some(app) = &app {
+                    let _ = app.emit("pet-speech", text.as_str());
                 }
             }
         }
     }
 
+    /// Consume `AudioEvent`s, run the agent for each utterance / greeting,
+    /// and forward resulting `AgentAction`s to the presentation loop.
     async fn audio_loop(
         audio_rx: Receiver<AudioEvent>,
-        agent_tx: Sender<AgentAction>,
-        provider: Arc<dyn Provider>,
-        tools: Vec<Box<dyn tools::Tool>>,
+        action_tx: Sender<AgentAction>,
+        config: Arc<RwLock<XenonConfig>>,
     ) {
         while let Ok(event) = audio_rx.recv().await {
             match event {
                 AudioEvent::Speech(utterance) => {
-                    let _ = agent_tx.send(AgentAction::SetPetState(PetState::Thinking)).await;
-
-                    let mut agent = Agent::new(
-                        Box::new(OpenAICompatProvider {
-                            client: reqwest::Client::new(),
-                            base_url: std::env::var("XENON_PROVIDER_URL")
-                                .unwrap_or_else(|_| "http://localhost:11434".to_string()),
-                            api_key: std::env::var("XENON_PROVIDER_API_KEY").ok(),
-                        }),
-                        tools.clone(),
+                    Self::run_agent(&utterance.text, &action_tx, &config).await;
+                }
+                AudioEvent::Greet => {
+                    let cfg = config.read().await;
+                    let greeting = format!(
+                        "The user just tapped you. Greet them warmly in one short sentence and mention you are {} ready to help.",
+                        cfg.pet_name
                     );
-
-                    let actions = agent.run_utterance(&utterance.text).await;
-
-                    if let Ok(actions) = actions {
-                        for action in actions {
-                            let _ = agent_tx.send(action).await;
-                        }
-                    }
+                    drop(cfg);
+                    Self::run_agent(&greeting, &action_tx, &config).await;
                 }
                 AudioEvent::Silence => {
-                    let _ = agent_tx.send(AgentAction::SetPetState(PetState::Idle)).await;
+                    // No-op: the stub audio pipeline never emits Silence.
                 }
             }
         }
     }
 
-    pub fn get_state(&self) -> Arc<RwLock<PetState>> {
-        self.state.clone()
+    async fn run_agent(text: &str, action_tx: &Sender<AgentAction>, config: &Arc<RwLock<XenonConfig>>) {
+        let cfg = config.read().await.clone();
+        let provider: Arc<dyn Provider> = Arc::new(OpenAICompatProvider::new(
+            cfg.provider.provider_url.clone(),
+            cfg.provider.provider_api_key.clone(),
+        ));
+        let agent_tools = tools::create_default_tools();
+        let agent = Agent::new(provider, agent_tools, cfg);
+
+        if let Err(e) = agent.run_utterance(text, action_tx.clone()).await {
+            log::error!("Agent error: {}", e);
+            let _ = action_tx
+                .send(AgentAction::Speak(
+                    "I encountered an error processing that request.".to_string(),
+                ))
+                .await;
+            let _ = action_tx.send(AgentAction::TurnFinished).await;
+        }
     }
 
-    pub async fn set_state(&self, state: PetState) {
-        let mut s = self.state.write().await;
-        *s = state;
+    /// Clone of the audio channel, so Tauri commands can inject utterances
+    /// (pet taps, text input, wake word) without owning the Runtime.
+    pub fn audio_sender(&self) -> Sender<AudioEvent> {
+        self.audio_tx.clone()
+    }
+
+    fn state(&self) -> Arc<RwLock<PetState>> {
+        self.state.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{AudioEvent, Utterance};
+
+    fn test_runtime() -> Runtime {
+        Runtime::new(Arc::new(RwLock::new(XenonConfig::default())))
+    }
 
     #[tokio::test]
     async fn test_runtime_creation() {
-        let runtime = Runtime::new();
-        assert!(runtime.is_ok());
+        let runtime = test_runtime();
+        // state starts at Idle
+        let s = runtime.state().read().await.clone();
+        assert!(matches!(s, PetState::Idle));
     }
 
     #[tokio::test]
     async fn test_runtime_start() {
-        let runtime = Runtime::new().unwrap();
-        let result = runtime.start().await;
-        assert!(result.is_ok());
+        let runtime = test_runtime();
+        runtime.start();
+        // No panic = success.
+    }
+
+    /// A Greet event must reach the agent loop and come back as pet state
+    /// changes, proving the audio channel is wired to the agent (ticket 10).
+    ///
+    /// Uses a black-hole provider URL so the Thinking state stays observable
+    /// while the HTTP connection times out.
+    #[tokio::test]
+    async fn test_greet_event_reaches_agent_loop() {
+        let mut cfg = XenonConfig::default();
+        cfg.provider.provider_url = "http://192.0.2.1:9".to_string(); // TEST-NET-1, non-routable
+        let config = Arc::new(RwLock::new(cfg));
+        let runtime = Runtime::new(config);
+        runtime.start();
+
+        let state = runtime.state();
+        runtime
+            .audio_sender()
+            .send(AudioEvent::Greet)
+            .await
+            .unwrap();
+
+        let mut saw_thinking = false;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let s = state.read().await.clone();
+            if matches!(s, PetState::Thinking) {
+                saw_thinking = true;
+                break;
+            }
+        }
+        assert!(saw_thinking, "Greet should push the pet into Thinking");
+    }
+
+    /// A Speech event must also drive the state machine through Thinking.
+    #[tokio::test]
+    async fn test_speech_event_reaches_agent_loop() {
+        let mut cfg = XenonConfig::default();
+        cfg.provider.provider_url = "http://192.0.2.1:9".to_string();
+        let config = Arc::new(RwLock::new(cfg));
+        let runtime = Runtime::new(config);
+        runtime.start();
+
+        let state = runtime.state();
+        runtime
+            .audio_sender()
+            .send(AudioEvent::Speech(Utterance {
+                text: "Hello".to_string(),
+                confidence: 1.0,
+            }))
+            .await
+            .unwrap();
+
+        let mut saw_thinking = false;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let s = state.read().await.clone();
+            if matches!(s, PetState::Thinking) {
+                saw_thinking = true;
+                break;
+            }
+        }
+        assert!(saw_thinking, "Speech should push the pet into Thinking");
     }
 }

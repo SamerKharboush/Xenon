@@ -1,18 +1,11 @@
-use crate::*;
+//! Xenon library crate.
+//!
+//! All modules are declared in `main.rs` (the binary) because Tauri's
+//! `generate_context!` macro and `tauri::generate_handler!` need them in
+//! the binary crate.  This library exists only to satisfy Cargo's `[lib]`
+//! target; it intentionally re-exports nothing to avoid double-compiling
+//! the module tree.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_events_types() {
-        let audio_event = AudioEvent::Speech(Utterance {
-            text: "Hello".to_string(),
-            confidence: 0.9,
-        });
-        assert!(matches!(audio_event, AudioEvent::Speech(_)));
-
-        let agent_action = AgentAction::Speak("Hello".to_string());
-        assert!(matches!(agent_action, AgentAction::Speak(_)));
-    }
-}
+/// Placeholder so the crate has at least one item.
+#[allow(dead_code)]
+fn _lib_placeholder() {}

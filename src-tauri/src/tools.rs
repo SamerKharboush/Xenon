@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use enigo::Mouse;
 use serde_json::Value;
 use std::process::Command;
 
-use crate::events::{ToolCall, ToolResult};
+use crate::events::ToolResult;
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -25,6 +26,53 @@ impl TakeScreenshotTool {
 
 #[async_trait]
 impl Tool for TakeScreenshotTool {
+    fn name(&self) -> &str {
+        "take_screenshot"
+    }
+
+    fn description(&self) -> &str {
+        "Take a screenshot of the current screen. Returns the path to the saved screenshot file."
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "monitor": {
+                    "type": "integer",
+                    "description": "Monitor index (0 = primary, 1 = secondary, etc.)"
+                }
+            },
+            "required": []
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolResult> {
+        let monitor_idx = args["monitor"].as_u64().unwrap_or(0) as usize;
+
+        let monitors = xcap::Monitor::all()?;
+        let monitor = monitors
+            .get(monitor_idx)
+            .ok_or_else(|| anyhow!("Monitor {} not found", monitor_idx))?;
+
+        let image = monitor.capture_image()?;
+        let filename = format!("{}/screenshot_{}.png", self.output_dir, chrono::Utc::now().timestamp());
+        image.save(&filename)?;
+
+        Ok(ToolResult {
+            call_id: String::new(),
+            result: serde_json::json!({
+                "path": filename,
+                "width": image.width(),
+                "height": image.height()
+            }),
+            is_error: false,
+            error_message: None,
+        })
+    }
+}
+
+pub struct ClickMouseTool;
 
 impl ClickMouseTool {
     pub fn new() -> Self {
@@ -79,9 +127,9 @@ impl Tool for ClickMouseTool {
         enigo.move_mouse(x, y, enigo::Coordinate::Abs)?;
 
         match button {
-            "left" => enigo.button(enigo::Button::Left, enigo::ButtonFunction::Click)?,
-            "right" => enigo.button(enigo::Button::Right, enigo::ButtonFunction::Click)?,
-            "middle" => enigo.button(enigo::Button::Middle, enigo::ButtonFunction::Click)?,
+            "left" => enigo.button(enigo::Button::Left, enigo::Direction::Click)?,
+            "right" => enigo.button(enigo::Button::Right, enigo::Direction::Click)?,
+            "middle" => enigo.button(enigo::Button::Middle, enigo::Direction::Click)?,
             _ => return Err(anyhow!("Invalid button: {}", button)),
         }
 

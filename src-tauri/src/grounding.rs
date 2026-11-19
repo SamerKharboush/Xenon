@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use image::{DynamicImage, GenericImageView, ImageFormat};
+use enigo::Mouse;
+use image::ImageFormat;
 use std::io::Cursor;
 
 use crate::events::PetState;
@@ -29,7 +30,7 @@ pub async fn ground_and_click(
     let mut enigo = enigo;
 
     enigo.move_mouse(coords.x, coords.y, enigo::Coordinate::Abs)?;
-    enigo.button(enigo::Button::Left, enigo::ButtonFunction::Click)?;
+    enigo.button(enigo::Button::Left, enigo::Direction::Click)?;
 
     Ok(GroundingResult {
         success: true,
@@ -100,7 +101,7 @@ fn parse_grounding_response(response: &str) -> Result<GroundingCoords> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ChatMessage, ChatRequest, ChatResponse, ChatRequestWithTools, ChatStream};
+    use crate::provider::{ChatRequest, ChatStream};
     use async_trait::async_trait;
 
     struct MockProvider {
@@ -110,13 +111,6 @@ mod tests {
     #[async_trait]
     impl Provider for MockProvider {
         async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream> {
-            unimplemented!()
-        }
-
-        async fn chat_with_tools(
-            &self,
-            _req: ChatRequestWithTools,
-        ) -> Result<ChatResponse> {
             unimplemented!()
         }
 

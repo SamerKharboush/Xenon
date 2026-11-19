@@ -10,7 +10,7 @@
         // independent of main.js. opaquePixels -1 = HTML only.
         window.addEventListener('load', function () {
             try {
-                window.__TAURI__.event.invoke('frontend_ready', {
+                window.__TAURI__.core.invoke('frontend_ready', {
                     width: window.innerWidth,
                     height: window.innerHeight,
                     opaquePixels: -1

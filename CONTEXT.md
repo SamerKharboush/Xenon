@@ -109,11 +109,11 @@ The Tokio-based Rust core that owns the audio pipeline, the agent loop, and the 
 _Avoid_: the backend, the engine, the core, the server
 
 **Audio Event**:
-A message on the audio channel — `Speech(Utterance)` or `Silence`. Produced by the Audio Pipeline, consumed by the agent loop.
+A message on the audio channel — `Speech(Utterance)`, `Silence`, or `Greet`. Produced by the Audio Pipeline (or Tauri commands like `pet_tap`), consumed by the agent loop.
 _Avoid_: voice event, mic event, input event
 
 **Agent Action**:
-A message on the agent channel — `Speak(String)`, `SetPetState(PetState)`, `ExecuteTool(ToolCall)`. Produced by the agent loop, consumed by the TTS/UI sync.
+A message on the agent channel — `Speak(String)`, `SetPetState(PetState)`, `ExecuteTool(ToolCall)`, `ToolResult(ToolResult)`, `TurnFinished`. Produced by the agent loop, consumed by the presentation loop (TTS/UI sync).
 _Avoid_: command, output event, response event
 
 ### Build & Distribution

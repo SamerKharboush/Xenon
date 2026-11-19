@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub enum AudioEvent {
     Speech(Utterance),
     Silence,
+    /// User tapped the pet: greet them by name.
+    Greet,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,13 +16,19 @@ pub struct Utterance {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentAction {
+    /// One sentence of the final spoken reply.
     Speak(String),
+    /// Keep the pet in the given Pet State (used at turn start: Thinking).
     SetPetState(PetState),
+    /// A tool is about to run (pet goes Agentic).
     ExecuteTool(ToolCall),
+    /// A tool finished; `is_error` results are also fed back to the model.
     ToolResult(ToolResult),
+    /// The agent turn is over; the pet returns to Idle.
+    TurnFinished,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PetState {
     Idle,
     Listening,

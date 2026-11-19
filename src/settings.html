@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Xenon Settings</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: rgba(20, 20, 30, 0.95);
+            backdrop-filter: blur(20px);
+            color: #e0e0e0;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            font-size: 24px;
+            margin-bottom: 20px;
+            color: #64c8ff;
+        }
+        
+        .section {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .section h2 {
+            font-size: 16px;
+            margin-bottom: 15px;
+            color: #64c8ff;
+        }
+        
+        .field {
+            margin-bottom: 15px;
+        }
+        
+        .field label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 14px;
+            color: #b0b0b0;
+        }
+        
+        .field input,
+        .field textarea,
+        .field select {
+            width: 100%;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 6px;
+            color: #e0e0e0;
+            font-size: 14px;
+            font-family: inherit;
+        }
+        
+        .field textarea {
+            min-height: 100px;
+            resize: vertical;
+        }
+        
+        .field input:focus,
+        .field textarea:focus,
+        .field select:focus {
+            outline: none;
+            border-color: #64c8ff;
+        }
+        
+        .checkbox-field {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .checkbox-field input[type="checkbox"] {
+            width: auto;
+            margin-right: 10px;
+        }
+        
+        .checkbox-field label {
+            margin-bottom: 0;
+        }
+        
+        .button-group {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: pointer;
+            font-family: inherit;
+            transition: all 0.2s;
+        }
+        
+        button.primary {
+            background: #64c8ff;
+            color: #000;
+        }
+        
+        button.primary:hover {
+            background: #84d8ff;
+        }
+        
+        button.secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: #e0e0e0;
+        }
+        
+        button.secondary:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        
+        .hint {
+            font-size: 12px;
+            color: #888;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚙️ Xenon Settings</h1>
+        
+        <div class="section">
+            <h2>Identity</h2>
+            <div class="field">
+                <label for="pet_name">Pet Name</label>
+                <input type="text" id="pet_name" placeholder="Xenon">
+                <div class="hint">The name your companion responds to</div>
+            </div>
+            <div class="field">
+                <label for="wake_word">Wake Word</label>
+                <input type="text" id="wake_word" placeholder="Xenon">
+                <div class="hint">Say this to get Xenon's attention</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>AI Provider</h2>
+            <div class="field">
+                <label for="provider_url">Provider URL</label>
+                <input type="text" id="provider_url" placeholder="http://localhost:11434">
+                <div class="hint">OpenAI-compatible endpoint (Ollama, LM Studio, ToshLLM, etc.)</div>
+            </div>
+            <div class="field">
+                <label for="provider_api_key">API Key (optional)</label>
+                <input type="password" id="provider_api_key" placeholder="sk-...">
+                <div class="hint">Leave empty for local providers</div>
+            </div>
+            <div class="field">
+                <label for="model_name">Model Name</label>
+                <input type="text" id="model_name" placeholder="local-model">
+                <div class="hint">Model identifier (use /v1/models to list available)</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>Personality</h2>
+            <div class="field">
+                <label for="system_prompt">System Prompt</label>
+                <textarea id="system_prompt" rows="6"></textarea>
+                <div class="hint">Customize Xenon's personality and behavior</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>Voice & Audio</h2>
+            <div class="checkbox-field">
+                <input type="checkbox" id="voice_enabled">
+                <label for="voice_enabled">Voice output enabled</label>
+            </div>
+            <div class="checkbox-field">
+                <input type="checkbox" id="wake_word_enabled">
+                <label for="wake_word_enabled">Wake word detection enabled</label>
+            </div>
+        </div>
+        
+        <div class="button-group">
+            <button class="secondary" id="cancel">Cancel</button>
+            <button class="primary" id="save">Save Settings</button>
+        </div>
+    </div>
+    
+    <script>
+        const { invoke } = window.__TAURI__.core;
+        
+        async function loadConfig() {
+            try {
+                const config = await invoke('get_config');
+                document.getElementById('pet_name').value = config.pet_name || 'Xenon';
+                document.getElementById('wake_word').value = config.wake_word || 'Xenon';
+                document.getElementById('provider_url').value = config.provider_url || 'http://localhost:11434';
+                document.getElementById('provider_api_key').value = config.provider_api_key || '';
+                document.getElementById('model_name').value = config.model_name || 'local-model';
+                document.getElementById('system_prompt').value = config.system_prompt || '';
+                document.getElementById('voice_enabled').checked = config.voice_enabled !== false;
+                document.getElementById('wake_word_enabled').checked = config.wake_word_enabled !== false;
+            } catch (e) {
+                console.error('Failed to load config:', e);
+            }
+        }
+        
+        async function saveConfig() {
+            const newConfig = {
+                pet_name: document.getElementById('pet_name').value,
+                wake_word: document.getElementById('wake_word').value,
+                provider_url: document.getElementById('provider_url').value,
+                provider_api_key: document.getElementById('provider_api_key').value || null,
+                model_name: document.getElementById('model_name').value,
+                system_prompt: document.getElementById('system_prompt').value,
+                voice_enabled: document.getElementById('voice_enabled').checked,
+                wake_word_enabled: document.getElementById('wake_word_enabled').checked,
+            };
+            
+            try {
+                await invoke('update_config', { newConfig });
+                window.close();
+            } catch (e) {
+                alert('Failed to save: ' + e);
+            }
+        }
+        
+        document.getElementById('save').addEventListener('click', saveConfig);
+        document.getElementById('cancel').addEventListener('click', () => window.close());
+        
+        loadConfig();
+    </script>
+</body>
+</html>

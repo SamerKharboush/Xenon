@@ -24,6 +24,17 @@
         "skipTaskbar": true,
         "acceptFirstMouse": true,
         "backgroundColor": [0, 0, 0, 0]
+      },
+      {
+        "label": "settings",
+        "title": "Xenon Settings",
+        "url": "settings.html",
+        "width": 650,
+        "height": 750,
+        "resizable": true,
+        "decorations": true,
+        "transparent": false,
+        "visible": false
       }
     ],
     "security": {
