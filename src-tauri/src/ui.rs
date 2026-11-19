@@ -96,27 +96,70 @@ pub async fn get_config(
 }
 
 /// Persist *new_config* and apply it to the shared config so the next
-/// agent turn picks up the new provider / model / prompt live.
+/// agent turn picks up the new provider / model / prompt live. The pet
+/// renderer gets the new Performance toggles via a `pet-config` event.
 #[tauri::command]
 pub async fn update_config(
+    app: tauri::AppHandle,
     config: State<'_, ArcRwLockConfig>,
     new_config: XenonConfig,
 ) -> Result<(), String> {
     new_config.save().map_err(|e| e.to_string())?;
     let mut guard = config.write().await;
     *guard = new_config;
+    let _ = app.emit("pet-config", &*guard);
+    Ok(())
+}
+
+/// Settings window, created on demand.
+///
+/// Keeping it out of `tauri.conf.json` means no second WebContent process
+/// (and its ~20 MB) is spawned until the user actually opens Settings.
+/// Closing the window destroys it; the next open rebuilds it.
+pub fn show_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("settings") {
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        app,
+        "settings",
+        tauri::WebviewUrl::App("settings.html".into()),
+    )
+    .title("Xenon Settings")
+    .inner_size(650.0, 750.0)
+    .resizable(true)
+    .decorations(true)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Onboarding window, created on demand for the same reason as Settings.
+pub fn show_onboarding<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("onboarding") {
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        app,
+        "onboarding",
+        tauri::WebviewUrl::App("onboarding.html".into()),
+    )
+    .title("Xenon — Permission Setup")
+    .inner_size(520.0, 440.0)
+    .resizable(false)
+    .decorations(true)
+    .build()
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 pub fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("settings") {
-        window.show().map_err(|e| e.to_string())?;
-        window.set_focus().map_err(|e| e.to_string())?;
-    } else {
-        log::warn!("Settings window not configured");
-    }
-    Ok(())
+    show_settings(&app)
 }
 
 /// Keeps the window click-through only while the cursor is away from the pet.

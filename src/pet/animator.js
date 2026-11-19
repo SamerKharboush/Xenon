@@ -14,37 +14,41 @@ export const STATE_LIST = Object.freeze([
     STATES.AGENTIC,
 ]);
 
-const POSES = Object.freeze({
-    idle: '/sprites/mochi-idle.png',
-    walk1: '/sprites/mochi-walk-1.png',
-    walk2: '/sprites/mochi-walk-2.png',
-    run1: '/sprites/mochi-run-1.png',
-    run2: '/sprites/mochi-run-2.png',
-    sleep: '/sprites/mochi-sleep.png',
-    jump: '/sprites/mochi-jump.png',
-    sit: '/sprites/mochi-sit.png',
-    lookCursor: '/sprites/mochi-look-cursor.png',
-    hide: '/sprites/mochi-hide.png',
-    celebrate: '/sprites/mochi-celebrate.png',
-    eat1: '/sprites/mochi-eat-1.png',
-    eat2: '/sprites/mochi-eat-2.png',
-    yawn: '/sprites/mochi-yawn.png',
-    roll: '/sprites/mochi-roll.png',
-    blush: '/sprites/mochi-blush.png',
-    stretch: '/sprites/mochi-stretch.png',
-    peek: '/sprites/mochi-peek.png',
-    tiltHead: '/sprites/mochi-tilt-head.png',
-    shake: '/sprites/mochi-shake.png',
-    nuzzle: '/sprites/mochi-nuzzle.png',
-    wiggle: '/sprites/mochi-wiggle.png',
-    dizzy: '/sprites/mochi-dizzy.png',
-    surprise: '/sprites/mochi-surprise.png',
+const POSE_FILES = Object.freeze({
+    idle: 'mochi-idle.png',
+    walk1: 'mochi-walk-1.png',
+    walk2: 'mochi-walk-2.png',
+    run1: 'mochi-run-1.png',
+    run2: 'mochi-run-2.png',
+    sleep: 'mochi-sleep.png',
+    jump: 'mochi-jump.png',
+    sit: 'mochi-sit.png',
+    lookCursor: 'mochi-look-cursor.png',
+    hide: 'mochi-hide.png',
+    celebrate: 'mochi-celebrate.png',
+    eat1: 'mochi-eat-1.png',
+    eat2: 'mochi-eat-2.png',
+    yawn: 'mochi-yawn.png',
+    roll: 'mochi-roll.png',
+    blush: 'mochi-blush.png',
+    stretch: 'mochi-stretch.png',
+    peek: 'mochi-peek.png',
+    tiltHead: 'mochi-tilt-head.png',
+    shake: 'mochi-shake.png',
+    nuzzle: 'mochi-nuzzle.png',
+    wiggle: 'mochi-wiggle.png',
+    dizzy: 'mochi-dizzy.png',
+    surprise: 'mochi-surprise.png',
 });
 
 export class Animator {
     constructor() {
         this.images = new Map();
+        this.pending = new Map();
         this.poseKeys = new Set();
+        // Sprite set in use: 'light' = 320x320 copies, '' = 448x448 originals.
+        this.lightSprites = true;
+        this.poseDir = '/sprites/light';
 
         this.state = STATES.IDLE;
         this.stateStart = 0;
@@ -77,22 +81,57 @@ export class Animator {
     }
 
     async preloadAll() {
-        const urls = [...new Set(Object.values(POSES))];
-        const promises = urls.map((url) =>
-            new Promise((resolve) => {
-                const img = new Image();
-                img.onload = () => {
-                    this.images.set(url, img);
-                    resolve();
-                };
-                img.onerror = () => resolve();
-                img.src = url;
-            })
-        );
-        await Promise.all(promises);
-        this.poseKeys = new Set(Object.keys(POSES));
+        // Light set: decode only the Idle pose. Every other pose loads on
+        // first use (see getPoseImage), so the idle WebContent heap does not
+        // hold 27 decoded bitmaps. The full set preloads all of them.
+        this.loadPose('idle');
+        if (!this.lightSprites) {
+            Object.keys(POSE_FILES).forEach((pose) => this.loadPose(pose));
+        }
+        this.poseKeys = new Set(Object.keys(POSE_FILES));
         this.ready = true;
         return this;
+    }
+
+    /** `/sprites/light/mochi-idle.png` or `/sprites/mochi-idle.png`. */
+    poseUrl(pose) {
+        const file = POSE_FILES[pose] || POSE_FILES.idle;
+        return `${this.poseDir}/${file}`;
+    }
+
+    /**
+     * Switch sprite set at runtime (Settings -> Performance). `true` uses the
+     * 320x320 copies in `src/sprites/light/` and decodes rare poses on demand;
+     * `false` uses the 448x448 originals in `src/sprites/` and preloads them.
+     * Takes effect immediately.
+     */
+    setLightSprites(light) {
+        if (this.lightSprites === light && this.poseDir) return;
+        this.lightSprites = light;
+        this.poseDir = light ? '/sprites/light' : '/sprites';
+        this.images.clear();
+        this.pending.clear();
+        if (light) {
+            this.loadPose(this.animPose || 'idle');
+        } else {
+            Object.keys(POSE_FILES).forEach((pose) => this.loadPose(pose));
+        }
+    }
+
+    /** Start decoding one pose if it is not already loaded or loading. */
+    loadPose(pose) {
+        const url = this.poseUrl(pose);
+        if (this.images.has(url) || this.pending.has(url)) return;
+        const promise = new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => {
+                this.images.set(url, img);
+                resolve();
+            };
+            img.onerror = () => resolve();
+            img.src = url;
+        });
+        this.pending.set(url, promise);
     }
 
     setReady() {
@@ -185,8 +224,8 @@ export class Animator {
     }
 
     getPoseImage(pose) {
-        const url = POSES[pose] || POSES.idle;
-        return this.images.get(url) || this.images.get(POSES.idle) || null;
+        this.loadPose(pose); // kick off decode; this frame falls back to idle
+        return this.images.get(this.poseUrl(pose)) || this.images.get(this.poseUrl('idle')) || null;
     }
 
     update(now) {

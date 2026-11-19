@@ -89,7 +89,10 @@ Core modules (`src-tauri/src/`):
 | `screenshot.rs` | Screen capture |
 | `tools.rs` | Tool trait + implementations |
 | `tts.rs` | TTS engine (sherpa-onnx) |
-| `ui.rs` | Tauri window management |
+| `ui.rs` | Tauri window management (incl. lazy Settings/Onboarding windows) |
+
+Two extra helper scripts live in `scripts/`: `measure-ram.sh` (memory, above) and
+`resize-sprites.sh` (regenerates `src/sprites/light/` from `src/sprites/`).
 
 See `CONTEXT.md` for the glossary and `docs/adr/` for architecture decisions.
 
@@ -128,6 +131,82 @@ Real-model tests are marked `#[ignore]`:
 ```bash
 cargo test -- --ignored
 ```
+
+## Memory
+
+Idle footprint, measured with `scripts/measure-ram.sh` (physical footprint per
+process — RSS counts shared clean framework pages several times over):
+
+```bash
+scripts/measure-ram.sh [path-to-Xenon.app] [settle-seconds]
+```
+
+It launches the app, waits, prints the `footprint` of the `xenon` process plus
+every WebKit XPC process (WebContent / GPU / Networking) the app just caused
+launchd to spawn, then a total, and kills the app. Numbers are the 0.2.0
+universal release build on macOS 14, ~15 s after launch:
+
+| Process | Idle (all toggles on) |
+| --- | --- |
+| `xenon` | ~32 MB |
+| WebContent (pet) | ~13-17 MB |
+| WebContent (onboarding, only while permissions are missing) | ~13 MB |
+| WebKit GPU | ~18 MB |
+| WebKit Networking | ~4 MB |
+| **Total** | **~78-83 MB** (budget: < 100 MB) |
+
+Grant Accessibility + Screen Recording and the onboarding process is never
+created: total settles at ~67-70 MB.
+
+### Performance toggles
+
+Settings → **Performance** exposes the three reductions, all **on** by default
+(the budget-meeting configuration). Turning one off restores the previous
+behaviour exactly.
+
+| Config key | Default | Toggles |
+| --- | --- | --- |
+| `light_sprites` | `true` | 320×320 sprites in `src/sprites/light/`, rare poses decoded on first use. Off: full-size 448×448 originals in `src/sprites/`, all preloaded (applies immediately) |
+| `lazy_audio` | `true` | Mic, VAD and TTS stay unloaded until the hotkey; tokio runs on 2 workers. Off: capture + VAD preloaded at startup, TTS model loaded, default per-core tokio pool (applies after restart) |
+| `idle_power_saver` | `true` | Idle draws at 15 FPS. Off: Idle draws at 60 FPS (CPU only, no RAM effect) |
+
+Measured with `scripts/measure-ram.sh` on the release build, ~15 s after launch,
+onboarding window open in both runs:
+
+| | xenon | WebContent (pet) | GPU | Networking | Onboarding | Total |
+| --- | --- | --- | --- | --- | --- | --- |
+| Toggles on | 32 MB | 13-14 MB | 15-16 MB | 4 MB | 13 MB | **78 MB** |
+| Toggles off | 38-39 MB | 16-19 MB | 18-20 MB | 4 MB | 13 MB | **90-94 MB** |
+
+The toggles-off run shows what each contributes: `xenon` +6-7 MB (per-core tokio
+pool instead of 2 workers), pet WebContent +3-6 MB (all 27 poses preloaded at
+448²). The audio half of `lazy_audio = false` could not be measured on the
+measurement host — it has no audio input device, so capture preload fails with
+"no supported input config" and the pipeline stays cold. On a Mac with a mic the
+same run additionally holds the cpal stream + Silero VAD (and the TTS model if
+one is installed).
+
+What is lazy by default, and why the number is what it is:
+
+- **Settings and onboarding windows are created on demand** (`ui::show_settings`
+  / `ui::show_onboarding`), not declared in `tauri.conf.json`. Each WKWebView
+  costs its own WebContent process (~13-25 MB); keeping them out of the startup
+  config saves ~40 MB. Closing a window destroys it, so the next open rebuilds it.
+- **Sprite poses decode on first use** (`light_sprites = true`). Shipped light
+  sprites are 320×320 (the pet draws at 240 CSS px) from 448×448 originals — 28
+  decoded 448² bitmaps would be ~22 MB. Regenerate with
+  `scripts/resize-sprites.sh`.
+- **Audio is lazy in hotkey listen mode** (the default, `lazy_audio = true`): no
+  cpal input stream, no VAD context, no whisper STT until `Cmd+Shift+Space` opens
+  a session. Whisper and the sherpa-onnx TTS model are loaded on first use and
+  unloaded when idle.
+- **Tokio runs on 2 worker threads**, not one per core, via
+  `tauri::async_runtime::set` in `main.rs`.
+- **Idle canvas draws at 15 FPS** (`idle_power_saver = true`); full rate in every
+  other state or while a speech bubble is up.
+
+Active RAM with whisper/STT/TTS/LLM loaded is several hundred MB — see
+`CONTEXT.md` ("Idle Shell" vs "Active with Models").
 
 ## Credits & license
 

@@ -203,6 +203,21 @@ pub struct XenonConfig {
     /// TTS model is unloaded from RAM after this many idle minutes.
     #[serde(default = "default_tts_unload_minutes")]
     pub tts_unload_minutes: u64,
+    /// Ship the 320x320 sprites and decode rare poses on first use. `false`
+    /// restores the 448x448 originals, all preloaded (Settings -> Performance).
+    #[serde(default = "default_true")]
+    pub light_sprites: bool,
+    /// Open the mic/VAD/TTS only when needed instead of at startup.
+    /// `false` preloads them (Settings -> Performance).
+    #[serde(default = "default_true")]
+    pub lazy_audio: bool,
+    /// Draw Idle at 15 FPS instead of 60 (Settings -> Performance).
+    #[serde(default = "default_true")]
+    pub idle_power_saver: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_listen_mode() -> String {
@@ -254,6 +269,9 @@ impl Default for XenonConfig {
             tts_speaker_id: 0,
             tts_speed: default_tts_speed(),
             tts_unload_minutes: default_tts_unload_minutes(),
+            light_sprites: true,
+            lazy_audio: true,
+            idle_power_saver: true,
         }
     }
 }
@@ -485,5 +503,35 @@ mod tests {
     fn test_default_name_is_xenon() {
         assert_eq!(XenonConfig::default().pet_name, "Xenon");
         assert_eq!(XenonConfig::default().wake_word, "Xenon");
+    }
+
+    /// The three Performance toggles default to on (budget-meeting config).
+    #[test]
+    fn test_performance_defaults_are_on() {
+        let cfg = XenonConfig::default();
+        assert!(cfg.light_sprites);
+        assert!(cfg.lazy_audio);
+        assert!(cfg.idle_power_saver);
+    }
+
+    /// Config files written before the Performance section existed must load
+    /// with the toggles on rather than failing or defaulting to false.
+    #[test]
+    fn test_old_config_without_performance_defaults_to_on() {
+        let old = r#"{
+            "pet_name": "Jarvis",
+            "provider_url": "http://127.0.0.1:8080",
+            "provider_api_key": null,
+            "model_name": "qwen3",
+            "voice_enabled": true,
+            "wake_word_enabled": true,
+            "wake_word": "Xenon",
+            "system_prompt": "hi"
+        }"#;
+        let cfg: XenonConfig = serde_json::from_str(old).expect("old config must deserialize");
+        assert_eq!(cfg.pet_name, "Jarvis");
+        assert!(cfg.light_sprites, "light_sprites must default to true");
+        assert!(cfg.lazy_audio, "lazy_audio must default to true");
+        assert!(cfg.idle_power_saver, "idle_power_saver must default to true");
     }
 }

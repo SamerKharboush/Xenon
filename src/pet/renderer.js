@@ -16,6 +16,7 @@ class Renderer {
         this.animator = new Animator();
         this.bubble = new Bubble();
         this.lastTime = performance.now();
+        this.lastDraw = 0;
         this.dpr = 1;
         this.idleLevel = 0;
         this.speechLevelSmooth = 0;
@@ -37,6 +38,8 @@ class Renderer {
         this.clickTimer = null;
         this.lastClickTime = 0;
         this.voiceMuted = false;
+        // Performance toggle (Settings -> Performance), live from pet-config.
+        this.idlePowerSaver = true;
 
         this.resize();
         window.addEventListener('resize', () => this.resize());
@@ -109,6 +112,23 @@ class Renderer {
             const text = typeof raw === 'string' ? raw : raw && typeof raw.message === 'string' ? raw.message : String(raw);
             this.bubble.show(text, BUBBLE_COLORS.notice, 4000);
         });
+
+        // Performance toggles: same config the settings window reads/writes.
+        if (invoke) {
+            invoke('get_config').then((cfg) => this.applyConfig(cfg)).catch(() => {});
+        }
+        listen('pet-config', (event) => this.applyConfig(event.payload));
+    }
+
+    /** Apply the Performance toggles from XenonConfig. */
+    applyConfig(cfg) {
+        if (!cfg) return;
+        if (typeof cfg.light_sprites === 'boolean') {
+            this.animator.setLightSprites(cfg.light_sprites);
+        }
+        if (typeof cfg.idle_power_saver === 'boolean') {
+            this.idlePowerSaver = cfg.idle_power_saver;
+        }
     }
 
     initInteractions() {
@@ -281,7 +301,18 @@ class Renderer {
     }
 
     loop(now) {
-        const dt = Math.min(48, now - this.lastTime);
+        this.rafId = requestAnimationFrame(this.loop);
+
+        // Idle is a slow breathing bob; 15 FPS is indistinguishable from 60
+        // and cuts the canvas/compositing work by 4x. Any other state (or a
+        // visible speech bubble) animates at the full display rate. Disabled
+        // by the Performance toggle.
+        const idle = this.idlePowerSaver && this.animator.state === 'Idle' && !this.bubble.text;
+        const minGap = idle ? 1000 / 15 : 0;
+        if (now - this.lastDraw < minGap) return;
+        this.lastDraw = now;
+
+        const dt = Math.min(80, now - this.lastTime);
         this.lastTime = now;
 
         const anim = this.animator;
@@ -306,7 +337,6 @@ class Renderer {
         }
 
         this.bubble.update(now);
-        this.rafId = requestAnimationFrame(this.loop);
     }
 
     updateParticles(now, dt, state) {

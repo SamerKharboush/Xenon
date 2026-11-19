@@ -104,6 +104,9 @@ struct Worker {
     stt: Option<WhisperContext>,
     stt_last_used: Option<Instant>,
     force: bool,
+    /// Capture is open but no hotkey session has started (lazy_audio = false).
+    /// Frames are dropped until the hotkey flips this off.
+    preloaded: bool,
     last_speech: Instant,
     last_level: Instant,
     model_notice_sent: bool,
@@ -137,6 +140,7 @@ fn worker(
         stt: None,
         stt_last_used: None,
         force: false,
+        preloaded: false,
         last_speech: Instant::now(),
         last_level: Instant::now(),
         model_notice_sent: false,
@@ -144,6 +148,9 @@ fn worker(
 
     if w.cfg.listen_mode == "always" {
         w.open_session(false);
+    } else if !w.cfg.lazy_audio {
+        // Performance toggle off: warm the mic and VAD at startup.
+        w.preload();
     }
 
     loop {
@@ -209,7 +216,48 @@ impl Worker {
         // Barge-in: tell the runtime to swap Speaking -> Listening. If TTS is
         // playing, task 3 stops it here (see runtime presentation_loop hook).
         self.emit(AudioEvent::ForceListen);
+        if self.preloaded && self.stream.is_some() {
+            // Warm mic from preload(): reuse the stream instead of reopening.
+            self.preloaded = false;
+            self.force = true;
+            self.input_buf.clear();
+            self.captured.clear();
+            self.seg.reset();
+            self.frames_committed = 0;
+            self.since_vad = 0;
+            self.last_speech = Instant::now();
+            self.emit(AudioEvent::Listening);
+            log::info!("audio: hotkey using preloaded capture");
+            return;
+        }
         self.open_session(true);
+    }
+
+    /// Performance toggle off: open capture and load the VAD model at
+    /// startup so the first hotkey press pays for neither. Nothing is
+    /// resampled or transcribed until the hotkey opens a session, and no pet
+    /// state changes.
+    fn preload(&mut self) {
+        self.input_buf.clear();
+        self.captured.clear();
+        self.seg.reset();
+        self.frames_committed = 0;
+        self.since_vad = 0;
+        self.force = false;
+        if let Err(e) = self.open_capture() {
+            log::error!("audio: preload capture failed: {e:#}");
+            self.close_session();
+            return;
+        }
+        self.preloaded = true;
+        if self.vad.is_none() {
+            if let Err(e) = self.load_vad() {
+                // Keep the warm mic; the hotkey path loads VAD (and reports a
+                // missing model) exactly as before.
+                log::warn!("audio: preload VAD failed: {e:#}");
+            }
+        }
+        log::info!("audio: capture + VAD preloaded (lazy_audio = false)");
     }
 
     fn open_session(&mut self, force: bool) {
@@ -273,6 +321,7 @@ impl Worker {
         self.frames_committed = 0;
         self.since_vad = 0;
         self.force = false;
+        self.preloaded = false;
     }
 
     /// Build and play a cpal input stream, wiring a fresh frame channel.
@@ -358,6 +407,12 @@ impl Worker {
     }
 
     fn on_frames(&mut self, frames: &[f32]) {
+        // Preloaded and no hotkey session: the mic is warm but idle. Drop the
+        // frames so nothing is resampled, transcribed, or emitted.
+        if self.preloaded {
+            self.input_buf.clear();
+            return;
+        }
         self.input_buf.extend_from_slice(frames);
         // Enough new native-rate audio to make one resample block.
         let block_need = (self.native_rate as usize * VAD_STRIDE_MS as usize) / 1000;

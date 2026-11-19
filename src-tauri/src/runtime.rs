@@ -290,6 +290,11 @@ impl Runtime {
     pub fn audio_sender(&self) -> Sender<AudioEvent> {
         self.audio_tx.clone()
     }
+
+    /// Performance toggle off: load the TTS model at startup.
+    pub fn preload_tts(&self) {
+        self.tts.preload();
+    }
 }
 
 /// TurnFinished must become Idle only when nothing is left to play; while the

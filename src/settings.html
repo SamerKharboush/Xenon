@@ -309,6 +309,25 @@
         </div>
 
         <div class="section">
+            <h2>Performance</h2>
+            <div class="checkbox-field">
+                <input type="checkbox" id="light_sprites">
+                <label for="light_sprites">Lightweight sprites</label>
+            </div>
+            <div class="hint">Smaller images, rare poses load on first use (~20 MB less memory). Off: full-size 448x448 sprites, all preloaded (applies immediately).</div>
+            <div class="checkbox-field">
+                <input type="checkbox" id="lazy_audio">
+                <label for="lazy_audio">Load voice features on demand</label>
+            </div>
+            <div class="hint">Lower idle memory, slightly slower first response. Off: mic, VAD and TTS load at startup, more tokio workers (applies after restart).</div>
+            <div class="checkbox-field">
+                <input type="checkbox" id="idle_power_saver">
+                <label for="idle_power_saver">Reduce animation rate while idle</label>
+            </div>
+            <div class="hint">Idle draws at 15 FPS instead of 60; all other states stay at full rate.</div>
+        </div>
+
+        <div class="section">
             <h2>Permissions</h2>
             <div class="perm-section">
                 <div>
@@ -484,6 +503,9 @@
                 document.getElementById('whisper_model_path').value = config.whisper_model_path || '';
                 document.getElementById('vad_model_path').value = config.vad_model_path || '';
                 document.getElementById('max_steps').value = config.max_steps ?? 15;
+                document.getElementById('light_sprites').checked = config.light_sprites !== false;
+                document.getElementById('lazy_audio').checked = config.lazy_audio !== false;
+                document.getElementById('idle_power_saver').checked = config.idle_power_saver !== false;
 
                 renderProfiles();
             } catch (e) {
@@ -518,6 +540,9 @@
             config.whisper_model_path = document.getElementById('whisper_model_path').value.trim();
             config.vad_model_path = document.getElementById('vad_model_path').value.trim();
             config.max_steps = Number(document.getElementById('max_steps').value) || 15;
+            config.light_sprites = document.getElementById('light_sprites').checked;
+            config.lazy_audio = document.getElementById('lazy_audio').checked;
+            config.idle_power_saver = document.getElementById('idle_power_saver').checked;
 
             try {
                 await invoke('update_config', { newConfig: config });

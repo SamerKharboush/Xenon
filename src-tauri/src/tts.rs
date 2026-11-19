@@ -45,6 +45,9 @@ struct SpeechLevel {
 enum TtsCommand {
     Speak(String),
     Stop,
+    /// Performance toggle off: load the neural model now instead of at the
+    /// first sentence.
+    Preload,
 }
 
 /// FIFO of sentences waiting to be synthesized. Kept separate so ordering
@@ -122,6 +125,20 @@ impl Tts {
     /// `speech-level` and `xenon-notice`.
     pub fn attach_app(&self, app: AppHandle) {
         let _ = self.app.set(app);
+    }
+
+    /// Performance toggle off: start the TTS worker and load the neural model
+    /// at startup. Never blocks on the load itself.
+    pub fn preload(&self) {
+        if !self
+            .config
+            .try_read()
+            .map(|c| c.tts_enabled)
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let _ = self.sender().send(TtsCommand::Preload);
     }
 
     /// Enqueue one sentence. Never blocks: the worker does synthesis.
@@ -364,6 +381,11 @@ impl Worker {
                 self.busy.store(true, Ordering::SeqCst);
             }
             TtsCommand::Stop => self.reset_stop(),
+            TtsCommand::Preload => {
+                if let Err(e) = self.ensure_model() {
+                    log::warn!("tts: preload failed: {e:#}");
+                }
+            }
         }
     }
 

@@ -23,13 +23,32 @@ use runtime::Runtime;
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // Loaded here (not only in setup) so the Performance toggles can pick the
+    // tokio worker count before any async runtime exists.
+    let cfg = config::XenonConfig::load();
+
+    // Tauri's default async runtime starts one tokio worker per core (24 on a
+    // maxed Mac Studio), each with its own stack and TLS. The app's async work
+    // is two idle loops plus a handful of commands, so a small fixed pool is
+    // enough. `lazy_audio = false` restores the default (per-core) pool; the
+    // runtime is created before the app, so that toggle applies after restart.
+    // The runtime must outlive the app, hence the binding.
+    let rt = if cfg.lazy_audio {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?
+    } else {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build()?
+    };
+    tauri::async_runtime::set(rt.handle().clone());
+
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .setup(|app| {
+        .setup(move |app| {
             let window = app.get_webview_window("main").unwrap();
             ui::setup_window(&window)?;
 
-            let cfg = config::XenonConfig::load();
             log::info!(
                 "Xenon starting: pet_name={}, provider={}, model={}, listen_mode={}",
                 cfg.pet_name,
@@ -40,6 +59,7 @@ fn main() -> anyhow::Result<()> {
 
             // Shared config: owned by the Runtime, read by commands, written
             // by `update_config` so settings apply live.
+            let lazy_audio = cfg.lazy_audio;
             let config: ui::ArcRwLockConfig = Arc::new(RwLock::new(cfg));
 
             let mut runtime = Runtime::new(config.clone());
@@ -50,6 +70,13 @@ fn main() -> anyhow::Result<()> {
             // before the shortcuts so `try_state::<Runtime>()` works inside
             // the abort hotkey handler.
             app.manage(runtime);
+
+            // Performance toggle off: load the neural voice model now.
+            if !lazy_audio {
+                if let Some(rt) = app.try_state::<Runtime>() {
+                    rt.preload_tts();
+                }
+            }
 
             // Real Audio Pipeline: cpal capture -> VAD -> STT, plus the
             // global-hotkey force-listen. Runs on its own dedicated thread.
@@ -107,17 +134,14 @@ fn main() -> anyhow::Result<()> {
             // `xenon --debug-open-settings` opens the settings window at
             // startup; used to verify it renders without needing a real click.
             if std::env::args().any(|a| a == "--debug-open-settings") {
-                if let Some(w) = app.get_webview_window("settings") {
-                    let _ = w.show();
-                }
+                let _ = ui::show_settings(app.handle());
             }
 
-            // If permissions are missing, show the onboarding window.
+            // If permissions are missing, show the onboarding window (created
+            // on demand so it costs no WebContent process until needed).
             let perms = permissions::get_permissions();
             if !perms.accessibility || !perms.screen_recording {
-                if let Some(w) = app.get_webview_window("onboarding") {
-                    let _ = w.show();
-                }
+                let _ = ui::show_onboarding(app.handle());
             }
 
             Ok(())
