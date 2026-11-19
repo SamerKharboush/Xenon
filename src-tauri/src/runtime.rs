@@ -8,7 +8,7 @@ use crate::config::XenonConfig;
 use crate::events::{AgentAction, AudioEvent, PetState};
 use crate::provider::{OpenAICompatProvider, Provider};
 use crate::tools;
-use crate::tts::TtsEngine;
+use crate::tts::Tts;
 
 pub struct Runtime {
     audio_tx: Sender<AudioEvent>,
@@ -19,13 +19,14 @@ pub struct Runtime {
     config: Arc<RwLock<XenonConfig>>,
     /// `None` in tests (no Tauri app), `Some` in production.
     app: Option<AppHandle>,
-    tts: Arc<TtsEngine>,
+    tts: Arc<Tts>,
 }
 
 impl Runtime {
     pub fn new(config: Arc<RwLock<XenonConfig>>) -> Self {
         let (audio_tx, audio_rx) = bounded(32);
         let (action_tx, action_rx) = bounded(32);
+        let tts = Arc::new(Tts::new(config.clone()));
 
         Self {
             audio_tx,
@@ -35,13 +36,14 @@ impl Runtime {
             state: Arc::new(RwLock::new(PetState::Idle)),
             config,
             app: None,
-            tts: Arc::new(TtsEngine::new()),
+            tts,
         }
     }
 
     /// Attach the Tauri AppHandle so the presentation loop can emit
     /// `pet-state` / `pet-speech` events to the frontend.
     pub fn attach_app(&mut self, app: AppHandle) {
+        self.tts.attach_app(app.clone());
         self.app = Some(app);
     }
 
@@ -59,8 +61,9 @@ impl Runtime {
         let audio_rx = self.audio_rx.clone();
         let action_tx = self.action_tx.clone();
         let config = self.config.clone();
+        let state = self.state.clone();
         tauri::async_runtime::spawn(async move {
-            Self::audio_loop(audio_rx, action_tx, config).await;
+            Self::audio_loop(audio_rx, action_tx, config, state).await;
         });
     }
 
@@ -70,7 +73,7 @@ impl Runtime {
         action_rx: Receiver<AgentAction>,
         state: Arc<RwLock<PetState>>,
         app: Option<AppHandle>,
-        tts: Arc<TtsEngine>,
+        tts: Arc<Tts>,
     ) {
         while let Ok(action) = action_rx.recv().await {
             let next = match &action {
@@ -78,35 +81,38 @@ impl Runtime {
                 AgentAction::SetPetState(s) => Some(s.clone()),
                 AgentAction::ExecuteTool(_) => Some(PetState::Agentic),
                 AgentAction::ToolResult(_) => Some(PetState::Thinking),
-                AgentAction::TurnFinished => Some(PetState::Idle),
+                // Idle only once the speech queue has drained; the drain
+                // watcher below emits Idle later when audio is still playing.
+                AgentAction::TurnFinished => turn_finished_next_state(tts.is_busy()),
             };
 
-            if let Some(new_state) = next {
-                let mut guard = state.write().await;
-                if *guard != new_state {
-                    // Barge-in: leaving Speaking toward Listening means the user
-                    // wants to cut the pet off — ask the TTS engine to stop.
-                    if *guard == PetState::Speaking && new_state == PetState::Listening {
-                        drop(guard);
-                        // TASK-3 HOOK: stop playback here.
-                        tts.request_stop();
-                        let mut g = state.write().await;
-                        *g = new_state.clone();
-                        drop(g);
-                    } else {
-                        *guard = new_state.clone();
-                        drop(guard);
+            match next {
+                Some(new_state) => {
+                    let mut guard = state.write().await;
+                    if *guard != new_state {
+                        // Barge-in: leaving Speaking toward Listening means the
+                        // user wants to cut the pet off — stop TTS playback now.
+                        if *guard == PetState::Speaking && new_state == PetState::Listening {
+                            drop(guard);
+                            tts.stop();
+                            let mut g = state.write().await;
+                            *g = new_state.clone();
+                            drop(g);
+                        } else {
+                            *guard = new_state.clone();
+                            drop(guard);
+                        }
+                        if let Some(app) = &app {
+                            let _ = app.emit("pet-state", &new_state);
+                        }
                     }
-                    if let Some(app) = &app {
-                        let _ = app.emit("pet-state", &new_state);
-                    }
-                } else {
-                    drop(guard);
                 }
+                None => Self::watch_tts_drain(tts.clone(), state.clone(), app.clone()),
             }
 
             if let AgentAction::Speak(text) = &action {
-                // TTS seam: real synthesis is a future task.
+                // TTS seam: enqueue the sentence; the dedicated worker
+                // synthesizes it while the previous sentence keeps playing.
                 let _ = tts.speak(text);
                 if let Some(app) = &app {
                     let _ = app.emit("pet-speech", text.as_str());
@@ -115,16 +121,55 @@ impl Runtime {
         }
     }
 
+    /// TurnFinished arrived while audio is still playing: poll (async, never
+    /// blocking a tokio worker) until the TTS queue drains, then emit Idle.
+    fn watch_tts_drain(tts: Arc<Tts>, state: Arc<RwLock<PetState>>, app: Option<AppHandle>) {
+        tauri::async_runtime::spawn(async move {
+            for _ in 0..1200 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if !tts.is_busy() {
+                    break;
+                }
+            }
+            let mut guard = state.write().await;
+            if *guard == PetState::Speaking {
+                *guard = PetState::Idle;
+                drop(guard);
+                if let Some(app) = &app {
+                    let _ = app.emit("pet-state", &PetState::Idle);
+                }
+            }
+        });
+    }
+
+    /// Stop any current playback (Tauri command + barge-in share this).
+    pub fn stop_speaking(&self) {
+        self.tts.stop();
+    }
+
     /// Consume `AudioEvent`s, run the agent for each utterance / greeting,
     /// and forward resulting `AgentAction`s to the presentation loop.
     async fn audio_loop(
         audio_rx: Receiver<AudioEvent>,
         action_tx: Sender<AgentAction>,
         config: Arc<RwLock<XenonConfig>>,
+        state: Arc<RwLock<PetState>>,
     ) {
         while let Ok(event) = audio_rx.recv().await {
             match event {
                 AudioEvent::Speech(utterance) => {
+                    // Half-duplex echo guard: in "always" listen mode the mic
+                    // hears the pet's own TTS while it is Speaking. Drop
+                    // VAD-triggered events then. The hotkey barge-in flips to
+                    // Listening before user speech arrives, so real speech
+                    // after a barge-in is never suppressed.
+                    let echoing = Self::echo_guard(&config, &state).await;
+                    if echoing {
+                        log::debug!(
+                            "tts echo guard: dropping transcribed speech while Speaking"
+                        );
+                        continue;
+                    }
                     Self::run_agent(&utterance.text, &action_tx, &config).await;
                 }
                 AudioEvent::Greet => {
@@ -136,9 +181,18 @@ impl Runtime {
                     drop(cfg);
                     Self::run_agent(&greeting, &action_tx, &config).await;
                 }
-                // Hotkey barge-in / speech onset: swap the pet to Listening.
-                // TTS-stop on barge-in is wired here in task 3.
-                AudioEvent::ForceListen | AudioEvent::Listening => {
+                // Hotkey always wins; VAD onset is suppressed by the echo
+                // guard so the pet cannot barge itself out of Speaking.
+                AudioEvent::ForceListen => {
+                    let _ = action_tx
+                        .send(AgentAction::SetPetState(PetState::Listening))
+                        .await;
+                }
+                AudioEvent::Listening => {
+                    if Self::echo_guard(&config, &state).await {
+                        log::debug!("tts echo guard: dropping VAD onset while Speaking");
+                        continue;
+                    }
                     let _ = action_tx
                         .send(AgentAction::SetPetState(PetState::Listening))
                         .await;
@@ -151,6 +205,22 @@ impl Runtime {
                 }
             }
         }
+    }
+
+    /// Half-duplex echo guard: true while the pet is Speaking in "always"
+    /// listen mode, where the mic would otherwise hear the pet's own TTS.
+    /// Documented behaviour: VAD onset and transcribed Speech are dropped
+    /// then; the Cmd+Shift+Space hotkey still works because it emits
+    /// ForceListen, which is never guarded.
+    async fn echo_guard(
+        config: &Arc<RwLock<XenonConfig>>,
+        state: &Arc<RwLock<PetState>>,
+    ) -> bool {
+        let always = {
+            let cfg = config.read().await;
+            cfg.listen_mode == "always"
+        };
+        always && matches!(*state.read().await, PetState::Speaking)
     }
 
     async fn run_agent(text: &str, action_tx: &Sender<AgentAction>, config: &Arc<RwLock<XenonConfig>>) {
@@ -184,10 +254,31 @@ impl Runtime {
     }
 }
 
+/// TurnFinished must become Idle only when nothing is left to play; while the
+/// speech queue is non-empty or audio is playing the drain watcher defers it.
+fn turn_finished_next_state(tts_busy: bool) -> Option<PetState> {
+    if tts_busy {
+        None
+    } else {
+        Some(PetState::Idle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::{AudioEvent, Utterance};
+
+    /// TurnFinished defers Idle only while audio is still playing.
+    #[test]
+    fn turn_finished_defers_idle_while_busy() {
+        assert_eq!(turn_finished_next_state(true), None);
+    }
+
+    #[test]
+    fn turn_finished_is_idle_once_drained() {
+        assert_eq!(turn_finished_next_state(false), Some(PetState::Idle));
+    }
 
     fn test_runtime() -> Runtime {
         Runtime::new(Arc::new(RwLock::new(XenonConfig::default())))
@@ -215,8 +306,16 @@ mod tests {
     /// while the HTTP connection times out.
     #[tokio::test]
     async fn test_greet_event_reaches_agent_loop() {
-        let mut cfg = XenonConfig::default();
-        cfg.provider.provider_url = "http://192.0.2.1:9".to_string(); // TEST-NET-1, non-routable
+        // tts disabled: keep tests silent (no fallback `say`); TEST-NET-1
+        // provider URL keeps Thinking observable while HTTP times out.
+        let cfg = XenonConfig {
+            tts_enabled: false,
+            provider: crate::config::ProviderConfig {
+                provider_url: "http://192.0.2.1:9".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let config = Arc::new(RwLock::new(cfg));
         let runtime = Runtime::new(config);
         runtime.start();
@@ -243,8 +342,14 @@ mod tests {
     /// A Speech event must also drive the state machine through Thinking.
     #[tokio::test]
     async fn test_speech_event_reaches_agent_loop() {
-        let mut cfg = XenonConfig::default();
-        cfg.provider.provider_url = "http://192.0.2.1:9".to_string();
+        let cfg = XenonConfig {
+            tts_enabled: false, // keep tests silent (no fallback `say`)
+            provider: crate::config::ProviderConfig {
+                provider_url: "http://192.0.2.1:9".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let config = Arc::new(RwLock::new(cfg));
         let runtime = Runtime::new(config);
         runtime.start();

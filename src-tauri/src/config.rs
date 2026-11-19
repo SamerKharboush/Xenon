@@ -45,6 +45,14 @@ fn app_support_models() -> PathBuf {
         .join("Library/Application Support/com.xenon.app/models")
 }
 
+/// Default neural voice directory, populated by scripts/fetch-models.sh.
+fn default_tts_model_dir() -> String {
+    app_support_models()
+        .join("kokoro-en-v0_19")
+        .to_string_lossy()
+        .to_string()
+}
+
 /// LLM endpoint settings. Flattened into XenonConfig so the config file keeps
 /// its historical flat shape (`provider_url`, `provider_api_key`,
 /// `model_name` at the top level).
@@ -92,6 +100,24 @@ pub struct XenonConfig {
     /// Path to the ggml Silero VAD model.
     #[serde(default = "default_vad_model_path")]
     pub vad_model_path: String,
+    /// Neural voice output (TTS) enabled.
+    #[serde(default = "default_tts_enabled")]
+    pub tts_enabled: bool,
+    /// Directory containing the neural voice model (Kokoro or VITS/Piper).
+    #[serde(default = "default_tts_model_dir")]
+    pub tts_model_dir: String,
+    /// "kokoro", "vits", or "" to autodetect from the model directory.
+    #[serde(default)]
+    pub tts_kind: String,
+    /// Voice/speaker id within the model.
+    #[serde(default)]
+    pub tts_speaker_id: u32,
+    /// Synthesis speed multiplier.
+    #[serde(default = "default_tts_speed")]
+    pub tts_speed: f32,
+    /// TTS model is unloaded from RAM after this many idle minutes.
+    #[serde(default = "default_tts_unload_minutes")]
+    pub tts_unload_minutes: u64,
 }
 
 fn default_listen_mode() -> String {
@@ -104,6 +130,15 @@ fn default_silence_ms() -> u64 {
     700
 }
 fn default_stt_unload_minutes() -> u64 {
+    5
+}
+fn default_tts_enabled() -> bool {
+    true
+}
+fn default_tts_speed() -> f32 {
+    1.0
+}
+fn default_tts_unload_minutes() -> u64 {
     5
 }
 
@@ -122,6 +157,12 @@ impl Default for XenonConfig {
             stt_unload_minutes: default_stt_unload_minutes(),
             whisper_model_path: default_whisper_model_path(),
             vad_model_path: default_vad_model_path(),
+            tts_enabled: default_tts_enabled(),
+            tts_model_dir: default_tts_model_dir(),
+            tts_kind: String::new(),
+            tts_speaker_id: 0,
+            tts_speed: default_tts_speed(),
+            tts_unload_minutes: default_tts_unload_minutes(),
         }
     }
 }

@@ -71,6 +71,13 @@ pub fn say(state: State<'_, AppState>, text: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Barge-in / mute: stop any TTS playback immediately. Callable from the
+/// frontend (renderer.js "mute voice" and pet-tap mute paths).
+#[tauri::command]
+pub fn stop_speaking(runtime: State<'_, crate::runtime::Runtime>) {
+    runtime.stop_speaking();
+}
+
 /// Manually set the pet to Listening (placeholder for wake-word integration).
 #[tauri::command]
 pub fn trigger_listen(window: Window) -> Result<(), String> {

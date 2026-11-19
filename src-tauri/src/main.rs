@@ -97,6 +97,7 @@ fn main() -> anyhow::Result<()> {
             ui::get_config,
             ui::update_config,
             ui::open_settings,
+            ui::stop_speaking,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -130,8 +131,11 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => toggle_pet_visibility(app, true),
             "talk" => {
-                if let Some(state) = app.try_state::<ui::AppState>() {
-                    let _ = state.audio_tx.try_send(events::AudioEvent::Greet);
+                // Same path as Cmd+Shift+Space: force-listen / barge-in.
+                if let Some(pipeline) = app.try_state::<Arc<AudioPipeline>>() {
+                    pipeline.force_listen();
+                } else {
+                    log::warn!("tray Talk: audio pipeline not available");
                 }
             }
             "settings" => {

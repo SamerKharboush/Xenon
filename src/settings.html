@@ -194,6 +194,34 @@
                 <input type="checkbox" id="wake_word_enabled">
                 <label for="wake_word_enabled">Wake word detection enabled</label>
             </div>
+            <div class="checkbox-field">
+                <input type="checkbox" id="tts_enabled">
+                <label for="tts_enabled">Speak replies aloud (neural voice)</label>
+            </div>
+            <div class="field">
+                <label for="tts_kind">Voice Model</label>
+                <select id="tts_kind">
+                    <option value="">Auto (detect from model folder)</option>
+                    <option value="kokoro">Kokoro</option>
+                    <option value="vits">VITS / Piper</option>
+                </select>
+                <div class="hint">Auto uses Kokoro when voices.bin is present, otherwise VITS/Piper.</div>
+            </div>
+            <div class="field">
+                <label for="tts_model_dir">Voice Model Directory</label>
+                <input type="text" id="tts_model_dir" placeholder="~/Library/Application Support/com.xenon.app/models/kokoro-en-v0_19">
+                <div class="hint">Populated by scripts/fetch-models.sh. Without a model Xenon falls back to the system voice.</div>
+            </div>
+            <div class="field">
+                <label for="tts_speaker_id">Speaker ID</label>
+                <input type="number" id="tts_speaker_id" min="0" max="512" step="1">
+                <div class="hint">Voice index within the model (0 is the default speaker).</div>
+            </div>
+            <div class="field">
+                <label for="tts_speed">Speaking Speed</label>
+                <input type="number" id="tts_speed" min="0.5" max="2.0" step="0.1">
+                <div class="hint">1.0 is normal speed.</div>
+            </div>
             <div class="field">
                 <label for="listen_mode">Listen Mode</label>
                 <select id="listen_mode">
@@ -247,6 +275,11 @@
                 document.getElementById('system_prompt').value = config.system_prompt || '';
                 document.getElementById('voice_enabled').checked = config.voice_enabled !== false;
                 document.getElementById('wake_word_enabled').checked = config.wake_word_enabled !== false;
+                document.getElementById('tts_enabled').checked = config.tts_enabled !== false;
+                document.getElementById('tts_kind').value = config.tts_kind || '';
+                document.getElementById('tts_model_dir').value = config.tts_model_dir || '';
+                document.getElementById('tts_speaker_id').value = config.tts_speaker_id ?? 0;
+                document.getElementById('tts_speed').value = config.tts_speed ?? 1.0;
                 document.getElementById('listen_mode').value = config.listen_mode || 'hotkey';
                 document.getElementById('language').value = config.language || 'en';
                 document.getElementById('silence_ms').value = config.silence_ms ?? 700;
@@ -268,6 +301,11 @@
                 system_prompt: document.getElementById('system_prompt').value,
                 voice_enabled: document.getElementById('voice_enabled').checked,
                 wake_word_enabled: document.getElementById('wake_word_enabled').checked,
+                tts_enabled: document.getElementById('tts_enabled').checked,
+                tts_kind: document.getElementById('tts_kind').value,
+                tts_model_dir: document.getElementById('tts_model_dir').value.trim(),
+                tts_speaker_id: Number(document.getElementById('tts_speaker_id').value) || 0,
+                tts_speed: Number(document.getElementById('tts_speed').value) || 1.0,
                 listen_mode: document.getElementById('listen_mode').value,
                 language: document.getElementById('language').value.trim() || 'en',
                 silence_ms: Number(document.getElementById('silence_ms').value) || 700,
