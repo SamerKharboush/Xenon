@@ -1,101 +1,88 @@
+//! Grounding: send a `Screenshot` to a vision model and read back the pixel
+//! coordinates of the UI element the agent named.
+//!
+//! The model answers in **image pixels** (the downscaled image it was shown),
+//! which `Screenshot::map_point` turns into logical screen points.
+
 use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use enigo::Mouse;
-use image::ImageFormat;
-use std::io::Cursor;
 
-use crate::events::PetState;
-use crate::provider::Provider;
+use crate::provider::{ChatMessage, ChatRequest, Provider};
+use crate::screenshot::Screenshot;
 
-pub struct GroundingResult {
-    pub success: bool,
-    pub message: String,
-    pub state: PetState,
+/// A grounded point in image-pixel space, plus the element it resolved to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroundingPoint {
+    pub target: String,
+    pub x: f64,
+    pub y: f64,
 }
 
-pub async fn ground_and_click(
+/// Ask *provider* (using *model*) to locate *target* in *shot*.
+pub async fn ground(
     provider: &dyn Provider,
-    screenshot: &[u8],
-) -> Result<GroundingResult> {
-    let resized = resize_screenshot(screenshot, 512, 512)?;
-    let base64_screenshot = BASE64.encode(&resized);
+    model: &str,
+    shot: &Screenshot,
+    target: &str,
+) -> Result<GroundingPoint> {
+    let prompt = format!(
+        "You are a UI grounding assistant. Look at this screenshot of a computer \
+         screen and locate the UI element described below. The image is {w}x{h} \
+         pixels. Return ONLY a JSON object with exactly this shape: \
+         {{\"target\": \"<element name>\", \"x\": <number>, \"y\": <number>}} where x \
+         and y are pixel coordinates within this {w}x{h} image. No prose, no code \
+         fences.\n\nTarget: {target}",
+        w = shot.image_width(),
+        h = shot.image_height(),
+        target = target,
+    );
 
-    let prompt = "You are a UI grounding assistant. Look at this screenshot and identify the UI element that matches the user's request. Return ONLY a JSON object with this exact format: {\"target\": \"element name\", \"x\": number, \"y\": number}. Do not include any other text.";
+    let req = ChatRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage::user_with_image(prompt, shot.data_uri())],
+        tools: None,
+        stream: false,
+        temperature: Some(0.0),
+        max_tokens: Some(200),
+    };
 
-    let response = provider.chat_vision(&base64_screenshot, prompt).await?;
-
-    let coords = parse_grounding_response(&response)?;
-
-    let enigo = enigo::Enigo::new(&enigo::Settings::default())?;
-    let mut enigo = enigo;
-
-    enigo.move_mouse(coords.x, coords.y, enigo::Coordinate::Abs)?;
-    enigo.button(enigo::Button::Left, enigo::Direction::Click)?;
-
-    Ok(GroundingResult {
-        success: true,
-        message: format!(
-            "Clicked on {} at ({}, {})",
-            coords.target, coords.x, coords.y
-        ),
-        state: PetState::Idle,
-    })
+    let response = provider.chat(req).await?;
+    parse_grounding_response(&response)
 }
 
-fn resize_screenshot(screenshot: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-    let img = image::load_from_memory(screenshot)?;
-    let resized = img.resize_exact(width, height, image::imageops::FilterType::Lanczos3);
-
-    let mut buf = Cursor::new(Vec::new());
-    resized.write_to(&mut buf, ImageFormat::Png)?;
-    Ok(buf.into_inner())
-}
-
-#[derive(Debug, Clone)]
-struct GroundingCoords {
-    target: String,
-    x: i32,
-    y: i32,
-}
-
-fn parse_grounding_response(response: &str) -> Result<GroundingCoords> {
+/// Parse a grounding reply. Tolerates ```json fences and surrounding prose by
+/// narrowing to the outermost JSON object, then parses exactly once.
+pub fn parse_grounding_response(response: &str) -> Result<GroundingPoint> {
     let trimmed = response.trim();
 
-    if trimmed.starts_with("```json") {
-        let start = trimmed.find('{').ok_or_else(|| anyhow!("No JSON found in response"))?;
-        let end = trimmed.rfind('}').ok_or_else(|| anyhow!("No JSON end found"))?;
-        let json_str = &trimmed[start..=end];
-
-        let value: serde_json::Value = serde_json::from_str(json_str)?;
-
-        let target = value["target"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing 'target' field"))?
-            .to_string();
-        let x = value["x"]
-            .as_i64()
-            .ok_or_else(|| anyhow!("Missing 'x' field"))? as i32;
-        let y = value["y"]
-            .as_i64()
-            .ok_or_else(|| anyhow!("Missing 'y' field"))? as i32;
-
-        Ok(GroundingCoords { target, x, y })
+    // Drop a markdown fence if present.
+    let body = if let Some(start) = trimmed.find("```") {
+        let after = &trimmed[start + 3..];
+        let after = after.strip_prefix("json").unwrap_or(after);
+        let end = after.find("```").unwrap_or(after.len());
+        after[..end].trim()
     } else {
-        let value: serde_json::Value = serde_json::from_str(trimmed)?;
+        trimmed
+    };
 
-        let target = value["target"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing 'target' field"))?
-            .to_string();
-        let x = value["x"]
-            .as_i64()
-            .ok_or_else(|| anyhow!("Missing 'x' field"))? as i32;
-        let y = value["y"]
-            .as_i64()
-            .ok_or_else(|| anyhow!("Missing 'y' field"))? as i32;
+    // Narrow to the outermost JSON object if the model added prose around it.
+    let json_str = match (body.find('{'), body.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &body[a..=b],
+        _ => body,
+    };
 
-        Ok(GroundingCoords { target, x, y })
-    }
+    let value: serde_json::Value = serde_json::from_str(json_str)?;
+    let target = value["target"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing 'target' field"))?
+        .to_string();
+    let x = value["x"]
+        .as_f64()
+        .ok_or_else(|| anyhow!("missing 'x' field"))?;
+    let y = value["y"]
+        .as_f64()
+        .ok_or_else(|| anyhow!("missing 'y' field"))?;
+
+    Ok(GroundingPoint { target, x, y })
 }
 
 #[cfg(test)]
@@ -114,55 +101,75 @@ mod tests {
             unimplemented!()
         }
 
-        async fn chat_vision(&self, _image: &str, _prompt: &str) -> Result<String> {
+        async fn chat(&self, _req: ChatRequest) -> Result<String> {
             Ok(self.response.clone())
         }
     }
 
-    fn create_test_png() -> Vec<u8> {
-        let img = image::DynamicImage::new_rgb8(100, 100);
-        let mut buf = Cursor::new(Vec::new());
-        img.write_to(&mut buf, ImageFormat::Png).unwrap();
-        buf.into_inner()
+    fn shot() -> Screenshot {
+        Screenshot::test_screenshot(512, 320, 1440.0, 900.0)
+    }
+
+    #[test]
+    fn test_parse_plain_json() {
+        let p = parse_grounding_response(r#"{"target":"Icon","x":50,"y":75}"#).unwrap();
+        assert_eq!(p, GroundingPoint { target: "Icon".into(), x: 50.0, y: 75.0 });
+    }
+
+    #[test]
+    fn test_parse_fenced_json() {
+        let p = parse_grounding_response("```json\n{\"target\":\"Icon\",\"x\":50,\"y\":75}\n```")
+            .unwrap();
+        assert_eq!(p.target, "Icon");
+        assert_eq!(p.x, 50.0);
+        assert_eq!(p.y, 75.0);
+    }
+
+    #[test]
+    fn test_parse_with_surrounding_prose() {
+        let p = parse_grounding_response("Here you go: {\"target\":\"OK\",\"x\":1.5,\"y\":2.5} done")
+            .unwrap();
+        assert_eq!(p.x, 1.5);
+        assert_eq!(p.y, 2.5);
+    }
+
+    #[test]
+    fn test_parse_float_coords() {
+        let p = parse_grounding_response(r#"{"target":"t","x":12.25,"y":33.75}"#).unwrap();
+        assert_eq!(p.x, 12.25);
+        assert_eq!(p.y, 33.75);
+    }
+
+    #[test]
+    fn test_parse_invalid_json_is_error() {
+        assert!(parse_grounding_response("not valid json").is_err());
+    }
+
+    #[test]
+    fn test_parse_missing_fields_is_error() {
+        assert!(parse_grounding_response(r#"{"target":"Button"}"#).is_err());
+        assert!(parse_grounding_response(r#"{"x":1,"y":2}"#).is_err());
     }
 
     #[tokio::test]
-    async fn test_ground_and_click_success() {
+    async fn test_ground_returns_point_in_image_space() {
         let provider = MockProvider {
-            response: r#"{"target": "Button", "x": 100, "y": 200}"#.to_string(),
+            response: r#"{"target":"Button","x":100,"y":200}"#.to_string(),
         };
-
-        let screenshot = create_test_png();
-        let result = ground_and_click(&provider, &screenshot).await;
-
-        assert!(result.is_ok());
-        let grounding_result = result.unwrap();
-        assert!(grounding_result.success);
+        let p = ground(&provider, "vl-model", &shot(), "the blue button").await.unwrap();
+        assert_eq!(p.target, "Button");
+        assert_eq!(p.x, 100.0);
+        assert_eq!(p.y, 200.0);
     }
 
     #[tokio::test]
-    async fn test_parse_grounding_response_with_markdown() {
-        let response = r#"```json
-{"target": "Icon", "x": 50, "y": 75}
-```"#;
-
-        let coords = parse_grounding_response(response).unwrap();
-        assert_eq!(coords.target, "Icon");
-        assert_eq!(coords.x, 50);
-        assert_eq!(coords.y, 75);
-    }
-
-    #[tokio::test]
-    async fn test_parse_grounding_response_invalid_json() {
-        let response = "not valid json";
-        let result = parse_grounding_response(response);
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_parse_grounding_response_missing_fields() {
-        let response = r#"{"target": "Button"}"#;
-        let result = parse_grounding_response(response);
-        assert!(result.is_err());
+    async fn test_ground_maps_to_screen_coords() {
+        let provider = MockProvider {
+            response: r#"{"target":"Button","x":256,"y":160}"#.to_string(),
+        };
+        let s = shot();
+        let p = ground(&provider, "vl-model", &s, "button").await.unwrap();
+        // Image center -> logical center (720, 450).
+        assert_eq!(s.map_point(p.x, p.y), (720, 450));
     }
 }

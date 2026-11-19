@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Xenon — Permission Setup</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: linear-gradient(160deg, #fffdf7 0%, #fff1e0 100%);
+            color: #3a2b34;
+            padding: 28px;
+            min-height: 100vh;
+        }
+        h1 { font-size: 22px; margin-bottom: 8px; color: #ff7aa1; }
+        .subtitle { font-size: 14px; color: #6a5a6a; margin-bottom: 24px; line-height: 1.5; }
+        .permission-card {
+            display: flex;
+            align-items: flex-start;
+            gap: 14px;
+            padding: 16px 18px;
+            margin-bottom: 16px;
+            background: rgba(255,255,255,0.75);
+            border-radius: 12px;
+            border: 1px solid rgba(255,170,190,0.35);
+        }
+        .icon { font-size: 28px; flex-shrink: 0; }
+        .permission-body { flex: 1; }
+        .permission-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+        .permission-desc { font-size: 13px; color: #6a5a6a; line-height: 1.5; }
+        .status-badge {
+            display: inline-block;
+            margin-top: 8px;
+            padding: 3px 12px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .status-ok { background: rgba(120, 200, 120, 0.25); color: #2a7a2a; }
+        .status-missing { background: rgba(255, 120, 120, 0.25); color: #a02020; }
+        .open-settings-btn {
+            margin-top: 10px;
+            padding: 8px 18px;
+            border: none;
+            border-radius: 999px;
+            background: #ff7aa1;
+            color: #fff;
+            font-size: 13px;
+            cursor: pointer;
+            font-family: inherit;
+        }
+        .open-settings-btn:hover { background: #ff5a85; }
+        .actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 8px;
+        }
+        .btn {
+            padding: 10px 22px;
+            border: none;
+            border-radius: 999px;
+            font-size: 14px;
+            cursor: pointer;
+            font-family: inherit;
+            transition: all 0.2s;
+        }
+        .btn-primary { background: #ff7aa1; color: #fff; }
+        .btn-primary:hover { background: #ff5a85; }
+        .btn-secondary { background: rgba(255,255,255,0.8); color: #3a2b34; border: 1px solid #e7d1da; }
+        .btn-secondary:hover { background: rgba(255,255,255,1); }
+    </style>
+</head>
+<body>
+    <div>
+        <h1>Setup Xenon</h1>
+        <p class="subtitle">Xenon needs a couple of macOS permissions to see your screen and control the mouse and keyboard. Click <strong>Open Settings</strong> for each item, grant access, then click <strong>Check Again</strong>.</p>
+
+        <div class="permission-card">
+            <div class="icon">♿</div>
+            <div class="permission-body">
+                <div class="permission-title">Accessibility</div>
+                <div class="permission-desc">Required to click, type, and press keyboard shortcuts. Go to System Settings → Privacy &amp; Security → Accessibility and toggle on Xenon.</div>
+                <span id="status-accessibility" class="status-badge status-missing">Checking…</span><br>
+                <button class="open-settings-btn" onclick="openSettings('accessibility')">Open Settings</button>
+            </div>
+        </div>
+
+        <div class="permission-card">
+            <div class="icon">🖥️</div>
+            <div class="permission-body">
+                <div class="permission-title">Screen Recording</div>
+                <div class="permission-desc">Required to take screenshots so Xenon can see what is on screen. Go to System Settings → Privacy &amp; Security → Screen Recording and toggle on Xenon.</div>
+                <span id="status-screen" class="status-badge status-missing">Checking…</span><br>
+                <button class="open-settings-btn" onclick="openSettings('screen')">Open Settings</button>
+            </div>
+        </div>
+
+        <div class="permission-card">
+            <div class="icon">🎙️</div>
+            <div class="permission-body">
+                <div class="permission-title">Microphone</div>
+                <div class="permission-desc">Required for voice input. Go to System Settings → Privacy &amp; Security → Microphone and toggle on Xenon.</div>
+                <span id="status-microphone" class="status-badge status-missing">Required for voice</span><br>
+                <button class="open-settings-btn" onclick="openSettings('microphone')">Open Settings</button>
+            </div>
+        </div>
+
+        <div class="actions">
+            <button class="btn btn-secondary" onclick="checkAgain()">Check Again</button>
+            <button class="btn btn-primary" id="done-btn" onclick="closeOnboarding()">Done</button>
+        </div>
+    </div>
+
+    <script>
+        const { invoke } = window.__TAURI__.core;
+
+        function setStatus(id, ok, okText, missingText) {
+            const el = document.getElementById(id);
+            if (ok) {
+                el.textContent = okText;
+                el.className = 'status-badge status-ok';
+            } else {
+                el.textContent = missingText;
+                el.className = 'status-badge status-missing';
+            }
+        }
+
+        async function checkPermissions() {
+            try {
+                const perms = await invoke('get_permissions');
+                setStatus('status-accessibility', perms.accessibility, '✓ Granted', '✗ Not granted');
+                setStatus('status-screen', perms.screen_recording, '✓ Granted', '✗ Not granted');
+
+                // Microphone is not checked via FFI; show a hint.
+                const micEl = document.getElementById('status-microphone');
+                micEl.textContent = 'Check in Settings';
+                micEl.className = 'status-badge status-missing';
+
+                // Auto-close if everything granted.
+                if (perms.accessibility && perms.screen_recording) {
+                    document.getElementById('done-btn').textContent = 'Done ✓';
+                }
+            } catch (e) {
+                console.error('get_permissions failed:', e);
+            }
+        }
+
+        async function openSettings(area) {
+            try {
+                await invoke('open_permission_settings', { area });
+            } catch (e) {
+                console.error('open_permission_settings failed:', e);
+            }
+        }
+
+        function checkAgain() {
+            checkPermissions();
+        }
+
+        function closeOnboarding() {
+            // Close the onboarding window.
+            const win = window.__TAURI__?.window?.getCurrentWindow?.();
+            if (win) { win.close(); }
+        }
+
+        checkPermissions();
+    </script>
+</body>
+</html>

@@ -4,8 +4,10 @@ mod audio_dsp;
 mod config;
 mod events;
 mod grounding;
+mod permissions;
 mod provider;
 mod runtime;
+mod screenshot;
 mod tools;
 mod tts;
 mod ui;
@@ -44,10 +46,19 @@ fn main() -> anyhow::Result<()> {
             runtime.attach_app(app.handle().clone());
             runtime.start();
 
+            // Keep the runtime alive for the lifetime of the app. Manage it
+            // before the shortcuts so `try_state::<Runtime>()` works inside
+            // the abort hotkey handler.
+            app.manage(runtime);
+
             // Real Audio Pipeline: cpal capture -> VAD -> STT, plus the
             // global-hotkey force-listen. Runs on its own dedicated thread.
             let audio_pipeline = Arc::new(AudioPipeline::new(
-                runtime.audio_sender(),
+                // We need audio_sender before the Runtime is managed; grab it
+                // from the audio pipeline's sender directly.
+                app.try_state::<Runtime>()
+                    .expect("runtime must be managed")
+                    .audio_sender(),
                 app.handle().clone(),
                 config.clone(),
             ));
@@ -65,14 +76,30 @@ fn main() -> anyhow::Result<()> {
             {
                 log::error!("global shortcut register failed: {e:#}");
             }
+
+            // Cmd+Shift+Escape: abort the running agent turn and stop TTS.
+            if let Err(e) =
+                app.global_shortcut()
+                    .on_shortcut("Cmd+Shift+Escape", move |app, _sc, event| {
+                        use tauri_plugin_global_shortcut::ShortcutState;
+                        if event.state == ShortcutState::Pressed {
+                            if let Some(rt) = app.try_state::<Runtime>() {
+                                rt.abort();
+                            }
+                        }
+                    })
+            {
+                log::error!("global shortcut register failed (abort hotkey): {e:#}");
+            }
+
             app.manage(audio_pipeline);
 
-            let audio_tx = runtime.audio_sender();
+            let audio_tx = app
+                .try_state::<Runtime>()
+                .expect("runtime must be managed")
+                .audio_sender();
             app.manage(ui::AppState::new(audio_tx));
             app.manage(config.clone());
-
-            // Keep the runtime alive for the lifetime of the app.
-            app.manage(runtime);
 
             // macOS menu-bar tray (skipTaskbar means the Dock is hidden).
             setup_tray(app)?;
@@ -81,6 +108,14 @@ fn main() -> anyhow::Result<()> {
             // startup; used to verify it renders without needing a real click.
             if std::env::args().any(|a| a == "--debug-open-settings") {
                 if let Some(w) = app.get_webview_window("settings") {
+                    let _ = w.show();
+                }
+            }
+
+            // If permissions are missing, show the onboarding window.
+            let perms = permissions::get_permissions();
+            if !perms.accessibility || !perms.screen_recording {
+                if let Some(w) = app.get_webview_window("onboarding") {
                     let _ = w.show();
                 }
             }
@@ -98,6 +133,8 @@ fn main() -> anyhow::Result<()> {
             ui::update_config,
             ui::open_settings,
             ui::stop_speaking,
+            permissions::get_permissions,
+            permissions::open_permission_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

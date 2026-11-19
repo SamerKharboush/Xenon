@@ -35,6 +35,17 @@
         "decorations": true,
         "transparent": false,
         "visible": false
+      },
+      {
+        "label": "onboarding",
+        "title": "Xenon — Permission Setup",
+        "url": "onboarding.html",
+        "width": 520,
+        "height": 440,
+        "resizable": false,
+        "decorations": true,
+        "transparent": false,
+        "visible": false
       }
     ],
     "security": {

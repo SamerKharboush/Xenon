@@ -56,6 +56,11 @@ pub struct ToolResult {
     pub result: serde_json::Value,
     pub is_error: bool,
     pub error_message: Option<String>,
+    /// Verification / perception screenshot. Skipped in serialization so the
+    /// webview never receives the base64 payload; the agent loop reads it
+    /// directly and appends it as a multimodal message.
+    #[serde(skip)]
+    pub image: Option<crate::screenshot::Screenshot>,
 }
 
 #[cfg(test)]
@@ -113,6 +118,7 @@ mod tests {
             result: serde_json::json!({"status": "ok"}),
             is_error: false,
             error_message: None,
+            image: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: ToolResult = serde_json::from_str(&json).unwrap();

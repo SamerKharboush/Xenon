@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::events::ToolCall;
@@ -21,10 +23,65 @@ pub enum ChatRole {
     Tool,
 }
 
+/// OpenAI message content: either a plain string or a list of parts
+/// (text + image_url) for vision messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl From<String> for MessageContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<&str> for MessageContent {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
-    pub content: String,
+    pub content: MessageContent,
+}
+
+impl ChatMessage {
+    pub fn text(role: ChatRole, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: MessageContent::Text(content.into()),
+        }
+    }
+
+    /// A user message carrying text plus an image data URI (vision input).
+    pub fn user_with_image(text: impl Into<String>, data_uri: String) -> Self {
+        Self {
+            role: ChatRole::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text { text: text.into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl { url: data_uri },
+                },
+            ]),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +118,41 @@ pub trait Provider: Send + Sync {
     /// Streams a chat completion. When `req.tools` is set, tool calls are
     /// delivered as complete `ToolCall`s in the final chunk.
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream>;
-    async fn chat_vision(&self, image_base64: &str, prompt: &str) -> Result<String>;
+    /// Non-streaming completion (used for grounding / vision calls).
+    async fn chat(&self, req: ChatRequest) -> Result<String>;
+}
+
+/// A 5xx from the provider: the next fallback profile may succeed.
+#[derive(Debug, thiserror::Error)]
+#[error("provider server error ({status}): {body}")]
+struct ServerError {
+    status: u16,
+    body: String,
+}
+
+/// Retryable when the failure is transient: a 5xx, a connection error, or a
+/// timeout. 4xx (bad key, bad request) and parse errors are not retried.
+pub fn is_retryable(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<ServerError>().is_some() {
+        return true;
+    }
+    if let Some(re) = err.downcast_ref::<reqwest::Error>() {
+        return re.is_timeout() || re.is_connect() || re.is_request();
+    }
+    false
+}
+
+/// Normalize an OpenAI-compatible base URL: drop a trailing slash and append
+/// `/v1` only when the URL has no path (so legacy `http://host:port` configs
+/// keep working while presets that already include `/v1` or
+/// `/v1beta/openai` are left untouched). The endpoint is then
+/// `{base_url}/chat/completions`.
+pub fn normalize_base_url(input: &str) -> String {
+    let trimmed = input.trim().trim_end_matches('/');
+    match reqwest::Url::parse(trimmed) {
+        Ok(url) if url.path() == "/" || url.path().is_empty() => format!("{trimmed}/v1"),
+        _ => trimmed.to_string(),
+    }
 }
 
 pub struct OpenAICompatProvider {
@@ -80,17 +171,13 @@ impl OpenAICompatProvider {
             .unwrap_or_else(|_| Client::new());
         Self {
             client,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: normalize_base_url(&base_url),
             api_key,
         }
     }
 
-    pub fn from_env() -> Result<Self> {
-        let base_url = std::env::var("XENON_PROVIDER_URL")
-            .unwrap_or_else(|_| "http://localhost:11434".to_string());
-        let api_key = std::env::var("XENON_PROVIDER_API_KEY").ok();
-
-        Ok(Self::new(base_url, api_key))
+    fn endpoint(&self) -> String {
+        format!("{}/chat/completions", self.base_url)
     }
 
     fn build_headers(&self) -> reqwest::header::HeaderMap {
@@ -122,6 +209,13 @@ impl OpenAICompatProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await?;
+            if status.is_server_error() {
+                return Err(ServerError {
+                    status: status.as_u16(),
+                    body: text,
+                }
+                .into());
+            }
             return Err(anyhow!("API request failed: {} - {}", status, text));
         }
 
@@ -288,8 +382,6 @@ impl OpenAICompatProvider {
 #[async_trait]
 impl Provider for OpenAICompatProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
-
         let mut body = serde_json::json!({
             "model": req.model,
             "messages": req.messages,
@@ -303,41 +395,122 @@ impl Provider for OpenAICompatProvider {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
 
-        let response = self.send_json(url, body).await?;
+        let response = self.send_json(self.endpoint(), body).await?;
         Ok(self.stream_response(response))
     }
 
-    async fn chat_vision(&self, image_base64: &str, prompt: &str) -> Result<String> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
-
-        let body = serde_json::json!({
-            "model": "gpt-4-vision-preview",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": format!("data:image/png;base64,{}", image_base64)
-                        }
-                    }
-                ]
-            }],
-            "max_tokens": 500,
+    async fn chat(&self, req: ChatRequest) -> Result<String> {
+        let mut body = serde_json::json!({
+            "model": req.model,
+            "messages": req.messages,
+            "stream": false,
+            "temperature": req.temperature.unwrap_or(0.7),
         });
+        if let Some(max_tokens) = req.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
 
-        let response = self.send_json(url, body).await?;
+        let response = self.send_json(self.endpoint(), body).await?;
         let json: Value = response.json().await?;
-        let content = json["choices"][0]["message"]["content"]
+        Ok(json["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
-            .to_string();
+            .to_string())
+    }
+}
 
-        Ok(content)
+/// Provider Hub fallback: try each profile in order, transparently moving on
+/// when the primary hits a connection error, timeout or 5xx. A non-retryable
+/// error (e.g. 4xx) is surfaced immediately. A `xenon-notice` is emitted at
+/// most once per instance when a fallback actually happens.
+pub struct FallbackProvider {
+    providers: Vec<Arc<dyn Provider>>,
+    names: Vec<String>,
+    app: Option<tauri::AppHandle>,
+    notified: AtomicBool,
+}
+
+impl FallbackProvider {
+    pub fn new(
+        providers: Vec<Arc<dyn Provider>>,
+        names: Vec<String>,
+        app: Option<tauri::AppHandle>,
+    ) -> Self {
+        Self {
+            providers,
+            names,
+            app,
+            notified: AtomicBool::new(false),
+        }
+    }
+
+    fn name_at(&self, i: usize) -> &str {
+        self.names.get(i).map(|s| s.as_str()).unwrap_or("?")
+    }
+
+    fn notify_once(&self, tried: &str) {
+        if self.notified.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let msg = format!(
+            "Primary provider unavailable; falling back to another profile ({tried})."
+        );
+        log::warn!("{msg}");
+        if let Some(app) = &self.app {
+            use tauri::Emitter;
+            let _ = app.emit("xenon-notice", msg);
+        }
+    }
+
+    /// Try each provider in order. `attempt` is `chat_stream` or `chat`.
+    async fn retry_all<T, F, Fut>(&self, mut attempt: F) -> Result<T>
+    where
+        F: FnMut(usize) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut last_err: Option<anyhow::Error> = None;
+        for i in 0..self.providers.len() {
+            match attempt(i).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if !is_retryable(&e) {
+                        return Err(e);
+                    }
+                    log::warn!("provider {} failed ({}), trying next", self.name_at(i), e);
+                    last_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            let tried = self.names.join(" -> ");
+            self.notify_once(&tried);
+            return Err(e);
+        }
+        Err(anyhow!("no providers configured"))
+    }
+}
+
+#[async_trait]
+impl Provider for FallbackProvider {
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream> {
+        // Each attempt clones the request; only the profile that accepts it
+        // consumes it. Streaming failures mid-stream are not retried (the
+        // model already saw partial output).
+        self.retry_all(|i| {
+            let p = self.providers[i].clone();
+            let req = req.clone();
+            async move { p.chat_stream(req).await }
+        })
+        .await
+    }
+
+    async fn chat(&self, req: ChatRequest) -> Result<String> {
+        self.retry_all(|i| {
+            let p = self.providers[i].clone();
+            let req = req.clone();
+            async move { p.chat(req).await }
+        })
+        .await
     }
 }
 
@@ -354,19 +527,29 @@ mod tests {
 
         let req = ChatRequest {
             model: "llama2".to_string(),
-            messages: vec![ChatMessage {
-                role: ChatRole::User,
-                content: "Hello".to_string(),
-            }],
+            messages: vec![ChatMessage::text(ChatRole::User, "Hello")],
             tools: None,
             stream: true,
             temperature: Some(0.7),
             max_tokens: Some(100),
         };
 
-        assert_eq!(provider.base_url, "http://localhost:11434");
+        assert_eq!(provider.base_url, "http://localhost:11434/v1");
+        assert_eq!(provider.endpoint(), "http://localhost:11434/v1/chat/completions");
         assert_eq!(provider.api_key, Some("test-key".to_string()));
         assert_eq!(req.model, "llama2");
+    }
+
+    #[test]
+    fn test_normalize_base_url() {
+        assert_eq!(normalize_base_url("http://localhost:11434"), "http://localhost:11434/v1");
+        assert_eq!(normalize_base_url("http://localhost:1234/v1/"), "http://localhost:1234/v1");
+        assert_eq!(normalize_base_url("https://api.openai.com/v1"), "https://api.openai.com/v1");
+        assert_eq!(
+            normalize_base_url("https://generativelanguage.googleapis.com/v1beta/openai"),
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+        assert_eq!(normalize_base_url("https://api.anthropic.com/v1"), "https://api.anthropic.com/v1");
     }
 
     #[test]
@@ -390,9 +573,201 @@ mod tests {
     fn test_chat_message_role_is_lowercase() {
         let json = serde_json::to_string(&ChatMessage {
             role: ChatRole::Tool,
-            content: "{}".to_string(),
+            content: MessageContent::Text("{}".to_string()),
         })
         .unwrap();
         assert_eq!(json, r#"{"role":"tool","content":"{}"}"#);
+    }
+
+    /// Vision messages serialize to OpenAI's content-parts shape.
+    #[test]
+    fn test_vision_message_serializes_parts() {
+        let msg = ChatMessage::user_with_image("find the button", "data:image/png;base64,AAAA".to_string());
+        let json = serde_json::to_string(&msg).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let parts = value["content"].as_array().expect("content parts");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "find the button");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn test_text_message_serializes_string() {
+        let msg = ChatMessage::text(ChatRole::User, "hi");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(json, r#"{"role":"user","content":"hi"}"#);
+    }
+
+    // ---- fallback ordering -------------------------------------------------
+
+    /// A provider that always fails. `retryable` picks a 5xx (retryable) or a
+    /// plain client error (not retryable).
+    struct FailingProvider {
+        retryable: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FailingProvider {
+        fn err(&self) -> anyhow::Error {
+            if self.retryable {
+                ServerError {
+                    status: 503,
+                    body: "unavailable".to_string(),
+                }
+                .into()
+            } else {
+                anyhow::anyhow!("client error")
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.err())
+        }
+
+        async fn chat(&self, _req: ChatRequest) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.err())
+        }
+    }
+
+    /// An OK provider that returns a fixed chat result.
+    struct OkProvider {
+        name: String,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for OkProvider {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(vec![Ok(ChatChunk {
+                content: "ok".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+            })])))
+        }
+
+        async fn chat(&self, _req: ChatRequest) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("ok:{}", self.name))
+        }
+    }
+
+    fn req() -> ChatRequest {
+        ChatRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            tools: None,
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fallback_order_on_retryable_error() {
+        let c1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback = FallbackProvider::new(
+            vec![
+                Arc::new(FailingProvider {
+                    retryable: true,
+                    calls: c1.clone(),
+                }),
+                Arc::new(OkProvider {
+                    name: "second".into(),
+                    calls: c2.clone(),
+                }),
+            ],
+            vec!["first".into(), "second".into()],
+            None,
+        );
+
+        let out = fallback.chat(req()).await.unwrap();
+        assert_eq!(out, "ok:second");
+        assert_eq!(c1.load(Ordering::SeqCst), 1, "first tried once");
+        assert_eq!(c2.load(Ordering::SeqCst), 1, "second tried once");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_skips_retry_on_client_error() {
+        let c1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback = FallbackProvider::new(
+            vec![
+                Arc::new(FailingProvider {
+                    retryable: false,
+                    calls: c1.clone(),
+                }),
+                Arc::new(OkProvider {
+                    name: "second".into(),
+                    calls: c2.clone(),
+                }),
+            ],
+            vec!["first".into(), "second".into()],
+            None,
+        );
+
+        let err = fallback.chat(req()).await.unwrap_err();
+        assert!(err.to_string().contains("client error"));
+        assert_eq!(c1.load(Ordering::SeqCst), 1);
+        assert_eq!(c2.load(Ordering::SeqCst), 0, "second must not be tried on 4xx");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_stops_after_first_success() {
+        let c1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback = FallbackProvider::new(
+            vec![
+                Arc::new(OkProvider {
+                    name: "first".into(),
+                    calls: c1.clone(),
+                }),
+                Arc::new(OkProvider {
+                    name: "second".into(),
+                    calls: c2.clone(),
+                }),
+            ],
+            vec!["first".into(), "second".into()],
+            None,
+        );
+
+        let out = fallback.chat(req()).await.unwrap();
+        assert_eq!(out, "ok:first");
+        assert_eq!(c1.load(Ordering::SeqCst), 1);
+        assert_eq!(c2.load(Ordering::SeqCst), 0, "second must not be tried");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_returns_last_error_when_all_fail() {
+        let fallback = FallbackProvider::new(
+            vec![
+                Arc::new(FailingProvider {
+                    retryable: true,
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+                Arc::new(FailingProvider {
+                    retryable: true,
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+            ],
+            vec!["a".into(), "b".into()],
+            None,
+        );
+
+        let err = fallback.chat(req()).await.unwrap_err();
+        assert!(err.to_string().contains("503"));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_empty_is_error() {
+        let fallback = FallbackProvider::new(vec![], vec![], None);
+        assert!(fallback.chat(req()).await.is_err());
     }
 }

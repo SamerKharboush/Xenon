@@ -1,4 +1,5 @@
 use async_channel::{bounded, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
@@ -6,7 +7,7 @@ use tokio::sync::RwLock;
 use crate::agent::Agent;
 use crate::config::XenonConfig;
 use crate::events::{AgentAction, AudioEvent, PetState};
-use crate::provider::{OpenAICompatProvider, Provider};
+use crate::provider::{FallbackProvider, OpenAICompatProvider, Provider};
 use crate::tools;
 use crate::tts::Tts;
 
@@ -20,6 +21,8 @@ pub struct Runtime {
     /// `None` in tests (no Tauri app), `Some` in production.
     app: Option<AppHandle>,
     tts: Arc<Tts>,
+    /// Set by Cmd+Shift+Escape to abort a running agent turn.
+    abort: Arc<AtomicBool>,
 }
 
 impl Runtime {
@@ -37,6 +40,7 @@ impl Runtime {
             config,
             app: None,
             tts,
+            abort: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -47,7 +51,15 @@ impl Runtime {
         self.app = Some(app);
     }
 
-    /// Spawn the presentation and audio loops.  Call once after
+    /// Abort the currently running agent turn (Cmd+Shift+Escape).
+    /// Also stops TTS playback so the user gets immediate silence.
+    pub fn abort(&self) {
+        self.abort.store(true, Ordering::SeqCst);
+        self.tts.stop();
+        log::info!("runtime: abort requested");
+    }
+
+    /// Spawn the presentation and audio loops. Call once after
     /// `attach_app`.
     pub fn start(&self) {
         let action_rx = self.action_rx.clone();
@@ -62,8 +74,10 @@ impl Runtime {
         let action_tx = self.action_tx.clone();
         let config = self.config.clone();
         let state = self.state.clone();
+        let abort = self.abort.clone();
+        let app = self.app.clone();
         tauri::async_runtime::spawn(async move {
-            Self::audio_loop(audio_rx, action_tx, config, state).await;
+            Self::audio_loop(audio_rx, action_tx, config, state, abort, app).await;
         });
     }
 
@@ -154,6 +168,8 @@ impl Runtime {
         action_tx: Sender<AgentAction>,
         config: Arc<RwLock<XenonConfig>>,
         state: Arc<RwLock<PetState>>,
+        abort: Arc<AtomicBool>,
+        app: Option<AppHandle>,
     ) {
         while let Ok(event) = audio_rx.recv().await {
             match event {
@@ -170,7 +186,8 @@ impl Runtime {
                         );
                         continue;
                     }
-                    Self::run_agent(&utterance.text, &action_tx, &config).await;
+                    abort.store(false, Ordering::SeqCst);
+                    Self::run_agent(&utterance.text, &action_tx, &config, &abort, &app).await;
                 }
                 AudioEvent::Greet => {
                     let cfg = config.read().await;
@@ -179,7 +196,8 @@ impl Runtime {
                         cfg.pet_name
                     );
                     drop(cfg);
-                    Self::run_agent(&greeting, &action_tx, &config).await;
+                    abort.store(false, Ordering::SeqCst);
+                    Self::run_agent(&greeting, &action_tx, &config, &abort, &app).await;
                 }
                 // Hotkey always wins; VAD onset is suppressed by the echo
                 // guard so the pet cannot barge itself out of Speaking.
@@ -223,14 +241,38 @@ impl Runtime {
         always && matches!(*state.read().await, PetState::Speaking)
     }
 
-    async fn run_agent(text: &str, action_tx: &Sender<AgentAction>, config: &Arc<RwLock<XenonConfig>>) {
+    async fn run_agent(
+        text: &str,
+        action_tx: &Sender<AgentAction>,
+        config: &Arc<RwLock<XenonConfig>>,
+        abort: &Arc<AtomicBool>,
+        app: &Option<AppHandle>,
+    ) {
         let cfg = config.read().await.clone();
-        let provider: Arc<dyn Provider> = Arc::new(OpenAICompatProvider::new(
-            cfg.provider.provider_url.clone(),
-            cfg.provider.provider_api_key.clone(),
+
+        let profiles = cfg.ordered_profiles();
+        let vision_model = cfg.primary().effective_vision_model().to_string();
+
+        let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
+        for p in &profiles {
+            providers.push(Arc::new(OpenAICompatProvider::new(
+                p.base_url.clone(),
+                p.api_key.clone(),
+            )));
+        }
+        let provider: Arc<dyn Provider> = Arc::new(FallbackProvider::new(
+            providers,
+            profiles.iter().map(|p| p.name.clone()).collect(),
+            app.clone(),
         ));
-        let agent_tools = tools::create_default_tools();
-        let agent = Agent::new(provider, agent_tools, cfg);
+
+        let ctx = tools::ToolContext {
+            app: app.clone(),
+            provider: Some(provider.clone()),
+            vision_model,
+        };
+        let agent_tools = tools::create_default_tools(ctx);
+        let agent = Agent::with_abort(provider, agent_tools, cfg, abort.clone());
 
         if let Err(e) = agent.run_utterance(text, action_tx.clone()).await {
             log::error!("Agent error: {}", e);
@@ -247,10 +289,6 @@ impl Runtime {
     /// (pet taps, text input, wake word) without owning the Runtime.
     pub fn audio_sender(&self) -> Sender<AudioEvent> {
         self.audio_tx.clone()
-    }
-
-    fn state(&self) -> Arc<RwLock<PetState>> {
-        self.state.clone()
     }
 }
 
@@ -288,7 +326,7 @@ mod tests {
     async fn test_runtime_creation() {
         let runtime = test_runtime();
         // state starts at Idle
-        let s = runtime.state().read().await.clone();
+        let s = runtime.state.read().await.clone();
         assert!(matches!(s, PetState::Idle));
     }
 
@@ -308,7 +346,7 @@ mod tests {
     async fn test_greet_event_reaches_agent_loop() {
         // tts disabled: keep tests silent (no fallback `say`); TEST-NET-1
         // provider URL keeps Thinking observable while HTTP times out.
-        let cfg = XenonConfig {
+        let mut cfg = XenonConfig {
             tts_enabled: false,
             provider: crate::config::ProviderConfig {
                 provider_url: "http://192.0.2.1:9".to_string(),
@@ -316,11 +354,12 @@ mod tests {
             },
             ..Default::default()
         };
+        cfg.migrate();
         let config = Arc::new(RwLock::new(cfg));
         let runtime = Runtime::new(config);
         runtime.start();
 
-        let state = runtime.state();
+        let state = runtime.state.clone();
         runtime
             .audio_sender()
             .send(AudioEvent::Greet)
@@ -342,7 +381,7 @@ mod tests {
     /// A Speech event must also drive the state machine through Thinking.
     #[tokio::test]
     async fn test_speech_event_reaches_agent_loop() {
-        let cfg = XenonConfig {
+        let mut cfg = XenonConfig {
             tts_enabled: false, // keep tests silent (no fallback `say`)
             provider: crate::config::ProviderConfig {
                 provider_url: "http://192.0.2.1:9".to_string(),
@@ -350,11 +389,12 @@ mod tests {
             },
             ..Default::default()
         };
+        cfg.migrate();
         let config = Arc::new(RwLock::new(cfg));
         let runtime = Runtime::new(config);
         runtime.start();
 
-        let state = runtime.state();
+        let state = runtime.state.clone();
         runtime
             .audio_sender()
             .send(AudioEvent::Speech(Utterance {

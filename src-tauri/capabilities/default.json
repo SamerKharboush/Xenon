@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/capabilities.json",
   "identifier": "default",
   "description": "Default capabilities for Xenon main and settings windows",
-  "windows": ["main", "settings"],
+  "windows": ["main", "settings", "onboarding"],
   "permissions": [
     "core:default",
     "core:event:default",

@@ -90,7 +90,8 @@ pub fn trigger_listen(window: Window) -> Result<(), String> {
 pub async fn get_config(
     config: State<'_, ArcRwLockConfig>,
 ) -> Result<XenonConfig, String> {
-    let guard = config.read().await;
+    let mut guard = config.write().await;
+    guard.migrate();
     Ok(guard.clone())
 }
 

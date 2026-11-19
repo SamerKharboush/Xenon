@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -9,47 +10,77 @@ use crate::events::{AgentAction, PetState, ToolCall, ToolResult};
 use crate::provider::{ChatMessage, ChatRequest, ChatRole, Provider};
 use crate::tools::{tools_to_schemas, Tool};
 
+/// Appended to the system prompt so the model knows the computer-control
+/// contract: it must look before acting, and every action returns a fresh
+/// screenshot for verification.
+const TOOL_HINT: &str = "\n\nYou have computer-control tools: look, click, type_text, \
+press_keys, scroll, open_app, wait. Call look to see the screen. Call click with a short \
+description of the element to click (e.g. \"the blue Spotify icon\"). Every action returns a \
+fresh screenshot so you can verify the result. Keep going until the user's request is done, \
+then reply with a short spoken confirmation.";
+
 pub struct Agent {
     provider: Arc<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
     max_iterations: usize,
     config: XenonConfig,
+    /// Set by the Cmd+Shift+Escape abort hotkey to stop the turn early.
+    abort: Arc<AtomicBool>,
 }
 
 impl Agent {
+    /// Convenience constructor with a fresh abort flag. Test-only; production
+    /// uses `with_abort` so the Cmd+Shift+Escape hotkey can stop the turn.
+    #[cfg(test)]
     pub fn new(provider: Arc<dyn Provider>, tools: Vec<Box<dyn Tool>>, config: XenonConfig) -> Self {
+        Self::with_abort(provider, tools, config, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn with_abort(
+        provider: Arc<dyn Provider>,
+        tools: Vec<Box<dyn Tool>>,
+        config: XenonConfig,
+        abort: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             provider,
             tools,
-            max_iterations: 5,
+            max_iterations: config.max_steps.max(1),
             config,
+            abort,
         }
+    }
+
+    fn aborted(&self) -> bool {
+        self.abort.load(Ordering::SeqCst)
     }
 
     /// Run a full ReAct turn for *text*, streaming sentences to *emit* as
     /// they are recognised. Tool errors are fed back into the conversation
-    /// so the model can react; the loop caps at `max_iterations`.
+    /// so the model can react; the loop caps at `max_steps`. If the abort
+    /// flag is set, the turn stops immediately.
     pub async fn run_utterance(&self, text: &str, emit: Sender<AgentAction>) -> Result<()> {
         let _ = emit
             .send(AgentAction::SetPetState(PetState::Thinking))
             .await;
 
+        let system = format!("{}{}", self.config.system_prompt, TOOL_HINT);
         let mut messages = vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: self.config.system_prompt.clone(),
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: text.to_string(),
-            },
+            ChatMessage::text(ChatRole::System, system),
+            ChatMessage::text(ChatRole::User, text.to_string()),
         ];
 
         let schemas = tools_to_schemas(&self.tools);
+        let model = self.config.primary().model;
 
         for _ in 0..self.max_iterations {
+            if self.aborted() {
+                log::info!("agent turn aborted");
+                break;
+            }
+
             let req = ChatRequest {
-                model: self.config.provider.model_name.clone(),
+                model: model.clone(),
                 messages: messages.clone(),
                 tools: Some(schemas.clone()),
                 stream: true,
@@ -64,6 +95,9 @@ impl Agent {
             let mut tool_calls: Vec<ToolCall> = Vec::new();
 
             while let Some(chunk) = stream.next().await {
+                if self.aborted() {
+                    break;
+                }
                 let chunk = chunk?;
                 if !chunk.content.is_empty() {
                     full_content.push_str(&chunk.content);
@@ -75,6 +109,11 @@ impl Agent {
                 if !chunk.tool_calls.is_empty() {
                     tool_calls = chunk.tool_calls;
                 }
+            }
+
+            if self.aborted() {
+                log::info!("agent turn aborted mid-stream");
+                break;
             }
 
             // Flush any remaining partial sentence.
@@ -100,6 +139,7 @@ impl Agent {
                             result: serde_json::json!({}),
                             is_error: true,
                             error_message: Some(e.to_string()),
+                            image: None,
                         },
                     },
                     None => ToolResult {
@@ -107,21 +147,23 @@ impl Agent {
                         result: serde_json::json!({}),
                         is_error: true,
                         error_message: Some(format!("Tool not found: {}", tool_call.name)),
+                        image: None,
                     },
                 };
 
                 let is_error = result.is_error;
+                let image = result.image.clone();
                 let _ = emit.send(AgentAction::ToolResult(result.clone())).await;
 
                 // Feed result back into conversation so the model can react.
-                messages.push(ChatMessage {
-                    role: ChatRole::Assistant,
-                    content: if full_content.is_empty() {
+                messages.push(ChatMessage::text(
+                    ChatRole::Assistant,
+                    if full_content.is_empty() {
                         format!("Called tool {} with args: {}", tool_call.name, tool_call.args)
                     } else {
                         full_content.clone()
                     },
-                });
+                ));
 
                 let result_json = if is_error {
                     serde_json::json!({ "error": result.error_message })
@@ -129,10 +171,23 @@ impl Agent {
                     result.result.clone()
                 };
 
-                messages.push(ChatMessage {
-                    role: ChatRole::Tool,
-                    content: serde_json::to_string(&result_json)?,
-                });
+                messages.push(ChatMessage::text(
+                    ChatRole::Tool,
+                    serde_json::to_string(&result_json)?,
+                ));
+
+                // A screenshot must travel in a user message (tool messages
+                // are plain strings in OpenAI format).
+                if let Some(shot) = image {
+                    let summary = result.result["summary"]
+                        .as_str()
+                        .unwrap_or("Screenshot after the action.")
+                        .to_string();
+                    messages.push(ChatMessage::user_with_image(
+                        format!("{summary} (tool: {})", tool_call.name),
+                        shot.data_uri(),
+                    ));
+                }
 
                 continue;
             }
@@ -143,11 +198,6 @@ impl Agent {
 
         let _ = emit.send(AgentAction::TurnFinished).await;
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn get_tools(&self) -> &Vec<Box<dyn Tool>> {
-        &self.tools
     }
 }
 
@@ -309,7 +359,7 @@ mod tests {
             )))
         }
 
-        async fn chat_vision(&self, _image: &str, _prompt: &str) -> Result<String> {
+        async fn chat(&self, _req: ChatRequest) -> Result<String> {
             Ok("{}".to_string())
         }
     }
@@ -344,6 +394,7 @@ mod tests {
                 } else {
                     None
                 },
+                image: None,
             })
         }
     }
@@ -477,6 +528,32 @@ mod tests {
 
         assert!(actions.iter().any(|a| matches!(a, AgentAction::Speak(_))));
         assert!(actions.iter().any(|a| matches!(a, AgentAction::TurnFinished)));
+    }
+
+    /// When the abort flag is already set, the agent must not call the
+    /// provider and must still emit TurnFinished so the pet returns to Idle.
+    #[tokio::test]
+    async fn test_agent_aborts_without_provider_call() {
+        let provider = Arc::new(MockProvider {
+            chunks: vec![],
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let flag = Arc::new(AtomicBool::new(true));
+        let agent = Agent::with_abort(provider, vec![], crate::config::XenonConfig::default(), flag);
+        let (tx, rx) = async_channel::bounded(32);
+
+        agent.run_utterance("Test", tx).await.unwrap();
+
+        let actions: Vec<AgentAction> = {
+            let mut v = Vec::new();
+            while let Ok(a) = rx.try_recv() {
+                v.push(a);
+            }
+            v
+        };
+
+        assert!(actions.iter().any(|a| matches!(a, AgentAction::TurnFinished)));
+        assert!(!actions.iter().any(|a| matches!(a, AgentAction::Speak(_))));
     }
 
     /// A tool that errors must still produce a TurnFinished so the pet
