@@ -84,8 +84,19 @@ impl Runtime {
             if let Some(new_state) = next {
                 let mut guard = state.write().await;
                 if *guard != new_state {
-                    *guard = new_state.clone();
-                    drop(guard);
+                    // Barge-in: leaving Speaking toward Listening means the user
+                    // wants to cut the pet off — ask the TTS engine to stop.
+                    if *guard == PetState::Speaking && new_state == PetState::Listening {
+                        drop(guard);
+                        // TASK-3 HOOK: stop playback here.
+                        tts.request_stop();
+                        let mut g = state.write().await;
+                        *g = new_state.clone();
+                        drop(g);
+                    } else {
+                        *guard = new_state.clone();
+                        drop(guard);
+                    }
                     if let Some(app) = &app {
                         let _ = app.emit("pet-state", &new_state);
                     }
@@ -125,8 +136,18 @@ impl Runtime {
                     drop(cfg);
                     Self::run_agent(&greeting, &action_tx, &config).await;
                 }
+                // Hotkey barge-in / speech onset: swap the pet to Listening.
+                // TTS-stop on barge-in is wired here in task 3.
+                AudioEvent::ForceListen | AudioEvent::Listening => {
+                    let _ = action_tx
+                        .send(AgentAction::SetPetState(PetState::Listening))
+                        .await;
+                }
+                // A listen window closed with nothing to transcribe: back to Idle.
                 AudioEvent::Silence => {
-                    // No-op: the stub audio pipeline never emits Silence.
+                    let _ = action_tx
+                        .send(AgentAction::SetPetState(PetState::Idle))
+                        .await;
                 }
             }
         }

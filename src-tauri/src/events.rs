@@ -6,6 +6,12 @@ pub enum AudioEvent {
     Silence,
     /// User tapped the pet: greet them by name.
     Greet,
+    /// Global hotkey (Cmd+Shift+Space): force the mic open and barge-in out of
+    /// any Speaking state into Listening. The runtime switches pet state.
+    ForceListen,
+    /// The audio pipeline opened the mic / detected speech onset: show the
+    /// Listening state + waveform.
+    Listening,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

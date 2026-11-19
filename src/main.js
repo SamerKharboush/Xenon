@@ -41,13 +41,48 @@ class PetRenderer {
         this.idleBehaviorTimer = 0;
         this.nextIdleBehavior = 2500 + Math.random() * 3000;
         this.currentBehavior = null;
-        
+
+        // Live mic RMS (0..1) from the Rust `audio-level` event.
+        this.audioLevel = 0;
+
+        this.createBubble();
         this.resize();
         window.addEventListener('resize', () => this.resize());
         this.setupTauriListener();
         this.setupMouseTracking();
         this.animate();
         this.reportReady();
+    }
+
+    // A small speech bubble reused by TTS (`pet-speech`) and notices
+    // (`xenon-notice`), positioned above the pet.
+    createBubble() {
+        const el = document.createElement('div');
+        el.id = 'xenon-bubble';
+        el.style.cssText = [
+            'position:fixed', 'left:50%', 'transform:translate(-50%,0)',
+            'bottom:calc(50% + 42px)', 'max-width:260px',
+            'padding:8px 12px', 'border-radius:12px',
+            'background:rgba(20,20,30,0.92)', 'color:#e6f4ff',
+            'font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+            'border:1px solid rgba(100,200,255,0.35)',
+            'box-shadow:0 4px 20px rgba(0,0,0,0.35)',
+            'pointer-events:none', 'opacity:0', 'transition:opacity .18s ease',
+            'z-index:10', 'text-align:center',
+        ].join(';');
+        document.body.appendChild(el);
+        this.bubble = el;
+        this.bubbleTimeout = null;
+    }
+
+    showBubble(text, autoHideMs = 2600) {
+        if (!this.bubble || !text) return;
+        this.bubble.textContent = text;
+        this.bubble.style.opacity = '1';
+        if (this.bubbleTimeout) clearTimeout(this.bubbleTimeout);
+        this.bubbleTimeout = setTimeout(() => {
+            if (this.bubble) this.bubble.style.opacity = '0';
+        }, autoHideMs);
     }
 
     resize() {
@@ -67,8 +102,18 @@ class PetRenderer {
         });
 
         listen('pet-speech', (event) => {
-            // Sentence-by-sentence TTS hook. Real lip-sync is a later task.
-            // console.log('[xenon] speak:', event.payload);
+            // Show the spoken sentence as a speech bubble above the pet.
+            this.showBubble(event.payload);
+        });
+
+        // Rust notices: missing models, mic-permission problems, etc.
+        listen('xenon-notice', (event) => {
+            this.showBubble(event.payload, 6000);
+        });
+
+        // Live mic level drives the Listening waveform.
+        listen('audio-level', (event) => {
+            this.audioLevel = Math.max(0, Math.min(1, event.payload && event.payload.rms) || 0);
         });
 
         // Real mouse input on the webview.
@@ -424,12 +469,20 @@ class PetRenderer {
         // Focused eyes
         this.drawEyes(ctx, 0, -2, 1);
         
-        // Waveform mouth
+        // Waveform mouth — driven by the live mic level when available, falling
+        // back to a gentle synthetic pulse before audio arrives.
         const time = now / 80;
         const barCount = 5;
+        const live = this.audioLevel || 0;
         ctx.fillStyle = COLORS.accent;
         for (let i = 0; i < barCount; i++) {
-            const height = (Math.sin(time + i * 0.8) * 8 + 8) / 2;
+            let height;
+            if (live > 0) {
+                const shape = 0.5 + 0.5 * Math.abs(Math.sin(time + i * 0.6));
+                height = Math.max(2, live * 26 * shape);
+            } else {
+                height = (Math.sin(time + i * 0.8) * 8 + 8) / 2;
+            }
             const x = (i - barCount / 2) * 4;
             ctx.fillRect(x - 1, 6 - height / 2, 2, height);
         }

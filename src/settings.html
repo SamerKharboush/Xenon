@@ -193,6 +193,37 @@
                 <input type="checkbox" id="wake_word_enabled">
                 <label for="wake_word_enabled">Wake word detection enabled</label>
             </div>
+            <div class="field">
+                <label for="listen_mode">Listen Mode</label>
+                <select id="listen_mode">
+                    <option value="hotkey">Hotkey (Cmd+Shift+Space)</option>
+                    <option value="always">Always listening</option>
+                </select>
+                <div class="hint">Hotkey: the mic opens only when you press Cmd+Shift+Space. Always: the VAD is armed continuously.</div>
+            </div>
+            <div class="field">
+                <label for="language">Language</label>
+                <input type="text" id="language" placeholder="en">
+                <div class="hint">Speech-to-text language code, or "auto" to detect.</div>
+            </div>
+            <div class="field">
+                <label for="silence_ms">Trailing Silence (ms)</label>
+                <input type="number" id="silence_ms" min="100" max="2000" step="50">
+                <div class="hint">Silence duration that ends an utterance (default 700).</div>
+            </div>
+            <div class="field">
+                <label for="stt_unload_minutes">Unload STT Model After (min)</label>
+                <input type="number" id="stt_unload_minutes" min="0" max="120" step="1">
+                <div class="hint">Frees RAM by unloading whisper after this many idle minutes (default 5, 0 = keep loaded).</div>
+            </div>
+            <div class="field">
+                <label for="whisper_model_path">Whisper Model Path</label>
+                <input type="text" id="whisper_model_path" placeholder="~/models/whisper/ggml-large-v3-turbo.bin">
+            </div>
+            <div class="field">
+                <label for="vad_model_path">Voice-Activity Model Path</label>
+                <input type="text" id="vad_model_path" placeholder="~/models/whisper/ggml-silero-v6.2.0.bin">
+            </div>
         </div>
         
         <div class="button-group">
@@ -215,6 +246,12 @@
                 document.getElementById('system_prompt').value = config.system_prompt || '';
                 document.getElementById('voice_enabled').checked = config.voice_enabled !== false;
                 document.getElementById('wake_word_enabled').checked = config.wake_word_enabled !== false;
+                document.getElementById('listen_mode').value = config.listen_mode || 'hotkey';
+                document.getElementById('language').value = config.language || 'en';
+                document.getElementById('silence_ms').value = config.silence_ms ?? 700;
+                document.getElementById('stt_unload_minutes').value = config.stt_unload_minutes ?? 5;
+                document.getElementById('whisper_model_path').value = config.whisper_model_path || '';
+                document.getElementById('vad_model_path').value = config.vad_model_path || '';
             } catch (e) {
                 console.error('Failed to load config:', e);
             }
@@ -230,6 +267,12 @@
                 system_prompt: document.getElementById('system_prompt').value,
                 voice_enabled: document.getElementById('voice_enabled').checked,
                 wake_word_enabled: document.getElementById('wake_word_enabled').checked,
+                listen_mode: document.getElementById('listen_mode').value,
+                language: document.getElementById('language').value.trim() || 'en',
+                silence_ms: Number(document.getElementById('silence_ms').value) || 700,
+                stt_unload_minutes: Number(document.getElementById('stt_unload_minutes').value),
+                whisper_model_path: document.getElementById('whisper_model_path').value.trim(),
+                vad_model_path: document.getElementById('vad_model_path').value.trim(),
             };
             
             try {

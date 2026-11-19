@@ -2,6 +2,49 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// Default whisper STT model path: the first candidate that exists, else the
+/// first candidate (so the UI shows a meaningful placeholder).
+fn default_whisper_model_path() -> String {
+    for c in [
+        home_dir().join("models/whisper/ggml-large-v3-turbo.bin"),
+        app_support_models().join("ggml-base.en.bin"),
+    ] {
+        if c.exists() {
+            return c.to_string_lossy().to_string();
+        }
+    }
+    home_dir()
+        .join("models/whisper/ggml-large-v3-turbo.bin")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Default Silero VAD model path (whisper.cpp ggml format).
+fn default_vad_model_path() -> String {
+    for c in [
+        home_dir().join("models/whisper/ggml-silero-v6.2.0.bin"),
+        app_support_models().join("ggml-silero-v6.2.0.bin"),
+    ] {
+        if c.exists() {
+            return c.to_string_lossy().to_string();
+        }
+    }
+    home_dir()
+        .join("models/whisper/ggml-silero-v6.2.0.bin")
+        .to_string_lossy()
+        .to_string()
+}
+
+fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn app_support_models() -> PathBuf {
+    // ~/Library/Application Support/com.xenon.app/models
+    home_dir()
+        .join("Library/Application Support/com.xenon.app/models")
+}
+
 /// LLM endpoint settings. Flattened into XenonConfig so the config file keeps
 /// its historical flat shape (`provider_url`, `provider_api_key`,
 /// `model_name` at the top level).
@@ -31,6 +74,37 @@ pub struct XenonConfig {
     pub wake_word_enabled: bool,
     pub wake_word: String,
     pub system_prompt: String,
+    /// "hotkey" (default) or "always".
+    #[serde(default = "default_listen_mode")]
+    pub listen_mode: String,
+    /// STT language code, or "auto"/"" to auto-detect.
+    #[serde(default = "default_language")]
+    pub language: String,
+    /// Trailing silence (ms) that ends a speech segment.
+    #[serde(default = "default_silence_ms")]
+    pub silence_ms: u64,
+    /// Whisper model is unloaded from RAM after this many idle minutes.
+    #[serde(default = "default_stt_unload_minutes")]
+    pub stt_unload_minutes: u64,
+    /// Path to the ggml whisper STT model.
+    #[serde(default = "default_whisper_model_path")]
+    pub whisper_model_path: String,
+    /// Path to the ggml Silero VAD model.
+    #[serde(default = "default_vad_model_path")]
+    pub vad_model_path: String,
+}
+
+fn default_listen_mode() -> String {
+    "hotkey".to_string()
+}
+fn default_language() -> String {
+    "en".to_string()
+}
+fn default_silence_ms() -> u64 {
+    700
+}
+fn default_stt_unload_minutes() -> u64 {
+    5
 }
 
 impl Default for XenonConfig {
@@ -42,6 +116,12 @@ impl Default for XenonConfig {
             wake_word_enabled: true,
             wake_word: "Xenon".to_string(),
             system_prompt: "You are Xenon, a witty and intelligent desktop companion inspired by Jarvis. Be helpful, concise, and occasionally playful. You can control the computer, answer questions, and assist with tasks. Keep responses conversational and natural.".to_string(),
+            listen_mode: default_listen_mode(),
+            language: default_language(),
+            silence_ms: default_silence_ms(),
+            stt_unload_minutes: default_stt_unload_minutes(),
+            whisper_model_path: default_whisper_model_path(),
+            vad_model_path: default_vad_model_path(),
         }
     }
 }

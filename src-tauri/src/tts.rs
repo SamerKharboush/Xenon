@@ -20,6 +20,14 @@ impl TtsEngine {
         // Placeholder: needs cpal output stream + audio playback
         Ok(())
     }
+
+    /// Barge-in hook: asked to stop playing (e.g. the user pressed the
+    /// force-listen hotkey mid-sentence). Real playback stop is wired in
+    /// task 3; today this only logs so the seam is explicit.
+    pub fn request_stop(&self) {
+        // ponytail: no-op barge-in hook; task 3 stops the cpal output stream.
+        log::debug!("TTS: barge-in requested (stop playback)");
+    }
 }
 
 #[cfg(test)]
