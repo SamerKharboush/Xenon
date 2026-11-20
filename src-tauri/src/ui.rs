@@ -174,6 +174,12 @@ pub fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
 /// stays interactive.
 ///
 /// Uses CGEventGetLocation, which needs no Accessibility grant (unlike enigo).
+static TYPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Typed-message input is up: keep the window interactive everywhere.
+pub fn set_typing(active: bool) {
+    TYPING.store(active, std::sync::atomic::Ordering::Relaxed);
+}
 fn spawn_hit_test(window: WebviewWindow) {
     use core_graphics::event::{CGEvent, CGEventType};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
@@ -213,7 +219,7 @@ fn spawn_hit_test(window: WebviewWindow) {
             let hit_radius = 90.0_f64.max(size.0.min(size.1) / 2.0);
             let over_pet = (dx * dx + dy * dy) <= hit_radius * hit_radius;
 
-            let should_ignore = !over_pet;
+            let should_ignore = !over_pet && !TYPING.load(std::sync::atomic::Ordering::Relaxed);
             if ignore != Some(should_ignore) {
                 if let Err(e) = window.set_ignore_cursor_events(should_ignore) {
                     log::warn!("hit-test: set_ignore_cursor_events failed: {e}");

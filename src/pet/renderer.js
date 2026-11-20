@@ -38,6 +38,9 @@ class Renderer {
         this.clickTimer = null;
         this.lastClickTime = 0;
         this.voiceMuted = false;
+        this.clickToTalk = true;
+        this.typedWrap = document.getElementById('typed-message');
+        this.typedInput = document.getElementById('typed-input');
         // Performance toggle (Settings -> Performance), live from pet-config.
         this.idlePowerSaver = true;
 
@@ -85,6 +88,13 @@ class Renderer {
             this.bubble.show(event.payload, BUBBLE_COLORS.speech, 0);
         });
 
+        listen('pet-wake', () => {
+            this.animator.triggerWake();
+            this.bubble.hide();
+        });
+
+        listen('typed-message-open', () => this.showTypedInput());
+
         listen('audio-level', (event) => {
             const raw = event.payload;
             const v = typeof raw === 'number' ? raw : raw && typeof raw.rms === 'number' ? raw.rms : 0;
@@ -128,6 +138,9 @@ class Renderer {
         }
         if (typeof cfg.idle_power_saver === 'boolean') {
             this.idlePowerSaver = cfg.idle_power_saver;
+        }
+        if (typeof cfg.click_to_talk === 'boolean') {
+            this.clickToTalk = cfg.click_to_talk;
         }
     }
 
@@ -195,10 +208,44 @@ class Renderer {
             }
             const rect = canvas.getBoundingClientRect();
             this.menuX = Math.min(this.cssW - 150, Math.max(4, e.clientX - rect.left));
-            this.menuY = Math.min(this.cssH - 110, Math.max(4, e.clientY - rect.top));
+            this.menuY = Math.min(this.cssH - 140, Math.max(4, e.clientY - rect.top));
             this.menuOpen = true;
             this.menuHovered = -1;
         });
+
+        if (this.typedInput) {
+            this.typedInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const text = this.typedInput.value.trim();
+                    this.hideTypedInput();
+                    if (text && this.invoke) {
+                        this.invoke('say', { text }).catch(() => {});
+                    }
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    this.hideTypedInput();
+                }
+            });
+            this.typedInput.addEventListener('blur', () => {
+                // Delay so Enter/Send can read the value first.
+                setTimeout(() => this.hideTypedInput(), 120);
+            });
+        }
+    }
+
+    showTypedInput() {
+        if (!this.typedWrap) return;
+        this.typedWrap.classList.add('visible');
+        this.typedInput.value = '';
+        if (this.invoke) this.invoke('set_typing', { active: true }).catch(() => {});
+        setTimeout(() => this.typedInput.focus(), 30);
+    }
+
+    hideTypedInput() {
+        if (!this.typedWrap || !this.typedWrap.classList.contains('visible')) return;
+        this.typedWrap.classList.remove('visible');
+        if (this.invoke) this.invoke('set_typing', { active: false }).catch(() => {});
     }
 
     handleTap(e) {
@@ -217,7 +264,13 @@ class Renderer {
         this.clickTimer = setTimeout(() => {
             this.clickTimer = null;
             if (this.invoke) {
-                this.invoke('pet_tap').catch(() => {});
+                // Single click starts listening when click_to_talk is on;
+                // otherwise the old tap-greet behaviour.
+                if (this.clickToTalk) {
+                    this.invoke('start_listening').catch(() => {});
+                } else {
+                    this.invoke('pet_tap').catch(() => {});
+                }
                 if (this.voiceMuted) {
                     this.invoke('stop_speaking').catch((err) => {
                         const msg = String(err || '');
@@ -268,8 +321,9 @@ class Renderer {
         return [
             { label: 'Settings', x: mx, y: my, w, action: 'settings' },
             { label: 'Talk', x: mx, y: my + 26, w, action: 'talk' },
-            { label: this.voiceMuted ? 'Unmute voice' : 'Mute voice', x: mx, y: my + 52, w, action: 'mute' },
-            { label: 'Quit', x: mx, y: my + 78, w, action: 'quit' },
+            { label: 'Type a message…', x: mx, y: my + 52, w, action: 'type' },
+            { label: this.voiceMuted ? 'Unmute voice' : 'Mute voice', x: mx, y: my + 78, w, action: 'mute' },
+            { label: 'Quit', x: mx, y: my + 104, w, action: 'quit' },
         ];
     }
 
@@ -281,7 +335,9 @@ class Renderer {
         if (item.action === 'settings') {
             invoke('open_settings').catch(() => {});
         } else if (item.action === 'talk') {
-            invoke('pet_tap').catch(() => {});
+            invoke('start_listening').catch(() => {});
+        } else if (item.action === 'type') {
+            invoke('open_typed_message').catch(() => {});
         } else if (item.action === 'mute') {
             this.voiceMuted = !this.voiceMuted;
             if (this.voiceMuted) {

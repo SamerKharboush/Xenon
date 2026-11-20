@@ -1,5 +1,23 @@
 # Third-Party Notices
 
+## Kokoro TTS Model
+
+Xenon downloads the **kokoro-multi-lang-v1_0** model from the sherpa-onnx
+releases. The model files and lexicons are not bundled in this repository.
+
+- **Source:** https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2
+- **License:** Apache License 2.0
+- **License text:** https://www.apache.org/licenses/LICENSE-2.0
+
+## sherpa-onnx
+
+Xenon links against the **sherpa-onnx** Rust crate and its prebuilt native
+libraries for offline text-to-speech.
+
+- **Source:** https://github.com/k2-fsa/sherpa-onnx
+- **License:** Apache License 2.0
+- **License text:** https://www.apache.org/licenses/LICENSE-2.0
+
 ## pet-mochi Sprites
 
 The sprite artwork in `src/sprites/` is derived from the **pet-mochi** project.

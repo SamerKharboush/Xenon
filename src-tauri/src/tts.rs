@@ -10,7 +10,8 @@
 //! `stop()` clears the queue and the playback buffer immediately, and the
 //! worker kills the fallback process on its next poll.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -22,7 +23,7 @@ use cpal::{SampleFormat, Stream};
 use serde::Serialize;
 use sherpa_onnx::{
     GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsKokoroModelConfig,
-    OfflineTtsModelConfig, OfflineTtsVitsModelConfig,
+    OfflineTtsModelConfig, OfflineTtsVitsModelConfig, OfflineTtsZipvoiceModelConfig,
 };
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
@@ -44,6 +45,12 @@ struct SpeechLevel {
 
 enum TtsCommand {
     Speak(String),
+    /// Voice picker Preview: one-off speaker/speed, never touches the queue.
+    Preview {
+        text: String,
+        speaker: Option<u32>,
+        speed: Option<f32>,
+    },
     Stop,
     /// Performance toggle off: load the neural model now instead of at the
     /// first sentence.
@@ -158,6 +165,34 @@ impl Tts {
         Ok(())
     }
 
+    /// Voice picker Preview: speak one sentence with a one-off Kokoro speaker
+    /// and/or speed. Bypasses the normal speech queue and the pet state.
+    pub fn preview_neural(
+        &self,
+        text: &str,
+        speaker: Option<u32>,
+        speed: Option<f32>,
+    ) -> Result<()> {
+        self.sender()
+            .send(TtsCommand::Preview {
+                text: text.to_string(),
+                speaker,
+                speed,
+            })
+            .context("tts worker stopped")
+    }
+
+    /// Preview a macOS system voice through `say` (no neural model).
+    pub fn preview_system(&self, voice: &str, text: &str) -> Result<()> {
+        std::process::Command::new("/usr/bin/say")
+            .arg("-v")
+            .arg(voice)
+            .arg(text)
+            .spawn()
+            .context("spawn /usr/bin/say for voice preview")?;
+        Ok(())
+    }
+
     /// Barge-in / mute: clear the queue, silence playback immediately and let
     /// the worker kill any fallback `say` process.
     pub fn stop(&self) {
@@ -214,10 +249,11 @@ enum SynthOut {
     Skip,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum TtsKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TtsKind {
     Kokoro,
     Vits,
+    Zipvoice,
 }
 
 /// Autodetect from file layout unless the user pinned a kind in Settings.
@@ -225,9 +261,29 @@ fn detect_kind(kind: &str, dir: &Path) -> TtsKind {
     match kind {
         "kokoro" => TtsKind::Kokoro,
         "vits" => TtsKind::Vits,
+        "zipvoice" => TtsKind::Zipvoice,
         _ if dir.join("voices.bin").exists() => TtsKind::Kokoro,
+        _ if first_with_prefix(dir, "encoder").is_some()
+            && first_with_prefix(dir, "decoder").is_some() =>
+        {
+            TtsKind::Zipvoice
+        }
         _ => TtsKind::Vits,
     }
+}
+
+fn first_with_prefix(dir: &Path, prefix: &str) -> Option<String> {
+    let entries = dir.read_dir().ok()?;
+    let mut names: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(prefix) && n.ends_with(".onnx"))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .next()
+        .map(|n| dir.join(n).to_string_lossy().to_string())
 }
 
 fn opt_file(dir: &Path, name: &str) -> Option<String> {
@@ -235,10 +291,201 @@ fn opt_file(dir: &Path, name: &str) -> Option<String> {
     p.exists().then(|| p.to_string_lossy().to_string())
 }
 
+/// Kokoro lexicon files. Multi-language v1_0 ships one or more
+/// `lexicon-*.txt` files, comma-joined for sherpa-onnx; single-language
+/// v0.19 ships none and falls back to the system voice.
+fn kokoro_lexicon(dir: &Path) -> Option<String> {
+    let mut files: Vec<String> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("lexicon") && n.ends_with(".txt"))
+        })
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    files.sort_by_key(|path| {
+        match Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+        {
+            "lexicon-us-en.txt" | "lexicon-en-us.txt" => 0,
+            "lexicon-gb-en.txt" => 1,
+            "lexicon-zh.txt" => 2,
+            _ => 3,
+        }
+    });
+    (!files.is_empty()).then(|| files.join(","))
+}
+
+/// Single-word keys from every Kokoro lexicon file. Used only to decide
+/// whether a word needs the MIT-safe spelling fallback.
+fn load_lexicon_words(dir: &Path) -> HashSet<String> {
+    let mut words = HashSet::new();
+    let Some(lexicon) = kokoro_lexicon(dir) else {
+        return words;
+    };
+    for path in lexicon.split(',') {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let key = line
+                .split_once("||")
+                .map(|(k, _)| k)
+                .unwrap_or(line);
+            if let Some(word) = key.split_whitespace().next() {
+                words.insert(word.to_lowercase());
+            }
+        }
+    }
+    words
+}
+
+const SMALL_NUMBERS: [&str; 20] = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen",
+];
+const TENS: [&str; 10] = [
+    "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+];
+
+fn number_word(n: u32) -> String {
+    if n < 20 {
+        return SMALL_NUMBERS[n as usize].to_string();
+    }
+    if n < 100 {
+        let tens = TENS[(n / 10) as usize];
+        return if n % 10 == 0 {
+            tens.to_string()
+        } else {
+            format!("{tens}-{}", SMALL_NUMBERS[(n % 10) as usize])
+        };
+    }
+    if n < 1000 {
+        let hundred = SMALL_NUMBERS[(n / 100) as usize];
+        return match n % 100 {
+            0 => format!("{hundred} hundred"),
+            rest => format!("{hundred} hundred {}", number_word(rest)),
+        };
+    }
+    // Longer numbers: spell the digits instead of silently dropping them.
+    n.to_string()
+        .chars()
+        .filter_map(|d| d.to_digit(10))
+        .map(number_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn flush_kokoro_run(
+    run: &mut String,
+    digits: bool,
+    words: &HashSet<String>,
+    pieces: &mut Vec<String>,
+) {
+    if run.is_empty() {
+        return;
+    }
+    if digits {
+        let spoken = run
+            .parse::<u32>()
+            .map(number_word)
+            .unwrap_or_else(|_| run.clone());
+        pieces.push(spoken);
+    } else if words.contains(&run.to_lowercase()) {
+        pieces.push(run.clone());
+    } else {
+        pieces.push(
+            run.to_lowercase()
+                .chars()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    run.clear();
+}
+
+/// Expand OOV words/numbers before sherpa-onnx sees them. sherpa-onnx 2.0's
+/// Kokoro lexicon path only handles hyphen splits and CJK characters; English
+/// OOV words and plain digits are otherwise skipped.
+fn expand_kokoro_token(token: &str, words: &HashSet<String>) -> String {
+    let Some(start) = token
+        .char_indices()
+        .find(|(_, c)| c.is_alphanumeric())
+        .map(|(i, _)| i)
+    else {
+        return token.to_string();
+    };
+    let end = token
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_alphanumeric())
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(token.len());
+    let core = &token[start..end];
+    if words.contains(&core.to_lowercase()) {
+        return token.to_string();
+    }
+
+    let prefix = &token[..start];
+    let suffix = &token[end..];
+    let mut pieces = Vec::new();
+    let mut run = String::new();
+    let mut digits = false;
+
+    for c in core.chars() {
+        if c.is_ascii_digit() {
+            if !digits && !run.is_empty() {
+                flush_kokoro_run(&mut run, digits, words, &mut pieces);
+            }
+            digits = true;
+            run.push(c);
+        } else if c.is_alphabetic() {
+            if digits && !run.is_empty() {
+                flush_kokoro_run(&mut run, digits, words, &mut pieces);
+            }
+            digits = false;
+            run.push(c);
+        } else {
+            flush_kokoro_run(&mut run, digits, words, &mut pieces);
+            digits = false;
+            pieces.push(c.to_string());
+        }
+    }
+    flush_kokoro_run(&mut run, digits, words, &mut pieces);
+
+    let core = pieces.join(" ");
+    if core.is_empty() {
+        return token.to_string();
+    }
+    if prefix.is_empty() && suffix.is_empty() {
+        core
+    } else {
+        format!("{prefix} {core} {suffix}")
+    }
+}
+
+fn prepare_kokoro_text(text: &str, words: &HashSet<String>) -> String {
+    text.split_whitespace()
+        .map(|token| expand_kokoro_token(token, words))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Build the sherpa-onnx config used both by the worker and the ignored
 /// real-model test. Missing optional files are simply left unset so Piper /
 /// VITS model directories work too.
-fn offline_tts_config(dir: &Path, kind: TtsKind) -> OfflineTtsConfig {
+pub(crate) fn offline_tts_config(dir: &Path, kind: TtsKind) -> OfflineTtsConfig {
     let model = opt_file(dir, "model.onnx");
     let tokens = opt_file(dir, "tokens.txt");
     let data_dir = dir
@@ -258,10 +505,7 @@ fn offline_tts_config(dir: &Path, kind: TtsKind) -> OfflineTtsConfig {
                 model,
                 voices: opt_file(dir, "voices.bin"),
                 tokens,
-                data_dir: data_dir.clone(),
-                dict_dir: opt_file(dir, "dict"),
-                lexicon: opt_file(dir, "lexicon-us-en.txt"),
-                lang: Some("en-us".to_string()),
+                lexicon: kokoro_lexicon(dir),
                 ..Default::default()
             };
         }
@@ -270,6 +514,16 @@ fn offline_tts_config(dir: &Path, kind: TtsKind) -> OfflineTtsConfig {
                 model,
                 tokens,
                 data_dir,
+                ..Default::default()
+            };
+        }
+        TtsKind::Zipvoice => {
+            model_cfg.zipvoice = OfflineTtsZipvoiceModelConfig {
+                tokens,
+                encoder: first_with_prefix(dir, "encoder"),
+                decoder: first_with_prefix(dir, "decoder"),
+                vocoder: first_with_prefix(dir, "vocoder"),
+                lexicon: opt_file(dir, "lexicon.txt"),
                 ..Default::default()
             };
         }
@@ -293,6 +547,8 @@ struct Worker {
     model: Option<OfflineTts>,
     model_dir_loaded: String,
     model_last_used: Option<Instant>,
+    lexicon_words: Option<HashSet<String>>,
+    lexicon_dir_loaded: String,
     stream: Option<Stream>,
     device_rate: u32,
     notice_sent: bool,
@@ -324,6 +580,8 @@ fn worker(
         model: None,
         model_dir_loaded: String::new(),
         model_last_used: None,
+        lexicon_words: None,
+        lexicon_dir_loaded: String::new(),
         stream: None,
         device_rate: 48_000,
         notice_sent: false,
@@ -380,6 +638,21 @@ impl Worker {
                 self.queue.push(text);
                 self.busy.store(true, Ordering::SeqCst);
             }
+            TtsCommand::Preview {
+                text,
+                speaker,
+                speed,
+            } => {
+                // Blocking one-off preview: finish it, then return to the
+                // normal queue. Playback is isolated from the queue state.
+                let out = self.synthesize_with(&text, speaker, speed);
+                self.wait_drained();
+                match out {
+                    SynthOut::Neural(pcm, rate) => self.start_playback(&pcm, rate),
+                    SynthOut::Say(text) => self.run_say(&text),
+                    SynthOut::Skip => {}
+                }
+            }
             TtsCommand::Stop => self.reset_stop(),
             TtsCommand::Preload => {
                 if let Err(e) = self.ensure_model() {
@@ -428,9 +701,48 @@ impl Worker {
     /// Lazy-load the model, then synthesize one sentence. A missing or broken
     /// model falls back to `say` with a one-time notice.
     fn synthesize(&mut self, text: &str) -> SynthOut {
+        self.synthesize_with(text, None, None)
+    }
+
+    fn synthesize_with(
+        &mut self,
+        text: &str,
+        speaker: Option<u32>,
+        speed: Option<f32>,
+    ) -> SynthOut {
         if !self.cfg.tts_enabled {
             return SynthOut::Skip;
         }
+        let model_dir = self.cfg.tts_model_dir.trim().to_string();
+        let dir = Path::new(&model_dir);
+        let kind = detect_kind(&self.cfg.tts_kind, dir);
+        if kind == TtsKind::Kokoro && kokoro_lexicon(dir).is_none() {
+            log::warn!(
+                "tts: Kokoro model at {} has no lexicon; run scripts/fetch-models.sh",
+                dir.display()
+            );
+            if !self.notice_sent {
+                self.notice_sent = true;
+                self.emit_notice(
+                    "Neural voice needs its lexicon. Run scripts/fetch-models.sh, then restart.",
+                );
+            }
+            return SynthOut::Say(text.to_string());
+        }
+        let prepared = if kind == TtsKind::Kokoro {
+            if self.lexicon_dir_loaded != model_dir {
+                self.lexicon_words = Some(load_lexicon_words(dir));
+                self.lexicon_dir_loaded = model_dir.clone();
+            }
+            prepare_kokoro_text(text, self.lexicon_words.as_ref().expect("lexicon loaded"))
+        } else {
+            String::new()
+        };
+        let text = if kind == TtsKind::Kokoro {
+            prepared.as_str()
+        } else {
+            text
+        };
         let model = match self.ensure_model() {
             Ok(()) => self.model.as_ref().expect("model loaded"),
             Err(e) => {
@@ -444,18 +756,36 @@ impl Worker {
                 return SynthOut::Say(text.to_string());
             }
         };
-        let gen = GenerationConfig {
-            speed: self.cfg.tts_speed,
-            sid: self.cfg.tts_speaker_id as i32,
+        let mut gen = GenerationConfig {
+            speed: speed.unwrap_or(self.cfg.tts_speed),
+            sid: speaker.map(|s| s as i32).unwrap_or(self.cfg.tts_speaker_id as i32),
             ..Default::default()
         };
+        if kind == TtsKind::Zipvoice {
+            if let Some((audio, rate, reference_text)) =
+                crate::voice::clone_reference(Path::new(self.cfg.tts_model_dir.trim()))
+            {
+                gen.reference_audio = Some(audio);
+                gen.reference_sample_rate = rate;
+                gen.reference_text = Some(reference_text);
+            }
+        }
         match model.generate_with_config(text, &gen, None::<fn(&[f32], f32) -> bool>) {
             Some(audio) if !audio.samples().is_empty() => {
                 self.model_last_used = Some(Instant::now());
                 SynthOut::Neural(audio.samples().to_vec(), audio.sample_rate() as u32)
             }
             _ => {
-                log::warn!("tts: synthesis returned no audio for {text:?}");
+                log::warn!(
+                    "tts: neural synthesis returned no audio (kind={kind:?}, dir={}, text={text:?})",
+                    dir.display()
+                );
+                if !self.notice_sent {
+                    self.notice_sent = true;
+                    self.emit_notice(
+                        "Neural voice returned no audio. Using the system voice for now.",
+                    );
+                }
                 SynthOut::Say(text.to_string())
             }
         }
@@ -467,12 +797,21 @@ impl Worker {
             return Ok(());
         }
         let path = Path::new(&dir);
-        anyhow::ensure!(
-            path.join("model.onnx").exists(),
-            "TTS model not found at {} (run scripts/fetch-models.sh)",
-            path.join("model.onnx").display()
-        );
         let kind = detect_kind(&self.cfg.tts_kind, path);
+        if kind == TtsKind::Zipvoice {
+            anyhow::ensure!(
+                first_with_prefix(path, "encoder").is_some()
+                    && first_with_prefix(path, "decoder").is_some(),
+                "ZipVoice encoder/decoder not found in {} (run scripts/fetch-models.sh)",
+                path.display()
+            );
+        } else {
+            anyhow::ensure!(
+                path.join("model.onnx").exists(),
+                "TTS model not found at {} (run scripts/fetch-models.sh)",
+                path.join("model.onnx").display()
+            );
+        }
         let cfg = offline_tts_config(path, kind);
         let model = OfflineTts::create(&cfg).context("sherpa-onnx could not load the TTS model")?;
         log::info!("tts: loaded {:?} model from {dir} (rate {} Hz)", kind, model.sample_rate());
@@ -539,10 +878,12 @@ impl Worker {
     /// `say` fallback: spawn once, poll for exit while emitting a synthetic
     /// envelope at ~30 Hz, and kill it immediately on barge-in.
     fn run_say(&mut self, text: &str) {
-        let mut child = match std::process::Command::new("/usr/bin/say")
-            .arg(text)
-            .spawn()
-        {
+        let voice = self.cfg.system_voice.trim().to_string();
+        let mut command = std::process::Command::new("/usr/bin/say");
+        if !voice.is_empty() {
+            command.arg("-v").arg(&voice);
+        }
+        let mut child = match command.arg(text).spawn() {
             Ok(child) => child,
             Err(e) => {
                 log::error!("tts: /usr/bin/say failed: {e}");
@@ -586,6 +927,8 @@ impl Worker {
             log::info!("tts: model dir changed, reloading on next sentence");
             self.model = None;
             self.model_last_used = None;
+            self.lexicon_words = None;
+            self.lexicon_dir_loaded.clear();
         }
     }
 
@@ -600,6 +943,8 @@ impl Worker {
                 );
                 self.model = None;
                 self.model_last_used = None;
+                self.lexicon_words = None;
+                self.lexicon_dir_loaded.clear();
             }
         }
     }
@@ -730,6 +1075,45 @@ mod tests {
     }
 
     #[test]
+    fn kokoro_oov_fallback_spells_unknown_words_and_numbers() {
+        let words: HashSet<String> = [
+            "xenon", "safari", "pm", "three", "forty-five", "for", "at", "s", "a", "m",
+            "e", "r", "o", "p", "n", "d", "t", "h", "f", "i", "v", "y", "x",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let out = prepare_kokoro_text("Xenon opened Safari for Samer at 3:45pm", &words);
+        assert!(out.contains("Xenon"), "{out}");
+        assert!(out.contains("o p e n e d"), "{out}");
+        assert!(out.contains("Safari"), "{out}");
+        assert!(out.contains("s a m e r"), "{out}");
+        assert!(out.contains("three : forty-five pm"), "{out}");
+    }
+
+    #[test]
+    fn kokoro_lexicon_detects_single_and_multi_lang_files() {
+        let dir = std::env::temp_dir().join(format!("xenon-kokoro-lexicon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lexicon-en-us.txt"), b"").unwrap();
+        let one = kokoro_lexicon(&dir).unwrap();
+        let names: Vec<_> = one
+            .split(',')
+            .map(|p| Path::new(p).file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["lexicon-en-us.txt"]);
+        std::fs::write(dir.join("lexicon-zh.txt"), b"").unwrap();
+        let two = kokoro_lexicon(&dir).unwrap();
+        let names: Vec<_> = two
+            .split(',')
+            .map(|p| Path::new(p).file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["lexicon-en-us.txt", "lexicon-zh.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn stop_clears_queued_sentences() {
         let q = SpeechQueue::default();
         q.push("one".into());
@@ -781,7 +1165,7 @@ mod tests {
     }
 
     /// Real Kokoro synthesis of "Hello from Xenon" at the default path.
-    /// Skips gracefully when the model is not installed.
+    /// Skips only when the model itself is not installed.
     /// Run with: cargo test -- --ignored tts
     #[test]
     #[ignore = "loads the real Kokoro model; run with -- --ignored tts"]
@@ -806,6 +1190,37 @@ mod tests {
         assert!(audio.sample_rate() > 0);
         eprintln!(
             "synthesized {} samples at {} Hz",
+            audio.samples().len(),
+            audio.sample_rate()
+        );
+    }
+
+    /// Real OOV probe: names and a clock time must not silently vanish.
+    #[test]
+    #[ignore = "loads the real Kokoro model; run with -- --ignored oov"]
+    fn tts_kokoro_oov_sentence() {
+        let cfg = XenonConfig::default();
+        let dir = Path::new(&cfg.tts_model_dir);
+        if !dir.join("model.onnx").exists() || !dir.join("voices.bin").exists() {
+            eprintln!("skip: Kokoro model absent at {}", dir.display());
+            return;
+        }
+        let tts = OfflineTts::create(&offline_tts_config(dir, TtsKind::Kokoro))
+            .expect("create Kokoro TTS");
+        let text = "Xenon opened Safari for Samer at 3:45pm";
+        let prepared = prepare_kokoro_text(text, &load_lexicon_words(dir));
+        eprintln!("oov prepared: {prepared:?}");
+        let gen = GenerationConfig {
+            speed: cfg.tts_speed,
+            sid: cfg.tts_speaker_id as i32,
+            ..Default::default()
+        };
+        let audio = tts
+            .generate_with_config(&prepared, &gen, None::<fn(&[f32], f32) -> bool>)
+            .expect("synthesize OOV sentence");
+        assert!(!audio.samples().is_empty(), "empty OOV synthesis result");
+        eprintln!(
+            "oov synthesized {} samples at {} Hz",
             audio.samples().len(),
             audio.sample_rate()
         );
