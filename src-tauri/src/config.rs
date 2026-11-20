@@ -214,6 +214,17 @@ pub struct XenonConfig {
     /// Draw Idle at 15 FPS instead of 60 (Settings -> Performance).
     #[serde(default = "default_true")]
     pub idle_power_saver: bool,
+
+    // --- release ---
+    /// Check GitHub Releases for a newer Xenon build (Settings -> Updates).
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
+    /// Unix timestamp (seconds) of the last update check; 0 = never.
+    #[serde(default)]
+    pub last_update_check: i64,
+    /// Version the user chose to skip (e.g. "v0.3.0"); None = skip nothing.
+    #[serde(default)]
+    pub skipped_version: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -272,6 +283,10 @@ impl Default for XenonConfig {
             light_sprites: true,
             lazy_audio: true,
             idle_power_saver: true,
+            // release
+            auto_check_updates: true,
+            last_update_check: 0,
+            skipped_version: None,
         }
     }
 }
@@ -533,5 +548,9 @@ mod tests {
         assert!(cfg.light_sprites, "light_sprites must default to true");
         assert!(cfg.lazy_audio, "lazy_audio must default to true");
         assert!(cfg.idle_power_saver, "idle_power_saver must default to true");
+        // release lane fields: old configs must default cleanly too.
+        assert!(cfg.auto_check_updates, "auto_check_updates must default to true");
+        assert_eq!(cfg.last_update_check, 0);
+        assert!(cfg.skipped_version.is_none());
     }
 }
