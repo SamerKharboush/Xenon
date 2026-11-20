@@ -11,9 +11,9 @@ permissions:
 
 jobs:
   release:
-    # Universal (x86_64 + aarch64) build needs both Apple targets; macos-14 is
+    # Universal (x86_64 + aarch64) build needs both Apple targets; macos-15 is
     # Apple Silicon, which cross-compiles the Intel slice fine.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
