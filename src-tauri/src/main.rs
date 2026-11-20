@@ -1,13 +1,18 @@
 mod agent;
 mod audio;
 mod audio_dsp;
+mod browser;
 mod config;
 mod events;
 mod grounding;
+mod headless;
+mod hub;
 mod permissions;
+mod presets;
 mod provider;
 mod runtime;
 mod screenshot;
+mod scripts;
 mod tools;
 mod tts;
 mod ui;
@@ -43,6 +48,12 @@ fn main() -> anyhow::Result<()> {
         tokio::runtime::Builder::new_multi_thread().enable_all().build()?
     };
     tauri::async_runtime::set(rt.handle().clone());
+
+    // Headless smoke-test entry: `xenon --agent-task "<task>" [--profile <name>]`
+    // runs one agent turn and exits 0/1 without starting the pet UI.
+    if let Some(code) = headless::run_from_args(&cfg) {
+        std::process::exit(code);
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -170,6 +181,10 @@ fn main() -> anyhow::Result<()> {
             updater::check_now,
             updater::skip_update,
             updater::install_update,
+            hub::provider_presets,
+            hub::detect_local_providers,
+            hub::list_provider_models,
+            hub::test_provider_profile,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

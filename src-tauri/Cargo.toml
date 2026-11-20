@@ -70,6 +70,8 @@ semver = "1.0"
 
 # SHA-256 verification of the downloaded DMG (against the release SHA256SUMS).
 sha2 = "0.10"
+# API keys in the macOS Keychain (never in config.json).
+keyring = "3"
 
 # Global cursor position for click-through hit-testing.
 # CGEventGetLocation needs no Accessibility grant (unlike enigo input synthesis).

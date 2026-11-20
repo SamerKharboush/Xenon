@@ -105,6 +105,9 @@ pub async fn update_config(
     new_config: XenonConfig,
 ) -> Result<(), String> {
     new_config.save().map_err(|e| e.to_string())?;
+    // Persist non-empty API keys to the Keychain before the config (which is
+    // written with secrets stripped) replaces the shared one.
+    crate::hub::store_keys(&new_config);
     let mut guard = config.write().await;
     *guard = new_config;
     let _ = app.emit("pet-config", &*guard);

@@ -1,6 +1,6 @@
 use async_channel::{bounded, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
 
@@ -10,6 +10,58 @@ use crate::events::{AgentAction, AudioEvent, PetState};
 use crate::provider::{FallbackProvider, OpenAICompatProvider, Provider};
 use crate::tools;
 use crate::tts::Tts;
+
+/// Build the agent used by both the pet runtime and the headless task runner.
+/// Each role gets its assigned profile first, then the remaining profiles as
+/// fallbacks (fallback order is preserved, ADR-0003).
+pub fn build_agent(
+    cfg: &XenonConfig,
+    app: Option<AppHandle>,
+    abort: Arc<AtomicBool>,
+) -> Agent {
+    let chain = |role: crate::config::Role| -> Arc<dyn Provider> {
+        let profiles = cfg.role_profiles(role);
+        let providers: Vec<Arc<dyn Provider>> = profiles
+            .iter()
+            .map(|p| {
+                Arc::new(OpenAICompatProvider::new(p.base_url.clone(), p.api_key.clone()))
+                    as Arc<dyn Provider>
+            })
+            .collect();
+        Arc::new(FallbackProvider::new(
+            providers,
+            profiles.iter().map(|p| p.name.clone()).collect(),
+            app.clone(),
+        ))
+    };
+
+    let agent_provider = chain(crate::config::Role::Agent);
+    let chat_provider = chain(crate::config::Role::Chat);
+    // Grounding (click / type / drag targets) uses the vision role.
+    let vision = cfg.role_profile(crate::config::Role::Vision);
+    let vision_provider: Arc<dyn Provider> = Arc::new(OpenAICompatProvider::new(
+        vision.base_url.clone(),
+        vision.api_key.clone(),
+    ));
+
+    let notes: tools::Notes = Arc::new(Mutex::new(Vec::new()));
+    let ctx = tools::ToolContext {
+        app,
+        provider: Some(vision_provider),
+        vision_model: vision.effective_vision_model().to_string(),
+        notes: notes.clone(),
+        allow_scripts: cfg.allow_scripts,
+        browser_eval: cfg.browser_eval_enabled,
+    };
+    Agent::with_roles(
+        agent_provider,
+        chat_provider,
+        tools::create_default_tools(ctx),
+        cfg.clone(),
+        abort,
+        notes,
+    )
+}
 
 pub struct Runtime {
     audio_tx: Sender<AudioEvent>,
@@ -249,30 +301,7 @@ impl Runtime {
         app: &Option<AppHandle>,
     ) {
         let cfg = config.read().await.clone();
-
-        let profiles = cfg.ordered_profiles();
-        let vision_model = cfg.primary().effective_vision_model().to_string();
-
-        let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
-        for p in &profiles {
-            providers.push(Arc::new(OpenAICompatProvider::new(
-                p.base_url.clone(),
-                p.api_key.clone(),
-            )));
-        }
-        let provider: Arc<dyn Provider> = Arc::new(FallbackProvider::new(
-            providers,
-            profiles.iter().map(|p| p.name.clone()).collect(),
-            app.clone(),
-        ));
-
-        let ctx = tools::ToolContext {
-            app: app.clone(),
-            provider: Some(provider.clone()),
-            vision_model,
-        };
-        let agent_tools = tools::create_default_tools(ctx);
-        let agent = Agent::with_abort(provider, agent_tools, cfg, abort.clone());
+        let agent = build_agent(&cfg, app.clone(), abort.clone());
 
         if let Err(e) = agent.run_utterance(text, action_tx.clone()).await {
             log::error!("Agent error: {}", e);
