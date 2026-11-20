@@ -170,6 +170,7 @@ fn main() -> anyhow::Result<()> {
         })
         .invoke_handler(tauri::generate_handler![
             ui::frontend_ready,
+            ui::start_window_drag,
             ui::set_click_through,
             ui::get_pet_state,
             ui::trigger_listen,

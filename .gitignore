@@ -21,3 +21,6 @@ gen/
 
 # Models (user-provided)
 models/
+
+# Stress harness output
+scripts/stress/out/

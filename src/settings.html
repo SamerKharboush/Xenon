@@ -434,6 +434,7 @@
         </div>
 
         <div class="button-group">
+            <div class="hint" id="settings-status" style="margin-bottom:8px; min-height:18px;"></div>
             <button class="secondary" id="cancel">Cancel</button>
             <button class="primary" id="save">Save Settings</button>
         </div>
@@ -446,6 +447,13 @@
         let presets = [];
         // index -> model ids from the last "Load models" call.
         const modelCache = {};
+
+        function showStatus(msg, error = false) {
+            const el = document.getElementById('settings-status');
+            if (!el) return;
+            el.textContent = msg;
+            el.style.color = error ? '#ff8a80' : '';
+        }
 
         // ---- Provider Profiles UI --------------------------------------------
 
@@ -672,7 +680,7 @@
 
         function removeProfile(index) {
             if (config.providers.length <= 1) {
-                alert('At least one provider profile is required.');
+                showStatus('At least one provider profile is required.', true);
                 return;
             }
             config.providers.splice(index, 1);
@@ -824,7 +832,7 @@
                 await invoke('update_config', { newConfig: config });
                 window.close();
             } catch (e) {
-                alert('Failed to save: ' + e);
+                showStatus('Failed to save: ' + e, true);
             }
         }
 
@@ -936,17 +944,17 @@
             if (v && v.kind === 'system') args.systemVoice = v.value;
             if (v && v.kind === 'kokoro') args.speakerId = Number(v.value) || 0;
             args.speed = Number(document.getElementById('tts_speed').value) || 1.0;
-            try { await invoke('preview_voice', args); } catch (e) { alert('Preview failed: ' + e); }
+            try { await invoke('preview_voice', args); } catch (e) { showStatus('Preview failed: ' + e, true); }
         });
         document.getElementById('import-voice').addEventListener('click', async () => {
             const path = document.getElementById('import_voice_path').value.trim();
             const name = document.getElementById('import_voice_name').value.trim();
-            if (!path || !name) { alert('Enter a folder path and a voice name.'); return; }
+            if (!path || !name) { showStatus('Enter a folder path and a voice name.', true); return; }
             try {
                 const dest = await invoke('import_voice_folder', { path, name });
-                alert('Imported to ' + dest);
+                showStatus('Imported to ' + dest);
                 await loadVoices();
-            } catch (e) { alert('Import failed: ' + e); }
+            } catch (e) { showStatus('Import failed: ' + e, true); }
         });
         document.getElementById('record-clone').addEventListener('click', async () => {
             const status = document.getElementById('clone-status');
@@ -962,9 +970,9 @@
                 const parts = [];
                 parts.push(`Accessibility: ${perms.accessibility ? '✓' : '✗'}`);
                 parts.push(`Screen Recording: ${perms.screen_recording ? '✓' : '✗'}`);
-                alert(parts.join('\n'));
+                showStatus(parts.join(' • '));
             } catch (e) {
-                alert('Could not check permissions: ' + e);
+                showStatus('Could not check permissions: ' + e, true);
             }
         });
 
@@ -1015,7 +1023,7 @@
                 document.getElementById('update-status').textContent = 'This version will be skipped.';
                 document.getElementById('skip-update').style.display = 'none';
             } catch (e) {
-                alert('Could not skip: ' + e);
+                showStatus('Could not skip: ' + e, true);
             }
         });
 

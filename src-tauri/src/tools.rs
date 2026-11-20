@@ -22,6 +22,8 @@ pub struct ToolContext {
     pub app: Option<tauri::AppHandle>,
     pub provider: Option<Arc<dyn Provider>>,
     pub vision_model: String,
+    /// True when the agent-role model accepts image parts.
+    pub vision: bool,
     pub notes: Notes,
     /// `run_script` is registered only when the user enabled scripts.
     pub allow_scripts: bool,
@@ -175,6 +177,40 @@ impl Tool for LookTool {
 
     async fn execute(&self, args: Value) -> Result<ToolResult> {
         let monitor = args["monitor"].as_u64().map(|v| v as usize);
+        if !self.ctx.vision {
+            // Text-only model: no image can be understood, so return the
+            // useful parts of the screen as text instead.
+            let front = osascript(
+                r#"tell application "System Events" to get name of first process whose frontmost is true"#,
+            )
+            .unwrap_or_else(|_| "unknown".to_string());
+            let windows = osascript(
+                r#"tell application "System Events"
+                    set out to ""
+                    repeat with p in (every process whose background only is false)
+                        set out to out & (name of p) & " | "
+                        try
+                            repeat with w in (every window of p)
+                                set out to out & (name of w) & " ;; "
+                            end repeat
+                        end try
+                        set out to out & linefeed
+                    end repeat
+                    return out"#,
+            )
+            .unwrap_or_default();
+            return Ok(ToolResult {
+                call_id: String::new(),
+                result: json!({
+                    "frontmost_app": front,
+                    "windows": windows,
+                    "summary": "Text-only screen view (this model cannot see images).",
+                }),
+                is_error: false,
+                error_message: None,
+                image: None,
+            });
+        }
         let shot = screenshot::capture_monitor(monitor)?;
         // `look` has no target: point the eyes at the centre of the screen.
         self.ctx.emit_focus(0.5, 0.5);
@@ -1040,6 +1076,7 @@ mod tests {
             app: None,
             provider: None,
             vision_model: "vl".to_string(),
+            vision: false,
             notes: Arc::new(Mutex::new(Vec::new())),
             allow_scripts: false,
             browser_eval: false,

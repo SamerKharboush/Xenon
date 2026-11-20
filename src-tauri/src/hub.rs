@@ -427,6 +427,45 @@ mod tests {
         assert!(test.error.is_none());
     }
 
+    fn stress_out() -> std::path::PathBuf {
+        let dir = std::env::var_os("XENON_STRESS_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../scripts/stress/out")
+            });
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Harness 5: detect local providers and list models, writing TSV output.
+    #[tokio::test]
+    #[ignore = "probes local ports; run with -- --ignored stress_hub_detect"]
+    async fn stress_hub_detect_and_list() {
+        use std::io::Write;
+        let det = detect_local_providers().await.unwrap();
+        let out = stress_out();
+        let mut f = std::fs::File::create(out.join("hub-detect.tsv")).unwrap();
+        for d in &det {
+            writeln!(f, "{}\t{}\t{}", d.name, d.base_url, d.models.join(",")).unwrap();
+        }
+        drop(f);
+        eprintln!("detected {} local providers", det.len());
+
+        for d in det.iter().filter(|d| d.base_url.contains("8080")) {
+            match list_provider_models(d.base_url.clone(), None).await {
+                Ok(models) => {
+                    let mut f = std::fs::File::create(out.join("hub-models.tsv")).unwrap();
+                    for m in &models {
+                        writeln!(f, "{}", m).unwrap();
+                    }
+                    eprintln!("models ({}): {models:?}", d.name);
+                }
+                Err(e) => eprintln!("list models failed for {}: {e}", d.name),
+            }
+        }
+    }
+
     #[test]
     fn test_legacy_flat_key_without_profiles_is_kept() {
         let store = MockStore::default();

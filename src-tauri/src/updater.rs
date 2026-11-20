@@ -25,6 +25,10 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const API_URL: &str =
     "https://api.github.com/repos/SamerKharboush/Xenon/releases/latest";
+/// Test override for the release API (harness 6 uses a local mock server).
+fn api_url() -> String {
+    std::env::var("XENON_UPDATE_API").unwrap_or_else(|_| API_URL.to_string())
+}
 const USER_AGENT: &str = "Xenon-Updater";
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const STARTUP_DELAY: Duration = Duration::from_secs(60);
@@ -251,7 +255,7 @@ fn http_client() -> Result<reqwest::Client, String> {
 async fn fetch_latest() -> Result<Option<Release>, String> {
     let client = http_client()?;
     let resp = client
-        .get(API_URL)
+        .get(api_url())
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
@@ -453,7 +457,7 @@ pub async fn install_update_impl(
         return Err("No update available".to_string());
     };
 
-    download_and_open(app, &p).await
+    download_and_open(Some(app), &p).await
 }
 
 #[tauri::command]
@@ -466,13 +470,25 @@ pub async fn install_update(
 
 // --- download + verify -------------------------------------------------------
 
-async fn download_and_open(app: &tauri::AppHandle, p: &PendingUpdate) -> Result<(), String> {
-    let downloads = dirs::download_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
+fn notify(app: Option<&tauri::AppHandle>, msg: impl Into<String>) {
+    if let Some(app) = app {
+        let _ = app.emit("xenon-notice", msg.into());
+    }
+}
+
+async fn download_and_open(
+    app: Option<&tauri::AppHandle>,
+    p: &PendingUpdate,
+) -> Result<(), String> {
+    let downloads = std::env::var_os("XENON_UPDATE_DOWNLOAD_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::download_dir)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
     std::fs::create_dir_all(&downloads).map_err(|e| e.to_string())?;
     let dest = downloads.join(&p.dmg_name);
 
-    let _ = app.emit(
-        "xenon-notice",
+    notify(
+        app,
         format!("Downloading Xenon v{}…", p.version),
     );
 
@@ -531,8 +547,8 @@ async fn download_and_open(app: &tauri::AppHandle, p: &PendingUpdate) -> Result<
         if pct >= 0 && pct != last_pct && last_notice.elapsed().as_secs() >= 5 {
             last_pct = pct;
             last_notice = std::time::Instant::now();
-            let _ = app.emit(
-                "xenon-notice",
+            notify(
+                app,
                 format!(
                     "Downloading Xenon v{}… {}%",
                     p.version, pct
@@ -556,18 +572,22 @@ async fn download_and_open(app: &tauri::AppHandle, p: &PendingUpdate) -> Result<
         log::warn!("no SHA-256 available for {}; skipping verification", p.dmg_name);
     }
 
-    let _ = app.emit(
-        "xenon-notice",
+    notify(
+        app,
         format!(
             "Verified ({} MB). Opening — drag Xenon to Applications.",
             (written as f64 / 1_048_576.0).round() as u64
         ),
     );
 
-    std::process::Command::new("open")
-        .arg(&dest)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    if std::env::var_os("XENON_UPDATE_NO_OPEN").is_none() {
+        std::process::Command::new("open")
+            .arg(&dest)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    } else {
+        log::info!("update harness: skipping `open` (XENON_UPDATE_NO_OPEN)");
+    }
 
     log::info!("update DMG downloaded to {}", dest.display());
     Ok(())
@@ -761,6 +781,99 @@ def456  Xenon_0.3.0_universal.app.zip
         let r: Release = serde_json::from_str(raw).unwrap();
         assert_eq!(r.tag_name, "v0.3.0");
         assert!(r.assets.is_empty());
+    }
+
+    /// Mock-server end-to-end: release JSON -> download -> SHA-256 verify.
+    /// Uses `XENON_UPDATE_API`, `XENON_UPDATE_DOWNLOAD_DIR` and
+    /// `XENON_UPDATE_NO_OPEN`; never touches the network or opens Finder.
+    #[tokio::test]
+    #[ignore = "spawns a local mock server; run with -- --ignored stress_updater_mock"]
+    async fn stress_updater_mock() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let dmg = b"Xenon test DMG";
+        let good_hash = sha256_hex(dmg);
+
+        async fn serve(listener: TcpListener, dmg: &'static [u8], hash: String) {
+            for _ in 0..6 {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let req = String::from_utf8_lossy(&buf);
+                let path = req.split_whitespace().nth(1).unwrap_or("/");
+                let addr = listener.local_addr().unwrap();
+                let (status, ctype, body): (&str, &str, Vec<u8>) = match path {
+                    "/releases/latest" => {
+                        let json = format!(
+                            r#"{{"tag_name":"v9.9.9","assets":[
+                                {{"name":"Xenon_9.9.9_universal.dmg","browser_download_url":"http://{addr}/dmg"}},
+                                {{"name":"SHA256SUMS","browser_download_url":"http://{addr}/sums"}}
+                            ]}}"#
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    }
+                    "/dmg" => ("200 OK", "application/octet-stream", dmg.to_vec()),
+                    "/sums" => (
+                        "200 OK",
+                        "text/plain",
+                        format!("{hash}  Xenon_9.9.9_universal.dmg\n").into_bytes(),
+                    ),
+                    _ => ("404 Not Found", "text/plain", b"no".to_vec()),
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dl = std::env::temp_dir().join(format!("xenon-update-good-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dl);
+        std::env::set_var("XENON_UPDATE_API", format!("http://{addr}/releases/latest"));
+        std::env::set_var("XENON_UPDATE_DOWNLOAD_DIR", &dl);
+        std::env::set_var("XENON_UPDATE_NO_OPEN", "1");
+        tokio::spawn(serve(listener, dmg, good_hash.clone()));
+
+        let result = fetch_latest().await;
+        let release = result.expect("fetch_latest").expect("release json");
+        assert_eq!(release.tag_name, "v9.9.9");
+        let dmg_asset = find_dmg(&release).unwrap();
+        let p = PendingUpdate {
+            version: release.tag_name.clone(),
+            dmg_name: dmg_asset.name.clone(),
+            dmg_url: dmg_asset.browser_download_url.clone(),
+            checksums_url: find_checksums(&release).map(|a| a.browser_download_url.clone()),
+        };
+        download_and_open(None, &p).await.expect("good hash downloads");
+        assert_eq!(std::fs::read(dl.join(&p.dmg_name)).unwrap(), dmg);
+        eprintln!("updater mock: correct hash accepted");
+
+        // Wrong checksum must refuse the DMG and delete it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dl = std::env::temp_dir().join(format!("xenon-update-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dl);
+        std::env::set_var("XENON_UPDATE_API", format!("http://{addr}/releases/latest"));
+        std::env::set_var("XENON_UPDATE_DOWNLOAD_DIR", &dl);
+        tokio::spawn(serve(listener, dmg, "0".repeat(64)));
+
+        let release = fetch_latest().await.unwrap().expect("release json");
+        let dmg_asset = find_dmg(&release).unwrap();
+        let p = PendingUpdate {
+            version: release.tag_name.clone(),
+            dmg_name: dmg_asset.name.clone(),
+            dmg_url: dmg_asset.browser_download_url.clone(),
+            checksums_url: find_checksums(&release).map(|a| a.browser_download_url.clone()),
+        };
+        let err = download_and_open(None, &p).await.unwrap_err();
+        assert!(err.contains("checksum mismatch"), "{err}");
+        assert!(!dl.join(&p.dmg_name).exists(), "bad DMG must be removed");
+        eprintln!("updater mock: wrong hash refused");
     }
 
     /// Live check against the real GitHub API. Ignored by default (needs

@@ -10,7 +10,7 @@
 //! `stop()` clears the queue and the playback buffer immediately, and the
 //! worker kills the fallback process on its next poll.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -321,12 +321,15 @@ fn kokoro_lexicon(dir: &Path) -> Option<String> {
     (!files.is_empty()).then(|| files.join(","))
 }
 
-/// Single-word keys from every Kokoro lexicon file. Used only to decide
-/// whether a word needs the MIT-safe spelling fallback.
-fn load_lexicon_words(dir: &Path) -> HashSet<String> {
-    let mut words = HashSet::new();
+/// Kokoro's lexicon maps a word to its IPA token sequence. Loading the map
+/// once (lazily, only when a sentence has OOV words) lets us build the
+/// `GenerationConfig::tokens` path that handles words the lexicon misses.
+type KokoroLexicon = HashMap<String, Vec<String>>;
+
+fn load_lexicon(dir: &Path) -> KokoroLexicon {
+    let mut map = KokoroLexicon::new();
     let Some(lexicon) = kokoro_lexicon(dir) else {
-        return words;
+        return map;
     };
     for path in lexicon.split(',') {
         let Ok(text) = fs::read_to_string(path) else {
@@ -337,16 +340,16 @@ fn load_lexicon_words(dir: &Path) -> HashSet<String> {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let key = line
-                .split_once("||")
-                .map(|(k, _)| k)
-                .unwrap_or(line);
-            if let Some(word) = key.split_whitespace().next() {
-                words.insert(word.to_lowercase());
+            let line = line.split_once("||").map(|(k, _)| k).unwrap_or(line);
+            let mut parts = line.split_whitespace();
+            let Some(word) = parts.next() else { continue };
+            let ipa: Vec<String> = parts.map(str::to_string).collect();
+            if !ipa.is_empty() {
+                map.entry(word.to_lowercase()).or_insert(ipa);
             }
         }
     }
-    words
+    map
 }
 
 const SMALL_NUMBERS: [&str; 20] = [
@@ -386,45 +389,195 @@ fn number_word(n: u32) -> String {
         .join(" ")
 }
 
-fn flush_kokoro_run(
-    run: &mut String,
-    digits: bool,
-    words: &HashSet<String>,
-    pieces: &mut Vec<String>,
-) {
-    if run.is_empty() {
-        return;
-    }
-    if digits {
-        let spoken = run
-            .parse::<u32>()
-            .map(number_word)
-            .unwrap_or_else(|_| run.clone());
-        pieces.push(spoken);
-    } else if words.contains(&run.to_lowercase()) {
-        pieces.push(run.clone());
-    } else {
-        pieces.push(
-            run.to_lowercase()
-                .chars()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-    }
-    run.clear();
+fn is_vowel(c: char) -> bool {
+    matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y')
 }
 
-/// Expand OOV words/numbers before sherpa-onnx sees them. sherpa-onnx 2.0's
-/// Kokoro lexicon path only handles hyphen splits and CJK characters; English
-/// OOV words and plain digits are otherwise skipped.
-fn expand_kokoro_token(token: &str, words: &HashSet<String>) -> String {
+/// Rule-based letter-to-sound for words the Kokoro lexicon does not know.
+/// Deliberately small: common digraphs, magic-e, and `-tion`/`-ing`.
+fn letter_to_sound(word: &str) -> Vec<String> {
+    let chars: Vec<char> = word.to_lowercase().chars().collect();
+    let n = chars.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut stressed = false;
+    while i < n {
+        // Vowel + consonant + final e: long vowel + consonant, e is silent.
+        if n >= 3
+            && i == 0
+            && chars[n - 1] == 'e'
+            && is_vowel(chars[n - 2])
+            && !is_vowel(chars[n - 3])
+        {
+            out.push(long_vowel(chars[n - 3]));
+            out.push(consonant(chars[n - 2]));
+            break;
+        }
+        let rest: String = chars[i..].iter().collect();
+        if rest.starts_with("tion") {
+            out.extend(["ʃ", "ə", "n"].map(str::to_string));
+            break;
+        }
+        if rest.starts_with("sion") {
+            out.extend(["ʒ", "ə", "n"].map(str::to_string));
+            break;
+        }
+        if rest == "ing" {
+            out.extend(["ɪ", "ŋ"].map(str::to_string));
+            break;
+        }
+        if rest == "ed" && i > 0 {
+            if chars[i - 1] == 't' || chars[i - 1] == 'd' {
+                out.extend(["ɪ", "d"].map(str::to_string));
+            } else {
+                out.push("d".to_string());
+            }
+            break;
+        }
+        if rest == "er" {
+            out.push("ɚ".to_string());
+            break;
+        }
+        if rest == "ar" {
+            out.extend(["ɑ", "ɹ"].map(str::to_string));
+            break;
+        }
+        if rest == "or" {
+            out.extend(["ɔ", "ɹ"].map(str::to_string));
+            break;
+        }
+        let pair: String = chars[i..(i + 2).min(n)].iter().collect();
+        let (tok, used) = match pair.as_str() {
+            "th" => ("θ", 2),
+            "sh" => ("ʃ", 2),
+            "ch" => ("ʧ", 2),
+            "ph" => ("f", 2),
+            "wh" => ("w", 2),
+            "ck" => ("k", 2),
+            "ng" => ("ŋ", 2),
+            "qu" => ("k w", 2),
+            "ee" | "ea" => ("i", 2),
+            "oo" => ("u", 2),
+            "ou" => ("ɑ", 2),
+            "ai" | "ay" => ("e", 2),
+            "oa" => ("o", 2),
+            "oi" | "oy" => ("ɔ", 2),
+            "au" | "aw" => ("ɔ", 2),
+            "ie" => ("i", 2),
+            "ei" => ("e", 2),
+            "ue" => ("u", 2),
+            _ => ("", 1),
+        };
+        if used == 2 {
+            if !stressed && is_vowel(pair.chars().next().unwrap()) {
+                out.push("ˈ".to_string());
+                stressed = true;
+            }
+            out.push(tok.to_string());
+            i += 2;
+            continue;
+        }
+        let c = chars[i];
+        if c == 'e' && i + 1 == n && i > 0 {
+            break; // silent final e
+        }
+        if is_vowel(c) {
+            if !stressed {
+                out.push("ˈ".to_string());
+                stressed = true;
+            }
+            out.push(
+                match c {
+                    'a' => "æ",
+                    'e' => "ɛ",
+                    'i' => "ɪ",
+                    'o' => "ɑ",
+                    'u' => "ʌ",
+                    'y' => "ɪ",
+                    _ => "ɪ",
+                }
+                .to_string(),
+            );
+        } else {
+            out.push(consonant(c));
+        }
+        i += 1;
+    }
+    out
+}
+
+fn long_vowel(c: char) -> String {
+    match c {
+        'a' => "e",
+        'e' => "i",
+        'i' => "a",
+        'o' => "o",
+        'u' => "u",
+        _ => "ɪ",
+    }
+    .to_string()
+}
+
+fn consonant(c: char) -> String {
+    match c {
+        'b' => "b",
+        'c' => "k",
+        'd' => "d",
+        'f' => "f",
+        'g' => "ɡ",
+        'h' => "h",
+        'j' => "ʤ",
+        'k' => "k",
+        'l' => "l",
+        'm' => "m",
+        'n' => "n",
+        'p' => "p",
+        'q' => "k",
+        'r' => "ɹ",
+        's' => "s",
+        't' => "t",
+        'v' => "v",
+        'w' => "w",
+        'x' => "k s",
+        'z' => "z",
+        c => return c.to_string(),
+    }
+    .to_string()
+}
+
+/// Resolve one word to IPA tokens, spelling all-caps acronyms letter by letter.
+fn resolve_word(word: &str, lex: &KokoroLexicon, oov: &mut bool) -> Vec<String> {
+    let lower = word.to_lowercase();
+    if let Some(ipa) = lex.get(&lower) {
+        return ipa.clone();
+    }
+    if lower.contains('-') {
+        let mut out = Vec::new();
+        for part in lower.split('-').filter(|p| !p.is_empty()) {
+            out.extend(resolve_word(part, lex, oov));
+        }
+        return out;
+    }
+    *oov = true;
+    let letters = word.chars().filter(|c| c.is_alphabetic()).count();
+    if letters > 1 && word.chars().all(|c| c.is_ascii_uppercase()) {
+        let mut out = Vec::new();
+        for c in word.chars() {
+            let key = c.to_lowercase().to_string();
+            out.extend(lex.get(&key).cloned().unwrap_or_else(|| letter_to_sound(&key)));
+        }
+        return out;
+    }
+    letter_to_sound(&lower)
+}
+
+fn split_alnum(token: &str) -> (&str, &str, &str) {
     let Some(start) = token
         .char_indices()
         .find(|(_, c)| c.is_alphanumeric())
         .map(|(i, _)| i)
     else {
-        return token.to_string();
+        return ("", "", token);
     };
     let end = token
         .char_indices()
@@ -432,54 +585,78 @@ fn expand_kokoro_token(token: &str, words: &HashSet<String>) -> String {
         .find(|(_, c)| c.is_alphanumeric())
         .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(token.len());
-    let core = &token[start..end];
-    if words.contains(&core.to_lowercase()) {
-        return token.to_string();
-    }
-
-    let prefix = &token[..start];
-    let suffix = &token[end..];
-    let mut pieces = Vec::new();
-    let mut run = String::new();
-    let mut digits = false;
-
-    for c in core.chars() {
-        if c.is_ascii_digit() {
-            if !digits && !run.is_empty() {
-                flush_kokoro_run(&mut run, digits, words, &mut pieces);
-            }
-            digits = true;
-            run.push(c);
-        } else if c.is_alphabetic() {
-            if digits && !run.is_empty() {
-                flush_kokoro_run(&mut run, digits, words, &mut pieces);
-            }
-            digits = false;
-            run.push(c);
-        } else {
-            flush_kokoro_run(&mut run, digits, words, &mut pieces);
-            digits = false;
-            pieces.push(c.to_string());
-        }
-    }
-    flush_kokoro_run(&mut run, digits, words, &mut pieces);
-
-    let core = pieces.join(" ");
-    if core.is_empty() {
-        return token.to_string();
-    }
-    if prefix.is_empty() && suffix.is_empty() {
-        core
-    } else {
-        format!("{prefix} {core} {suffix}")
-    }
+    (&token[..start], &token[start..end], &token[end..])
 }
 
-fn prepare_kokoro_text(text: &str, words: &HashSet<String>) -> String {
-    text.split_whitespace()
-        .map(|token| expand_kokoro_token(token, words))
-        .collect::<Vec<_>>()
-        .join(" ")
+fn punctuation_tokens(s: &str, lex: &KokoroLexicon) -> Vec<String> {
+    s.chars()
+        .flat_map(|c| {
+            let key = c.to_string();
+            lex.get(&key).cloned().unwrap_or_else(|| vec![key])
+        })
+        .collect()
+}
+
+/// Build the text/tokens pair handed to sherpa-onnx. Known words take the
+/// lexicon path (`tokens = None`); any OOV word switches the whole sentence
+/// to `GenerationConfig::tokens` with IPA for every word.
+fn prepare_kokoro(text: &str, lex: &KokoroLexicon) -> (String, Option<Vec<String>>) {
+    let mut pieces = Vec::new();
+    let mut tokens = Vec::new();
+    let mut oov = false;
+    for token in text.split_whitespace() {
+        let (prefix, core, suffix) = split_alnum(token);
+        if !prefix.is_empty() {
+            pieces.push(prefix.to_string());
+            tokens.extend(punctuation_tokens(prefix, lex));
+        }
+        if core.is_empty() {
+            pieces.push(token.to_string());
+            tokens.extend(punctuation_tokens(token, lex));
+        } else {
+            let mut run = String::new();
+            let mut digits = false;
+            for c in core.chars() {
+                let c_digits = c.is_ascii_digit();
+                if !run.is_empty() && c_digits != digits {
+                    flush_kokoro_run(&mut run, digits, lex, &mut oov, &mut pieces, &mut tokens);
+                }
+                digits = c_digits;
+                run.push(c);
+            }
+            flush_kokoro_run(&mut run, digits, lex, &mut oov, &mut pieces, &mut tokens);
+        }
+        if !suffix.is_empty() {
+            pieces.push(suffix.to_string());
+            tokens.extend(punctuation_tokens(suffix, lex));
+        }
+    }
+    let out = pieces.join(" ");
+    (out, oov.then_some(tokens))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_kokoro_run(
+    run: &mut String,
+    digits: bool,
+    lex: &KokoroLexicon,
+    oov: &mut bool,
+    pieces: &mut Vec<String>,
+    tokens: &mut Vec<String>,
+) {
+    if run.is_empty() {
+        return;
+    }
+    let spoken = if digits {
+        run.parse::<u32>()
+            .map(number_word)
+            .unwrap_or_else(|_| run.clone())
+    } else {
+        run.clone()
+    };
+    pieces.push(spoken.clone());
+    tokens.extend(resolve_word(&spoken, lex, oov));
+    run.clear();
 }
 
 /// Build the sherpa-onnx config used both by the worker and the ignored
@@ -547,7 +724,7 @@ struct Worker {
     model: Option<OfflineTts>,
     model_dir_loaded: String,
     model_last_used: Option<Instant>,
-    lexicon_words: Option<HashSet<String>>,
+    lexicon: Option<KokoroLexicon>,
     lexicon_dir_loaded: String,
     stream: Option<Stream>,
     device_rate: u32,
@@ -580,7 +757,7 @@ fn worker(
         model: None,
         model_dir_loaded: String::new(),
         model_last_used: None,
-        lexicon_words: None,
+        lexicon: None,
         lexicon_dir_loaded: String::new(),
         stream: None,
         device_rate: 48_000,
@@ -729,19 +906,14 @@ impl Worker {
             }
             return SynthOut::Say(text.to_string());
         }
-        let prepared = if kind == TtsKind::Kokoro {
+        let (prepared, tokens) = if kind == TtsKind::Kokoro {
             if self.lexicon_dir_loaded != model_dir {
-                self.lexicon_words = Some(load_lexicon_words(dir));
+                self.lexicon = Some(load_lexicon(dir));
                 self.lexicon_dir_loaded = model_dir.clone();
             }
-            prepare_kokoro_text(text, self.lexicon_words.as_ref().expect("lexicon loaded"))
+            prepare_kokoro(text, self.lexicon.as_ref().expect("lexicon loaded"))
         } else {
-            String::new()
-        };
-        let text = if kind == TtsKind::Kokoro {
-            prepared.as_str()
-        } else {
-            text
+            (text.to_string(), None)
         };
         let model = match self.ensure_model() {
             Ok(()) => self.model.as_ref().expect("model loaded"),
@@ -759,6 +931,7 @@ impl Worker {
         let mut gen = GenerationConfig {
             speed: speed.unwrap_or(self.cfg.tts_speed),
             sid: speaker.map(|s| s as i32).unwrap_or(self.cfg.tts_speaker_id as i32),
+            tokens: tokens.map(|t| vec![t]),
             ..Default::default()
         };
         if kind == TtsKind::Zipvoice {
@@ -770,7 +943,7 @@ impl Worker {
                 gen.reference_text = Some(reference_text);
             }
         }
-        match model.generate_with_config(text, &gen, None::<fn(&[f32], f32) -> bool>) {
+        match model.generate_with_config(&prepared, &gen, None::<fn(&[f32], f32) -> bool>) {
             Some(audio) if !audio.samples().is_empty() => {
                 self.model_last_used = Some(Instant::now());
                 SynthOut::Neural(audio.samples().to_vec(), audio.sample_rate() as u32)
@@ -927,7 +1100,7 @@ impl Worker {
             log::info!("tts: model dir changed, reloading on next sentence");
             self.model = None;
             self.model_last_used = None;
-            self.lexicon_words = None;
+            self.lexicon = None;
             self.lexicon_dir_loaded.clear();
         }
     }
@@ -943,7 +1116,7 @@ impl Worker {
                 );
                 self.model = None;
                 self.model_last_used = None;
-                self.lexicon_words = None;
+                self.lexicon = None;
                 self.lexicon_dir_loaded.clear();
             }
         }
@@ -1074,21 +1247,145 @@ mod tests {
         assert!(q.pop().is_none());
     }
 
+    /// Harness 3: 100-sentence queue ordering plus a real `Tts::stop` latency
+    /// check (must be <100 ms) and a memory sample. Skips if Kokoro is absent.
     #[test]
-    fn kokoro_oov_fallback_spells_unknown_words_and_numbers() {
-        let words: HashSet<String> = [
-            "xenon", "safari", "pm", "three", "forty-five", "for", "at", "s", "a", "m",
-            "e", "r", "o", "p", "n", "d", "t", "h", "f", "i", "v", "y", "x",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-        let out = prepare_kokoro_text("Xenon opened Safari for Samer at 3:45pm", &words);
-        assert!(out.contains("Xenon"), "{out}");
-        assert!(out.contains("o p e n e d"), "{out}");
-        assert!(out.contains("Safari"), "{out}");
-        assert!(out.contains("s a m e r"), "{out}");
-        assert!(out.contains("three : forty-five pm"), "{out}");
+    #[ignore = "enqueues 100 sentences through the TTS worker; run with -- --ignored tts_queue"]
+    fn tts_queue_stress_harness() {
+        let q = SpeechQueue::default();
+        for i in 0..100 {
+            q.push(format!("Sentence {i}."));
+        }
+        for i in 0..100 {
+            assert_eq!(q.pop().as_deref(), Some(format!("Sentence {i}.").as_str()));
+        }
+        assert!(q.pop().is_none());
+
+        let cfg = XenonConfig::default();
+        let dir = Path::new(&cfg.tts_model_dir);
+        if !dir.join("model.onnx").exists() || !dir.join("voices.bin").exists() {
+            eprintln!("skip: Kokoro model absent at {}", dir.display());
+            return;
+        }
+        let tts = Tts::new(Arc::new(RwLock::new(cfg)));
+        for i in 0..100 {
+            tts.speak(&format!("Sentence {i}.")).expect("enqueue");
+        }
+        assert!(tts.is_busy(), "100 queued sentences should be busy");
+        let started = Instant::now();
+        tts.stop();
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(100), "stop took {elapsed:?}");
+        assert!(!tts.is_busy(), "stop must clear busy");
+
+        let pid = std::process::id();
+        let rss = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        eprintln!("tts queue: 100 ordered, stop={elapsed:?}, rss={}KB", rss);
+    }
+
+    /// Harness 3b: with no neural model, the worker must fall back to `say`
+    /// instead of dead-ending. Uses a short phrase and checks `say` exits 0.
+    #[test]
+    #[ignore = "spawns /usr/bin/say; run with -- --ignored tts_say_fallback"]
+    fn tts_say_fallback_harness() {
+        let tmp = std::env::temp_dir().join(format!("xenon-tts-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = XenonConfig {
+            tts_model_dir: tmp.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let tts = Tts::new(Arc::new(RwLock::new(cfg)));
+        tts.speak("Xenon fallback test.").expect("enqueue");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while tts.is_busy() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!tts.is_busy(), "say fallback did not drain in 15s");
+        let _ = std::fs::remove_dir_all(&tmp);
+        eprintln!("tts say fallback: drained");
+    }
+
+    fn ipa(words: &[(&str, &[&str])]) -> KokoroLexicon {
+        words
+            .iter()
+            .map(|(w, p)| {
+                (
+                    w.to_string(),
+                    p.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    fn joined(tokens: &[String]) -> String {
+        tokens.join(" ")
+    }
+
+    #[test]
+    fn kokoro_oov_builds_phoneme_tokens() {
+        let lex = ipa(&[
+            ("xenon", &["z", "ˈ", "i", "n", "ˌ", "ɑ", "n"]),
+            ("safari", &["s", "ə", "f", "ˈ", "ɑ", "ɹ", "i"]),
+            ("open", &["ˈ", "O", "p", "ᵊ", "n"]),
+            ("three", &["θ", "ɹ", "i"]),
+            ("forty-five", &["f", "ˈ", "ɔ", "ɹ", "t", "i", "f", "a", "ɪ", "v"]),
+            ("pm", &["p", "i", "ˈ", "ɛ", "m"]),
+            ("s", &["ˈ", "ɛ", "s"]),
+            ("a", &["ˈ", "e", "ɪ"]),
+            ("m", &["ɛ", "m"]),
+            ("e", &["i"]),
+            ("r", &["ɑ", "ɹ"]),
+            ("l", &["ˈ", "ɛ", "l"]),
+            (":", &[":"]),
+        ]);
+        let (text, tokens) = prepare_kokoro("Xenon opened Safari for Samer at 3:45pm", &lex);
+        assert!(text.contains("Xenon"), "{text}");
+        assert!(text.contains("Samer"), "{text}");
+        let tokens = tokens.expect("OOV sentence must use the phoneme path");
+        let words = joined(&tokens);
+        assert!(words.contains("z ˈ i n ˌ ɑ n"), "Xenon IPA missing: {words}");
+        assert!(words.contains("s ˈ æ m ɚ"), "Samer IPA missing: {words}");
+        assert!(words.contains("ˈ ɑ p ɛ n d"), "opened IPA missing: {words}");
+    }
+
+    #[test]
+    fn kokoro_known_sentence_uses_lexicon_path() {
+        let lex = ipa(&[
+            ("hello", &["h", "ə", "l", "ˈ", "o"]),
+            ("world", &["w", "ˈ", "ɜ", "ɹ", "l", "d"]),
+        ]);
+        let (text, tokens) = prepare_kokoro("Hello world", &lex);
+        assert_eq!(text, "Hello world");
+        assert!(tokens.is_none(), "all-known sentence should not need tokens");
+    }
+
+    #[test]
+    fn kokoro_spells_all_caps_acronyms() {
+        let lex = ipa(&[
+            ("l", &["ˈ", "ɛ", "l"]),
+            ("m", &["ɛ", "m"]),
+            ("nasa", &["n", "ˈ", "æ", "s", "ə"]),
+        ]);
+        let (_, tokens) = prepare_kokoro("NASA and LLM", &lex);
+        let words = joined(&tokens.expect("acronyms need tokens"));
+        assert!(words.contains("n ˈ æ s ə"), "{words}");
+        assert!(
+            words.contains("ˈ ɛ l ɛ m"),
+            "LLM should spell letters: {words}"
+        );
+    }
+
+    #[test]
+    fn letter_to_sound_handles_opened_and_samer() {
+        assert_eq!(joined(&letter_to_sound("opened")), "ˈ ɑ p ɛ n d");
+        assert_eq!(joined(&letter_to_sound("samer")), "s ˈ æ m ɚ");
     }
 
     #[test]
@@ -1208,11 +1505,12 @@ mod tests {
         let tts = OfflineTts::create(&offline_tts_config(dir, TtsKind::Kokoro))
             .expect("create Kokoro TTS");
         let text = "Xenon opened Safari for Samer at 3:45pm";
-        let prepared = prepare_kokoro_text(text, &load_lexicon_words(dir));
-        eprintln!("oov prepared: {prepared:?}");
+        let (prepared, tokens) = prepare_kokoro(text, &load_lexicon(dir));
+        eprintln!("oov prepared: {prepared:?} tokens={tokens:?}");
         let gen = GenerationConfig {
             speed: cfg.tts_speed,
             sid: cfg.tts_speaker_id as i32,
+            tokens: tokens.map(|t| vec![t]),
             ..Default::default()
         };
         let audio = tts

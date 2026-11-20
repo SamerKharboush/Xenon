@@ -78,6 +78,12 @@ pub fn stop_speaking(runtime: State<'_, crate::runtime::Runtime>) {
     runtime.stop_speaking();
 }
 
+/// Start the native window drag from the pet's drag handle.
+#[tauri::command]
+pub fn start_window_drag(window: Window) -> Result<(), String> {
+    window.start_dragging().map_err(|e| e.to_string())
+}
+
 /// Manually set the pet to Listening (placeholder for wake-word integration).
 #[tauri::command]
 pub fn trigger_listen(window: Window) -> Result<(), String> {

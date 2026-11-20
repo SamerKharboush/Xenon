@@ -932,7 +932,13 @@ pub(crate) fn transcribe_samples(samples: &[f32], cfg: &XenonConfig) -> Result<S
         anyhow::bail!("no whisper model available for transcription");
     }
     let ctx = WhisperContext::new_with_params(&path, WhisperContextParameters::new())?;
-    match run_stt(&ctx, samples, None) {
+    transcribe_with_context(&ctx, samples)
+}
+
+/// Transcribe with an already-loaded context (harnesses reuse one context for
+/// many utterances instead of paying model load per call).
+pub(crate) fn transcribe_with_context(ctx: &WhisperContext, samples: &[f32]) -> Result<String> {
+    match run_stt(ctx, samples, None) {
         Ok(Some(u)) => Ok(u.text),
         Ok(None) => Ok(String::new()),
         Err(e) => Err(e),
@@ -1031,6 +1037,133 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(4);
         push_mono(&[0.1, 0.2, 0.3], 1, &tx);
         assert_eq!(rx.try_recv().unwrap(), vec![0.1, 0.2, 0.3]);
+    }
+
+    /// Harness 1: ~20 generated utterances through base.en and large-v3-turbo,
+    /// recording first-load and per-utterance latency. Audio is produced by
+    /// scripts/stress/gen-utterances.py (raw f32le 16 kHz + expected text).
+    #[test]
+    #[ignore = "loads real whisper models; run with -- --ignored stress_stt_harness"]
+    fn stress_stt_harness() {
+        use std::io::Write;
+
+        let dir = std::env::var_os("XENON_STT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("xenon-stt"));
+        let out = std::env::var_os("XENON_STRESS_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../scripts/stress/out")
+            });
+        std::fs::create_dir_all(&out).unwrap();
+        let summary = out.join("stt-summary.tsv");
+        let _ = std::fs::remove_file(&summary);
+        let load_only = std::env::var_os("XENON_STT_LOAD_ONLY").is_some();
+
+        let cfg = XenonConfig::default();
+        let home = dirs::home_dir().unwrap_or_default();
+        let models = [
+            (
+                "base.en",
+                home.join("Library/Application Support/com.xenon.app/models/ggml-base.en.bin"),
+            ),
+            ("large-v3-turbo", std::path::PathBuf::from(&cfg.whisper_model_path)),
+        ];
+
+        for (name, path) in models {
+            if !path.exists() {
+                eprintln!("skip: {name} absent at {}", path.display());
+                continue;
+            }
+            let started = Instant::now();
+            let mut params = WhisperContextParameters::new();
+            // This host's Metal backend aborts on large-v3 (ggml-metal
+            // `GGML_ASSERT(buf_dst)` on the old AMD FirePro D700). The
+            // harness still measures transcription, so use CPU for that model.
+            if name.contains("large") {
+                params.use_gpu(false);
+            }
+            let ctx = WhisperContext::new_with_params(&path, params).expect("load whisper context");
+            let first_load_ms = started.elapsed().as_millis();
+            if load_only {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&summary)
+                    .unwrap();
+                writeln!(f, "{name}\t{first_load_ms}").unwrap();
+                eprintln!("STT {name}: first_load={first_load_ms}ms (load-only)");
+                continue;
+            }
+
+            let mut files: Vec<_> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("f32"))
+                .collect();
+            files.sort();
+
+            let mut rows = Vec::new();
+            let mut times = Vec::new();
+            for wav in &files {
+                let Ok(bytes) = std::fs::read(wav) else { continue };
+                let samples: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let expected = std::fs::read_to_string(wav.with_extension("txt"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let t0 = Instant::now();
+                let transcript = transcribe_with_context(&ctx, &samples).unwrap_or_default();
+                let ms = t0.elapsed().as_millis();
+                times.push(ms as f64);
+                rows.push(format!(
+                    "{}\t{}\t{}\t{}",
+                    wav.file_name().unwrap().to_string_lossy(),
+                    expected,
+                    transcript,
+                    ms
+                ));
+            }
+
+            if times.is_empty() {
+                eprintln!("STT {name}: no utterances found in {}", dir.display());
+                continue;
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let avg = times.iter().sum::<f64>() / times.len() as f64;
+            let p95 = times
+                .get((times.len() * 95 / 100).min(times.len() - 1))
+                .copied()
+                .unwrap_or(0.0);
+            let mut f = std::fs::File::create(out.join(format!("stt-{name}.tsv"))).unwrap();
+            for row in &rows {
+                writeln!(f, "{row}").unwrap();
+            }
+            let mut sf = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&summary)
+                .unwrap();
+            writeln!(
+                sf,
+                "{name}\t{}\t{first_load_ms}\t{avg:.0}\t{p95:.0}",
+                rows.len()
+            )
+            .unwrap();
+            eprintln!(
+                "STT {name}: n={} first_load={}ms avg={:.0}ms p95={:.0}ms",
+                rows.len(),
+                first_load_ms,
+                avg,
+                p95
+            );
+        }
     }
 
     /// End-to-end check with the real ggml models at the default paths:

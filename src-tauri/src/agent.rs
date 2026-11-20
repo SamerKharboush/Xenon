@@ -15,22 +15,27 @@ use crate::tools::{tools_to_schemas, Notes, Tool};
 /// Appended to the system prompt so the model knows the computer-control
 /// contract: it must look before acting, and every action returns a fresh
 /// screenshot for verification.
-fn tool_hint(tools: &[Box<dyn Tool>]) -> String {
+fn tool_hint(tools: &[Box<dyn Tool>], vision: bool) -> String {
     let mut names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
     names.sort_unstable();
+    let verify = if vision {
+        "Every action returns a fresh screenshot so you can verify the result."
+    } else {
+        "This model cannot see screenshots. Use list_windows, frontmost_app and browser_read \
+         for text descriptions, and each tool's summary to verify the result."
+    };
     format!(
         "\n\nYou have computer-control tools: {}. \
          Call look to see the screen. Describe click targets in words (e.g. \"the blue \
-         Spotify icon\"). Every action returns a fresh screenshot so you can verify the \
-         result. Keep going until the user's request is done, then call done with a short \
-         summary (or fail with the reason).",
+         Spotify icon\"). {verify} Keep going until the user's request is done, then call done \
+         with a short summary (or fail with the reason).",
         names.join(", ")
     )
 }
 
 /// Prompt protocol for models without native tool calling (many local GGUFs):
 /// one JSON action per turn inside a fenced block.
-fn action_protocol_hint(tools: &[Box<dyn Tool>]) -> String {
+fn action_protocol_hint(tools: &[Box<dyn Tool>], vision: bool) -> String {
     let mut s = String::from(
         "\n\nTOOL PROTOCOL (this model has no native tool calling). Reply with exactly one \
          JSON object per turn, inside a fenced ```json block, and nothing else:\n\
@@ -45,10 +50,14 @@ fn action_protocol_hint(tools: &[Box<dyn Tool>]) -> String {
             tool.schema()
         ));
     }
-    s.push_str(
+    s.push_str(if vision {
         "Call \"done\" with a short summary when the task is complete, or \"fail\" with the \
-         reason if it cannot be done. Wait for the screenshot result before the next action.",
-    );
+         reason if it cannot be done. Wait for the screenshot result before the next action."
+    } else {
+        "This model cannot see screenshots. Use list_windows, frontmost_app and browser_read \
+         for text descriptions, and each tool's summary to verify. Call \"done\" with a short \
+         summary when the task is complete, or \"fail\" with the reason if it cannot be done."
+    });
     s
 }
 
@@ -228,6 +237,10 @@ pub struct Agent {
     abort: Arc<AtomicBool>,
     /// False when the model has no native tool calling (text protocol).
     native_tools: bool,
+    /// Whether the agent-role model accepts image parts.
+    vision: bool,
+    /// One-time notice when a text-only model first gets a screenshot result.
+    vision_notice: AtomicBool,
     /// Task-scoped notes written by the `remember` tool.
     notes: Notes,
 }
@@ -269,6 +282,7 @@ impl Agent {
         notes: Notes,
     ) -> Self {
         let native_tools = !config.role_lacks_tools(Role::Agent);
+        let vision = config.role_profile(Role::Agent).supports_vision;
         Self {
             provider,
             chat_provider,
@@ -277,6 +291,8 @@ impl Agent {
             config,
             abort,
             native_tools,
+            vision,
+            vision_notice: AtomicBool::new(false),
             notes,
         }
     }
@@ -415,9 +431,9 @@ impl Agent {
 
         let mut system = self.config.system_prompt.clone();
         if self.native_tools {
-            system.push_str(&tool_hint(&self.tools));
+            system.push_str(&tool_hint(&self.tools, self.vision));
         } else {
-            system.push_str(&action_protocol_hint(&self.tools));
+            system.push_str(&action_protocol_hint(&self.tools, self.vision));
         }
 
         let mut messages = vec![
@@ -474,8 +490,9 @@ impl Agent {
                 if let Some(tool_call) = tool_calls.into_iter().next() {
                     self.push_assistant(&mut messages, &content, &tool_call);
                     let result = self.run_tool(&tool_call, &emit).await;
+                    self.notice_text_only(&emit, &result).await;
                     let terminal = matches!(tool_call.name.as_str(), "done" | "fail");
-                    push_tool_result(&mut messages, &tool_call, &result)?;
+                    push_tool_result(&mut messages, &tool_call, &result, self.vision)?;
                     if terminal {
                         speak_terminal(&emit, &tool_call.name, &result).await;
                         break;
@@ -496,8 +513,9 @@ impl Agent {
                     };
                     messages.push(ChatMessage::text(ChatRole::Assistant, content.clone()));
                     let result = self.run_tool(&tool_call, &emit).await;
+                    self.notice_text_only(&emit, &result).await;
                     let terminal = matches!(tool_call.name.as_str(), "done" | "fail");
-                    push_tool_result(&mut messages, &tool_call, &result)?;
+                    push_tool_result(&mut messages, &tool_call, &result, self.vision)?;
                     if terminal {
                         speak_terminal(&emit, &tool_call.name, &result).await;
                         break;
@@ -518,6 +536,23 @@ impl Agent {
         Ok(())
     }
 
+    /// Tell the user once that this model cannot see the screenshots that
+    /// other tools still return, and that the agent is using text instead.
+    async fn notice_text_only(&self, emit: &Sender<AgentAction>, result: &ToolResult) {
+        if self.vision || result.image.is_none() {
+            return;
+        }
+        if !self.vision_notice.swap(true, Ordering::SeqCst) {
+            let _ = emit
+                .send(AgentAction::Speak(
+                    "This model can't see screenshots, so I'll use text descriptions from the \
+                     tools instead."
+                        .to_string(),
+                ))
+                .await;
+        }
+    }
+
     fn push_assistant(&self, messages: &mut Vec<ChatMessage>, content: &str, call: &ToolCall) {
         let text = if content.is_empty() {
             format!("Called tool {} with args: {}", call.name, call.args)
@@ -536,6 +571,7 @@ fn push_tool_result(
     messages: &mut Vec<ChatMessage>,
     tool_call: &ToolCall,
     result: &ToolResult,
+    vision: bool,
 ) -> Result<()> {
     let result_json = if result.is_error {
         serde_json::json!({ "error": result.error_message })
@@ -547,19 +583,21 @@ fn push_tool_result(
         serde_json::to_string(&result_json)?,
     ));
 
-    if let Some(shot) = &result.image {
-        let summary = result.result["summary"]
-            .as_str()
-            .unwrap_or("Screenshot after the action.")
-            .to_string();
-        messages.push(ChatMessage::user_with_image(
-            format!(
-                "{summary} (tool: {}). Check it: did the screen change as expected? \
-                 Then take the next action.",
-                tool_call.name
-            ),
-            shot.data_uri(),
-        ));
+    if vision {
+        if let Some(shot) = &result.image {
+            let summary = result.result["summary"]
+                .as_str()
+                .unwrap_or("Screenshot after the action.")
+                .to_string();
+            messages.push(ChatMessage::user_with_image(
+                format!(
+                    "{summary} (tool: {}). Check it: did the screen change as expected? \
+                     Then take the next action.",
+                    tool_call.name
+                ),
+                shot.data_uri(),
+            ));
+        }
     }
     Ok(())
 }

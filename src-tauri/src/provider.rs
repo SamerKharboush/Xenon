@@ -4,10 +4,11 @@ use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::events::ToolCall;
@@ -156,9 +157,25 @@ pub fn is_retryable(err: &anyhow::Error) -> bool {
         return true;
     }
     if let Some(re) = err.downcast_ref::<reqwest::Error>() {
-        return re.is_timeout() || re.is_connect() || re.is_request();
+        return re.is_timeout() || re.is_connect() || re.is_request() || re.is_decode() || re.is_body();
     }
     false
+}
+
+/// One send lock per base URL. A single-slot llama.cpp server cannot serve
+/// the planning and action calls concurrently, so every request to the same
+/// endpoint (including the stream's lifetime) takes this lock.
+static PROVIDER_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+fn provider_lock(base_url: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let locks = PROVIDER_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    locks
+        .lock()
+        .unwrap()
+        .entry(base_url.to_string())
+        .or_default()
+        .clone()
 }
 
 /// Normalize an OpenAI-compatible base URL: drop a trailing slash and append
@@ -239,6 +256,26 @@ impl OpenAICompatProvider {
         }
 
         Ok(response)
+    }
+
+    /// Bounded retry for transient transport / 5xx errors. Each attempt runs
+    /// under the provider lock, so a slow retry blocks other requests to the
+    /// same single-slot server instead of piling on.
+    async fn send_json_retry(&self, url: String, body: Value) -> Result<reqwest::Response> {
+        const ATTEMPTS: usize = 3;
+        let mut delay = Duration::from_millis(200);
+        for attempt in 1..=ATTEMPTS {
+            match self.send_json(url.clone(), body.clone()).await {
+                Ok(r) => return Ok(r),
+                Err(e) if attempt < ATTEMPTS && is_retryable(&e) => {
+                    log::warn!("provider request failed ({e}); retry {attempt}/{ATTEMPTS}");
+                    tokio::time::sleep(delay).await;
+                    delay *= 4;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(anyhow!("provider retries exhausted"))
     }
 
     /// Parses an OpenAI-style SSE body into ChatChunks: line-buffered,
@@ -398,6 +435,21 @@ impl OpenAICompatProvider {
     }
 }
 
+struct GatedStream {
+    inner: ChatStream,
+    /// Held until the stream is dropped, so planning and action calls to the
+    /// same endpoint never overlap.
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl Stream for GatedStream {
+    type Item = Result<ChatChunk>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
 #[async_trait]
 impl Provider for OpenAICompatProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream> {
@@ -414,8 +466,12 @@ impl Provider for OpenAICompatProvider {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
 
-        let response = self.send_json(self.endpoint(), body).await?;
-        Ok(self.stream_response(response))
+        let guard = provider_lock(&self.base_url).lock_owned().await;
+        let response = self.send_json_retry(self.endpoint(), body).await?;
+        Ok(Box::pin(GatedStream {
+            inner: self.stream_response(response),
+            _guard: guard,
+        }))
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<String> {
@@ -429,7 +485,8 @@ impl Provider for OpenAICompatProvider {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
 
-        let response = self.send_json(self.endpoint(), body).await?;
+        let _guard = provider_lock(&self.base_url).lock_owned().await;
+        let response = self.send_json_retry(self.endpoint(), body).await?;
         let json: Value = response.json().await?;
         Ok(json["choices"][0]["message"]["content"]
             .as_str()
@@ -801,9 +858,120 @@ mod tests {
         assert!(err.to_string().contains("503"));
     }
 
+    /// Harness 5: dead primary port must fall back to a live ToshLLM server
+    /// with one notice (no Tauri app attached, so we only measure timing).
+    #[tokio::test]
+    #[ignore = "uses local model server; run with -- --ignored stress_provider_fallback"]
+    async fn stress_provider_fallback_dead_port() {
+        let dead = OpenAICompatProvider::new("http://127.0.0.1:1".to_string(), None);
+        let live = OpenAICompatProvider::new("http://127.0.0.1:8080/v1".to_string(), None);
+        let fallback = FallbackProvider::new(
+            vec![Arc::new(dead), Arc::new(live)],
+            vec!["dead-port".into(), "ToshLLM".into()],
+            None,
+        );
+        let mut req = req();
+        req.model = std::env::var("XENON_MODEL").unwrap_or_else(|_| "local".into());
+        req.messages = vec![ChatMessage::text(ChatRole::User, "Say OK.")];
+        let started = std::time::Instant::now();
+        match fallback.chat(req).await {
+            Ok(out) => eprintln!(
+                "fallback ok in {} ms: {}",
+                started.elapsed().as_millis(),
+                out
+            ),
+            Err(e) => eprintln!("fallback skipped (server down?): {e}"),
+        }
+    }
+
+    /// Harness 5: malformed 200 body and HTTP 500 are surfaced as errors.
+    #[tokio::test]
+    #[ignore = "spawns local mock server; run with -- --ignored stress_provider_malformed"]
+    async fn stress_provider_malformed_and_500() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn serve(body: &'static str, status: &'static str) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                for _ in 0..4 {
+                    let Ok((mut sock, _)) = listener.accept().await else { break };
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        let bad = OpenAICompatProvider::new(serve("not json", "200 OK").await, None);
+        let err = bad.chat(req()).await.unwrap_err();
+        eprintln!("malformed 200 -> {err}");
+        assert!(!err.to_string().is_empty());
+
+        let err500 = OpenAICompatProvider::new(serve("boom", "500 Internal Server Error").await, None)
+            .chat(req())
+            .await
+            .unwrap_err();
+        eprintln!("500 -> {err500}");
+        assert!(is_retryable(&err500), "500 must stay retryable");
+    }
+
     #[tokio::test]
     async fn test_fallback_empty_is_error() {
         let fallback = FallbackProvider::new(vec![], vec![], None);
         assert!(fallback.chat(req()).await.is_err());
+    }
+
+    #[test]
+    fn test_provider_lock_is_per_base_url() {
+        let a1 = provider_lock("http://localhost:8080/v1");
+        let a2 = provider_lock("http://localhost:8080/v1");
+        let b = provider_lock("http://localhost:8081/v1");
+        assert!(Arc::ptr_eq(&a1, &a2), "same endpoint shares a lock");
+        assert!(!Arc::ptr_eq(&a1, &b), "different endpoints do not share");
+    }
+
+    #[tokio::test]
+    async fn test_send_json_retry_recovers_from_503() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = if attempt == 0 {
+                    "unavailable"
+                } else {
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                };
+                let status = if attempt == 0 {
+                    "503 Service Unavailable"
+                } else {
+                    "200 OK"
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let provider = OpenAICompatProvider::new(format!("http://{addr}"), None);
+        let resp = provider
+            .send_json_retry(provider.endpoint(), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "second attempt should succeed");
     }
 }

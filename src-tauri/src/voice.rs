@@ -789,6 +789,87 @@ mod tests {
         );
     }
 
+    /// Harness 2: 30 positives + 30 negatives through the wake matcher.
+    #[test]
+    #[ignore = "synthesizes and transcribes audio; run with -- --ignored stress_wake_harness"]
+    fn stress_wake_harness() {
+        use std::io::Write;
+
+        let cfg = XenonConfig::default();
+        let model = if Path::new(&cfg.wake_model_path).exists() {
+            cfg.wake_model_path.clone()
+        } else {
+            cfg.whisper_model_path.clone()
+        };
+        if !Path::new(&model).exists() {
+            eprintln!("skip: no whisper model");
+            return;
+        }
+        let ctx = whisper_rs::WhisperContext::new_with_params(
+            &model,
+            whisper_rs::WhisperContextParameters::new(),
+        )
+        .expect("load whisper");
+
+        let positives = [
+            "Hey Xenon", "Hey Xenon.", "Hey Xenon!", "Hey Xenon, are you there?",
+            "Hey Xenon, what time is it?", "Hey Xenon, open Safari", "Hey Xenon, stop",
+            "Hey Xenon, hello", "Hey Xenon, can you hear me?", "Hey Xenon, thanks",
+            "Hey Xenon, do the thing", "Hey Xenon, read this", "Hey Xenon, look here",
+            "Hey Xenon, remember this", "Hey Xenon, tell me a joke", "Hey Xenon, play music",
+            "Hey Xenon, turn it down", "Hey Xenon, turn it up", "Hey Xenon, next",
+            "Hey Xenon, done", "Hey Xenon, yes", "Hey Xenon, no", "Hey Xenon, maybe",
+            "Hey Xenon, wait", "Hey Xenon, go", "Hey Xenon, come back",
+            "Hey Xenon, I need help", "Hey Xenon, are you listening?",
+            "Hey Xenon, good morning", "Hey Xenon, good night",
+        ];
+        let negatives = [
+            "Hello there", "Hey you", "Hello Xenon", "Hey Xenon's friend",
+            "What time is it?", "Open Safari", "Stop", "Thanks", "Good morning",
+            "Good night", "How are you?", "What is the weather?", "Tell me a joke",
+            "Read this page", "Remember this", "Do the thing", "Can you hear me?",
+            "Are you there?", "Hey, listen", "Hey, stop", "Hey, go", "Wait a minute",
+            "I need help", "Please help me", "This is a test", "Testing one two three",
+            "The quick brown fox", "Something completely different", "Never mind",
+            "Never say that word",
+        ];
+
+        let out = std::env::var_os("XENON_STRESS_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../scripts/stress/out")
+            });
+        std::fs::create_dir_all(&out).unwrap();
+        let mut f = std::fs::File::create(out.join("wake.tsv")).unwrap();
+        let mut pos_hits = 0;
+        let mut neg_hits = 0;
+
+        for (label, texts, expected) in [
+            ("pos", &positives[..], true),
+            ("neg", &negatives[..], false),
+        ] {
+            for text in texts {
+                let Some(samples) = say_wav(text) else { continue };
+                let transcript =
+                    crate::audio::transcribe_with_context(&ctx, &samples).unwrap_or_default();
+                let matched = match_wake(&transcript, "hey xenon", cfg.wake_sensitivity).is_some();
+                if matched && expected {
+                    pos_hits += 1;
+                }
+                if matched && !expected {
+                    neg_hits += 1;
+                }
+                writeln!(f, "{label}\t{text}\t{transcript}\t{matched}").unwrap();
+            }
+        }
+        eprintln!(
+            "wake: positives fired {pos_hits}/{}; negatives fired {neg_hits}/{}",
+            positives.len(),
+            negatives.len()
+        );
+    }
+
     /// Real Kokoro preview: every speaker must produce non-silent audio.
     #[test]
     #[ignore = "loads the real Kokoro model; run with -- --ignored kokoro_speakers"]

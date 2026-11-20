@@ -147,6 +147,7 @@ mod tests {
             app: None,
             provider: None,
             vision_model: "vl".to_string(),
+            vision: false,
             notes: Arc::new(Mutex::new(Vec::new())),
             allow_scripts: false,
             browser_eval: false,

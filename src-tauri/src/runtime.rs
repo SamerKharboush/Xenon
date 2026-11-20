@@ -49,6 +49,7 @@ pub fn build_agent(
         app,
         provider: Some(vision_provider),
         vision_model: vision.effective_vision_model().to_string(),
+        vision: cfg.role_profile(crate::config::Role::Agent).supports_vision,
         notes: notes.clone(),
         allow_scripts: cfg.allow_scripts,
         browser_eval: cfg.browser_eval_enabled,
