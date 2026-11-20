@@ -417,7 +417,8 @@ mod tests {
             model: models[0].clone(),
             vision_model: models[0].clone(),
             supports_tools: true,
-            supports_vision: true,
+            // New profiles don't assume vision: only a hub test can prove it.
+            supports_vision: false,
         };
         let test = test_profile(&profile).await;
         eprintln!("test_profile => {test:?}");

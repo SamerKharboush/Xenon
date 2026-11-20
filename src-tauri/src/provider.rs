@@ -150,16 +150,68 @@ struct ServerError {
     body: String,
 }
 
-/// Retryable when the failure is transient: a 5xx, a connection error, or a
-/// timeout. 4xx (bad key, bad request) and parse errors are not retried.
+/// The SSE body ended without `[DONE]` / a finish reason: a truncated answer.
+#[derive(Debug, thiserror::Error)]
+#[error("provider stream ended before finishing")]
+struct IncompleteStream;
+
+/// A connect error (refused / no route / DNS): the endpoint is not there, so
+/// retrying the same profile with backoff only wastes seconds. The caller
+/// should move straight on to the next fallback profile.
+pub fn is_connect_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<reqwest::Error>()
+        .map(|re| re.is_connect())
+        .unwrap_or(false)
+}
+
+/// Retryable when the failure is transient: a 5xx, a read/body timeout, a
+/// broken response body, a dead endpoint (which the fallback chain moves
+/// past), or a stream cut off before it could finish. 4xx (bad key, bad
+/// request) and parse errors are not retried.
 pub fn is_retryable(err: &anyhow::Error) -> bool {
-    if err.downcast_ref::<ServerError>().is_some() {
+    if err.downcast_ref::<ServerError>().is_some()
+        || err.downcast_ref::<IncompleteStream>().is_some()
+    {
         return true;
     }
     if let Some(re) = err.downcast_ref::<reqwest::Error>() {
-        return re.is_timeout() || re.is_connect() || re.is_request() || re.is_decode() || re.is_body();
+        return re.is_timeout()
+            || re.is_connect()
+            || re.is_request()
+            || re.is_decode()
+            || re.is_body();
     }
     false
+}
+
+/// Same as [`is_retryable`] but for *same-provider* backoff retries: a
+/// connect error is excluded, because a refused socket will still be refused
+/// 200 ms later. Failing over to the next profile is immediate instead.
+fn is_backoff_retryable(err: &anyhow::Error) -> bool {
+    is_retryable(err) && !is_connect_error(err)
+}
+
+/// Timeouts for one provider client.
+///
+/// `read` is an *idle* timeout between chunks, not a total budget: a slow
+/// local model (single-digit tokens/second on CPU) can legitimately spend
+/// minutes on a long stream, and a total timeout kills it mid-answer.
+/// `total` applies only to the small non-streaming calls (probes, planning).
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderTimeouts {
+    pub connect: Duration,
+    pub read: Duration,
+    pub total: Duration,
+}
+
+impl Default for ProviderTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            read: Duration::from_secs(120),
+            total: Duration::from_secs(120),
+        }
+    }
 }
 
 /// One send lock per base URL. A single-slot llama.cpp server cannot serve
@@ -195,21 +247,49 @@ pub struct OpenAICompatProvider {
     client: Client,
     base_url: String,
     api_key: Option<String>,
+    timeouts: ProviderTimeouts,
 }
 
 impl OpenAICompatProvider {
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
-        // Timeouts so a dead endpoint fails the turn instead of hanging it.
+        Self::with_timeouts(base_url, api_key, ProviderTimeouts::default())
+    }
+
+    /// Same provider with explicit timeouts (tests shrink them to milliseconds).
+    pub fn with_timeouts(
+        base_url: String,
+        api_key: Option<String>,
+        timeouts: ProviderTimeouts,
+    ) -> Self {
+        // No total `.timeout()`: it also covers the streamed body, so a slow
+        // model streaming for minutes gets killed mid-answer ("error decoding
+        // response body"). `read_timeout` is an idle timeout between chunks
+        // instead, and `total` is applied per-request for non-streaming calls.
         let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(timeouts.connect)
+            .read_timeout(timeouts.read)
             .build()
             .unwrap_or_else(|_| Client::new());
         Self {
             client,
             base_url: normalize_base_url(&base_url),
             api_key,
+            timeouts,
         }
+    }
+
+    /// Stream requests must not carry the total cap; only the small
+    /// non-streaming probes do.
+    fn request(&self, url: &str, body: &Value, stream: bool) -> reqwest::RequestBuilder {
+        let mut req = self
+            .client
+            .post(url)
+            .headers(self.build_headers())
+            .json(body);
+        if !stream {
+            req = req.timeout(self.timeouts.total);
+        }
+        req
     }
 
     fn endpoint(&self) -> String {
@@ -233,14 +313,9 @@ impl OpenAICompatProvider {
     }
 
     /// POST a JSON body and turn any non-2xx into an Err carrying status + body.
-    async fn send_json(&self, url: String, body: Value) -> Result<reqwest::Response> {
-        let response = self
-            .client
-            .post(&url)
-            .headers(self.build_headers())
-            .json(&body)
-            .send()
-            .await?;
+    /// `stream` picks the timeout policy (idle read vs total cap).
+    async fn send_json(&self, url: String, body: Value, stream: bool) -> Result<reqwest::Response> {
+        let response = self.request(&url, &body, stream).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -261,13 +336,21 @@ impl OpenAICompatProvider {
     /// Bounded retry for transient transport / 5xx errors. Each attempt runs
     /// under the provider lock, so a slow retry blocks other requests to the
     /// same single-slot server instead of piling on.
-    async fn send_json_retry(&self, url: String, body: Value) -> Result<reqwest::Response> {
+    ///
+    /// A connect error is *not* retried: it fails immediately so the fallback
+    /// chain moves to the next profile (a refused socket stays refused).
+    async fn send_json_retry(
+        &self,
+        url: String,
+        body: Value,
+        stream: bool,
+    ) -> Result<reqwest::Response> {
         const ATTEMPTS: usize = 3;
         let mut delay = Duration::from_millis(200);
         for attempt in 1..=ATTEMPTS {
-            match self.send_json(url.clone(), body.clone()).await {
+            match self.send_json(url.clone(), body.clone(), stream).await {
                 Ok(r) => return Ok(r),
-                Err(e) if attempt < ATTEMPTS && is_retryable(&e) => {
+                Err(e) if attempt < ATTEMPTS && is_backoff_retryable(&e) => {
                     log::warn!("provider request failed ({e}); retry {attempt}/{ATTEMPTS}");
                     tokio::time::sleep(delay).await;
                     delay *= 4;
@@ -405,6 +488,11 @@ impl OpenAICompatProvider {
                                 acc.buf.push('\n');
                                 continue;
                             }
+                            // A clean EOF before [DONE]/finish_reason is a
+                            // truncated answer, not a valid empty completion.
+                            if !acc.finish_pending {
+                                err = Some(IncompleteStream.into());
+                            }
                             break;
                         }
                     }
@@ -467,11 +555,43 @@ impl Provider for OpenAICompatProvider {
         }
 
         let guard = provider_lock(&self.base_url).lock_owned().await;
-        let response = self.send_json_retry(self.endpoint(), body).await?;
-        Ok(Box::pin(GatedStream {
-            inner: self.stream_response(response),
-            _guard: guard,
-        }))
+
+        // Retry only while nothing has been emitted yet: a stream that dies
+        // before its first delta is invisible to the model, so replaying the
+        // whole request is safe. Once output starts, the error is surfaced —
+        // the model already saw partial text.
+        const ATTEMPTS: usize = 3;
+        let mut delay = Duration::from_millis(200);
+        for attempt in 1..=ATTEMPTS {
+            let response = self
+                .send_json_retry(self.endpoint(), body.clone(), true)
+                .await?;
+            let mut stream = self.stream_response(response);
+            match futures::StreamExt::next(&mut stream).await {
+                Some(Ok(first)) => {
+                    let rest = stream;
+                    let chained = futures::stream::once(async move { Ok(first) }).chain(rest);
+                    return Ok(Box::pin(GatedStream {
+                        inner: Box::pin(chained),
+                        _guard: guard,
+                    }));
+                }
+                Some(Err(e)) if attempt < ATTEMPTS && is_backoff_retryable(&e) => {
+                    log::warn!("stream failed before the first chunk ({e}); retry {attempt}/{ATTEMPTS}");
+                    tokio::time::sleep(delay).await;
+                    delay *= 4;
+                }
+                Some(Err(e)) => return Err(e),
+                // Empty stream: a valid (if useless) completion.
+                None => {
+                    return Ok(Box::pin(GatedStream {
+                        inner: Box::pin(futures::stream::empty()),
+                        _guard: guard,
+                    }))
+                }
+            }
+        }
+        Err(anyhow!("provider stream retries exhausted"))
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<String> {
@@ -486,7 +606,9 @@ impl Provider for OpenAICompatProvider {
         }
 
         let _guard = provider_lock(&self.base_url).lock_owned().await;
-        let response = self.send_json_retry(self.endpoint(), body).await?;
+        let response = self
+            .send_json_retry(self.endpoint(), body, false)
+            .await?;
         let json: Value = response.json().await?;
         Ok(json["choices"][0]["message"]["content"]
             .as_str()
@@ -539,6 +661,10 @@ impl FallbackProvider {
     }
 
     /// Try each provider in order. `attempt` is `chat_stream` or `chat`.
+    ///
+    /// A connect error (refused / no route) already fails fast inside the
+    /// provider, so the next profile is tried immediately — no backoff delay
+    /// is paid for an endpoint that is not listening.
     async fn retry_all<T, F, Fut>(&self, mut attempt: F) -> Result<T>
     where
         F: FnMut(usize) -> Fut,
@@ -547,7 +673,12 @@ impl FallbackProvider {
         let mut last_err: Option<anyhow::Error> = None;
         for i in 0..self.providers.len() {
             match attempt(i).await {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    if i > 0 {
+                        self.notify_once(self.name_at(i));
+                    }
+                    return Ok(v);
+                }
                 Err(e) => {
                     if !is_retryable(&e) {
                         return Err(e);
@@ -858,28 +989,34 @@ mod tests {
         assert!(err.to_string().contains("503"));
     }
 
-    /// Harness 5: dead primary port must fall back to a live ToshLLM server
-    /// with one notice (no Tauri app attached, so we only measure timing).
+    /// Harness 5: dead primary port must fail fast (connect error, no backoff)
+    /// and the fallback chain must then reach the live server. Measures the
+    /// dead-port attempt separately from live inference, which can be slow.
     #[tokio::test]
     #[ignore = "uses local model server; run with -- --ignored stress_provider_fallback"]
     async fn stress_provider_fallback_dead_port() {
         let dead = OpenAICompatProvider::new("http://127.0.0.1:1".to_string(), None);
+        let mut req = req();
+        req.model = std::env::var("XENON_MODEL").unwrap_or_else(|_| "local".into());
+        req.messages = vec![ChatMessage::text(ChatRole::User, "Say OK.")];
+
+        // The dead port must refuse fast: connect error, no 3x backoff.
+        let started = std::time::Instant::now();
+        let err = dead.chat(req.clone()).await.unwrap_err();
+        let ms = started.elapsed().as_millis();
+        eprintln!("dead port failed in {ms} ms: {err}");
+        assert!(ms < 2000, "dead primary took {ms} ms to fail");
+        assert!(is_connect_error(&err), "expected a connect error, got: {err}");
+
+        // And the chain reaches the live server.
         let live = OpenAICompatProvider::new("http://127.0.0.1:8080/v1".to_string(), None);
         let fallback = FallbackProvider::new(
             vec![Arc::new(dead), Arc::new(live)],
             vec!["dead-port".into(), "ToshLLM".into()],
             None,
         );
-        let mut req = req();
-        req.model = std::env::var("XENON_MODEL").unwrap_or_else(|_| "local".into());
-        req.messages = vec![ChatMessage::text(ChatRole::User, "Say OK.")];
-        let started = std::time::Instant::now();
         match fallback.chat(req).await {
-            Ok(out) => eprintln!(
-                "fallback ok in {} ms: {}",
-                started.elapsed().as_millis(),
-                out
-            ),
+            Ok(out) => eprintln!("fallback ok: {out}"),
             Err(e) => eprintln!("fallback skipped (server down?): {e}"),
         }
     }
@@ -969,9 +1106,277 @@ mod tests {
 
         let provider = OpenAICompatProvider::new(format!("http://{addr}"), None);
         let resp = provider
-            .send_json_retry(provider.endpoint(), serde_json::json!({}))
+            .send_json_retry(provider.endpoint(), serde_json::json!({}), false)
             .await
             .unwrap();
         assert!(resp.status().is_success(), "second attempt should succeed");
+    }
+
+    /// F2: a dead primary endpoint must fail over on the *first* connection
+    /// attempt. Connect errors are not retried with backoff (3 attempts at
+    /// 200ms/800ms would blow past the 2s budget on their own).
+    #[tokio::test]
+    async fn test_connect_error_is_not_retried_with_backoff() {
+        // Port 1 is never listening; the refusal is immediate.
+        let provider = OpenAICompatProvider::new("http://127.0.0.1:1".to_string(), None);
+        let started = std::time::Instant::now();
+        let err = provider
+            .send_json_retry(provider.endpoint(), serde_json::json!({}), false)
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(is_connect_error(&err), "expected a connect error, got {err}");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "connect error must not be retried with backoff (took {elapsed:?})"
+        );
+    }
+
+    /// F2 end-to-end: dead primary -> live fallback answer in well under 2s.
+    #[tokio::test]
+    async fn test_fallback_from_dead_port_is_fast() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = r#"{"choices":[{"message":{"content":"OK"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let dead = OpenAICompatProvider::new("http://127.0.0.1:1".to_string(), None);
+        let live = OpenAICompatProvider::new(format!("http://{addr}"), None);
+        let fallback = FallbackProvider::new(
+            vec![Arc::new(dead), Arc::new(live)],
+            vec!["dead-port".into(), "live".into()],
+            None,
+        );
+
+        let started = std::time::Instant::now();
+        let out = fallback.chat(req()).await.expect("fallback answer");
+        let elapsed = started.elapsed();
+        assert_eq!(out, "OK");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "dead primary must fail over immediately (took {elapsed:?})"
+        );
+    }
+
+    /// Slow-streaming mock: sends one SSE delta every `gap`, `chunks` times.
+    /// `stall_after` > 0 closes the connection after that many deltas without
+    /// `[DONE]` (a truncated stream).
+    async fn mock_sse(
+        chunks: usize,
+        gap: Duration,
+        stall_after: usize,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                hits2.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                Connection: close\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    for i in 0..chunks {
+                        if stall_after > 0 && i >= stall_after {
+                            break; // truncated: no [DONE], just close
+                        }
+                        let delta = format!("part{i} ");
+                        let data = format!(
+                            "data: {}\n\n",
+                            serde_json::json!({
+                                "choices": [{"delta": {"content": delta}, "finish_reason": null}]
+                            })
+                        );
+                        if sock.write_all(data.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(gap).await;
+                    }
+                    if stall_after > 0 && chunks >= stall_after {
+                        // Truncated: no [DONE], just close.
+                        return;
+                    }
+                    let _ = sock
+                        .write_all(b"data: [DONE]\n\n")
+                        .await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// F1: a stream slower than the old 120s total cap must survive, because
+    /// only an *idle* timeout is in play. Timeouts are shrunk so the test runs
+    /// in under a second.
+    #[tokio::test]
+    async fn test_slow_stream_survives_short_total_but_long_idle() {
+        let (base, _hits) = mock_sse(4, Duration::from_millis(60), 0).await;
+        let provider = OpenAICompatProvider::with_timeouts(
+            base,
+            None,
+            ProviderTimeouts {
+                connect: Duration::from_millis(500),
+                read: Duration::from_secs(5),
+                // Total cap would be exceeded by the 4x60ms stream + overhead
+                // only if it were applied to the body; it must not be.
+                total: Duration::from_millis(1),
+            },
+        );
+        let mut req = req();
+        req.stream = true;
+        req.messages = vec![ChatMessage::text(ChatRole::User, "stream slowly")];
+
+        let mut stream = provider.chat_stream(req).await.expect("open stream");
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            text.push_str(&chunk.expect("chunk").content);
+        }
+        assert_eq!(text, "part0 part1 part2 part3 ");
+    }
+
+    /// F1: a stream that dies before its first delta is retried (the model saw
+    /// nothing); the second attempt succeeds.
+    #[tokio::test]
+    async fn test_stream_without_first_delta_is_retried() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let n = hits2.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                    if n == 0 {
+                        // Truncated stream, no delta at all.
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let data = serde_json::json!({
+                        "choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}]
+                    });
+                    let body = format!("data: {data}\n\ndata: [DONE]\n\n");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let provider = OpenAICompatProvider::with_timeouts(
+            format!("http://{addr}"),
+            None,
+            ProviderTimeouts {
+                connect: Duration::from_millis(500),
+                read: Duration::from_millis(500),
+                total: Duration::from_millis(500),
+            },
+        );
+        let mut req = req();
+        req.stream = true;
+        let mut stream = provider.chat_stream(req).await.expect("retry then stream");
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            text.push_str(&chunk.expect("chunk").content);
+        }
+        assert_eq!(text, "hello");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "first attempt was retried once");
+    }
+
+    /// F1: once output has started, a broken stream is surfaced, not retried.
+    #[tokio::test]
+    async fn test_stream_error_after_first_delta_is_surfaced() {
+        let (base, hits) = mock_sse(10, Duration::from_millis(20), 1).await;
+        let provider = OpenAICompatProvider::with_timeouts(
+            base,
+            None,
+            ProviderTimeouts {
+                connect: Duration::from_millis(500),
+                read: Duration::from_millis(5000),
+                total: Duration::from_millis(5000),
+            },
+        );
+        let mut req = req();
+        req.stream = true;
+        let mut stream = provider.chat_stream(req).await.expect("open stream");
+        // First chunk is fine...
+        let first = stream.next().await.expect("one chunk").expect("ok chunk");
+        assert!(!first.content.is_empty());
+        // ...then the truncated stream (no [DONE]) is an error, not a clean end.
+        let err = stream
+            .next()
+            .await
+            .expect("truncation is surfaced")
+            .expect_err("incomplete stream");
+        assert!(err.to_string().contains("before finishing"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a stream that already emitted must not be retried"
+        );
+    }
+
+    /// F1: a non-streaming probe keeps its total cap.
+    #[tokio::test]
+    async fn test_non_streaming_keeps_total_timeout() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            // Never respond; the total timeout must fire.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock);
+        });
+        let provider = OpenAICompatProvider::with_timeouts(
+            format!("http://{addr}"),
+            None,
+            ProviderTimeouts {
+                connect: Duration::from_millis(500),
+                read: Duration::from_secs(30),
+                total: Duration::from_millis(300),
+            },
+        );
+        let started = std::time::Instant::now();
+        let err = provider.chat(req()).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "total timeout should fire fast"
+        );
+        assert!(!err.to_string().is_empty());
     }
 }

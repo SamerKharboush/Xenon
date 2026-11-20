@@ -2,19 +2,25 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-/// Default whisper STT model path: the first candidate that exists, else the
-/// first candidate (so the UI shows a meaningful placeholder).
+/// Default whisper STT model path: on Apple Silicon the large turbo model is
+/// fast enough (Metal); on Intel the GPU backend is broken for large models,
+/// so use base.en (CPU) instead. First candidate that exists, else a placeholder.
 fn default_whisper_model_path() -> String {
-    for c in [
-        home_dir().join("models/whisper/ggml-large-v3-turbo.bin"),
-        app_support_models().join("ggml-base.en.bin"),
-    ] {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if cfg!(target_arch = "aarch64") {
+        candidates.push(home_dir().join("models/whisper/ggml-large-v3-turbo.bin"));
+    }
+    candidates.push(app_support_models().join("ggml-base.en.bin"));
+    candidates.push(home_dir().join("models/whisper/ggml-large-v3-turbo.bin"));
+    for c in &candidates {
         if c.exists() {
             return c.to_string_lossy().to_string();
         }
     }
-    home_dir()
-        .join("models/whisper/ggml-large-v3-turbo.bin")
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| app_support_models().join("ggml-base.en.bin"))
         .to_string_lossy()
         .to_string()
 }
@@ -99,7 +105,8 @@ pub struct ProviderProfile {
     #[serde(default = "default_true")]
     pub supports_tools: bool,
     /// Model accepts image parts (screenshots). Needed for grounding.
-    #[serde(default = "default_true")]
+    /// Defaults to `false`: capability is proven only by a Hub Test.
+    #[serde(default)]
     pub supports_vision: bool,
 }
 
@@ -119,7 +126,7 @@ impl ProviderProfile {
             model: model.into(),
             vision_model: vision_model.into(),
             supports_tools: true,
-            supports_vision: true,
+            supports_vision: false,
         }
     }
 
@@ -209,6 +216,9 @@ pub struct XenonConfig {
     /// Whisper model is unloaded from RAM after this many idle minutes.
     #[serde(default = "default_stt_unload_minutes")]
     pub stt_unload_minutes: u64,
+    /// whisper GPU on Apple Silicon. `None` = auto (GPU only on aarch64).
+    #[serde(default)]
+    pub stt_use_gpu: Option<bool>,
     /// Path to the ggml whisper STT model.
     #[serde(default = "default_whisper_model_path")]
     pub whisper_model_path: String,
@@ -308,18 +318,19 @@ fn default_wake_sensitivity() -> f32 {
     0.5
 }
 fn default_wake_model_path() -> String {
-    for c in [
+    // Same resolution as the app: tiny.en (smallest), then base.en, then the
+    // main STT model.
+    let candidates = [
         app_support_models().join("ggml-tiny.en.bin"),
         app_support_models().join("ggml-base.en.bin"),
-    ] {
+        home_dir().join("models/whisper/ggml-large-v3-turbo.bin"),
+    ];
+    for c in &candidates {
         if c.exists() {
             return c.to_string_lossy().to_string();
         }
     }
-    app_support_models()
-        .join("ggml-tiny.en.bin")
-        .to_string_lossy()
-        .to_string()
+    candidates[0].to_string_lossy().to_string()
 }
 fn default_language() -> String {
     "en".to_string()
@@ -359,6 +370,7 @@ impl Default for XenonConfig {
             language: default_language(),
             silence_ms: default_silence_ms(),
             stt_unload_minutes: default_stt_unload_minutes(),
+            stt_use_gpu: None,
             whisper_model_path: default_whisper_model_path(),
             vad_model_path: default_vad_model_path(),
             tts_enabled: default_tts_enabled(),

@@ -633,6 +633,7 @@
                     result.vision ? 'vision ✓' : 'vision ✗',
                 ];
                 if (result.error) bits.push('error: ' + result.error);
+                // Keep the test result visible; flags are persisted on Save.
                 if (status) status.textContent = bits.join(' · ');
             } catch (e) {
                 if (status) status.textContent = 'Test failed: ' + e;
@@ -673,7 +674,8 @@
                 model: 'llama3.2',
                 vision_model: 'llava',
                 supports_tools: true,
-                supports_vision: true,
+                // Vision starts off until a hub test proves the model accepts images.
+                supports_vision: false,
             });
             renderProfiles();
         }
@@ -906,7 +908,8 @@
                         model,
                         vision_model: model,
                         supports_tools: true,
-                        supports_vision: true,
+                        // Vision off until a hub test proves the model accepts images.
+                        supports_vision: false,
                     });
                     modelCache[config.providers.length - 1] = d.models;
                 }

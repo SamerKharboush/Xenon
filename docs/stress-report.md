@@ -9,7 +9,7 @@ summaries and tails only.
 | Harness | Script / test | Result | Evidence |
 | --- | --- | --- | --- |
 | 1. STT | `scripts/stress/run-stt.sh` → `audio::tests::stress_stt_harness` | PASS (CPU for large-v3; Metal crash reported) | `out/stt-base.en.tsv`, `out/stt-large-v3-turbo.tsv`, `out/stt-summary.tsv` |
-| 2. Wake word | `scripts/stress/wake-cpu.sh` → `voice::tests::stress_wake_harness` | FAIL — 8/30 positives fired, 0/30 negatives fired | `out/wake.tsv`, `out/wake.log` |
+| 2. Wake word | `scripts/stress/wake-cpu.sh` → `voice::tests::stress_wake_harness` | PASS (round 2) — 30/30 positives, 1/30 negatives (was 8/30, 0/30) | `out/wake.tsv`, `out/wake.log` |
 | 3. TTS | `scripts/stress/run-tts.sh` | PASS | `out/tts-kokoro.log`, `out/tts-oov.log`, `out/tts-speakers.log`, `out/tts-queue.log`, `out/tts-fallback.log` |
 | 4. Agent tasks | `scripts/stress/agent-tasks.py` | FAIL — desktop tasks blocked/failing on this headless host; script/reporting fixed | `out/agent.log`, `out/agent/*.stdout` |
 | 5. Providers | `scripts/stress/run-providers.sh` | PASS | `out/hub-detect.tsv`, `out/hub-models.tsv`, `out/provider-*.log` |
@@ -93,28 +93,80 @@ a wake-specific prompt; see “Reported only”.
 
 1. **`large-v3-turbo` Metal abort.** On this Mac (AMD FirePro D700),
    `ggml-metal-device.m:1618: GGML_ASSERT(buf_dst) failed` aborts the process
-   during `whisper_encode_internal`. `base.en` works on the same GPU. The STT
-   harness uses CPU for `large-v3-turbo` so the rest of the matrix can run.
-   Needs a device/backend fix or a runtime CPU fallback.
-2. **Wake word accuracy.** 8/30 positives fired with `base.en`; 0/30 negatives
-   fired. Example transcripts show the wake phrase misheard as “Hazing on” /
-   “Hazy-Non”. Needs a better wake model (e.g. `ggml-tiny.en.bin`), a
-   wake-specific initial prompt, or a looser matcher that does not increase
-   false fires.
+   during `whisper_encode_internal`. `base.en` works on the same GPU. Round 2
+   (F3) gates whisper GPU to `aarch64` only, so x86_64 hosts (like this one)
+   stay on CPU and avoid the abort; the STT harness pins CPU explicitly.
+2. **Wake word accuracy.** Fixed in round 2: 30/30 positives, 1/30 negatives
+   (was 8/30, 0/30). See “Fix round 2” F4 — phonetic window matcher + wake
+   phrase as whisper `initial_prompt`; the remaining fire is “Hello Xenon”.
 3. **Agent vision profile mismatch.** The configured `Primary` profile has
    `supports_vision: true`, but the local Qwen3 server rejects image input
-   (`500 image input is not supported`). K1 correctly trusts the profile flag;
-   the profile needs `supports_vision: false` or a runtime capability probe.
-   Headless tasks also had Screen Recording denied, so desktop verification
-   could not run.
+   (`500 image input is not supported`). Round 2 (F5) defaults new profiles to
+   `supports_vision: false`, persists hub Test results, and drops images +
+   retries once at runtime when the provider reports images unsupported.
 4. **Soak skipped.** No Xenon process was running in `wake_word` mode, so the
    20-minute sampler had nothing to attach to.
 
+## Fix round 2
+
+Follow-up to the findings F1–F7 from the hands-on run. All changes are on
+`feature/xenon-vertical-slice`, no commits made.
+
+- **F1 provider timeouts** (`src-tauri/src/provider.rs`): streaming requests
+  use `connect_timeout` + an idle `read_timeout` (no total cap), so a slow CPU
+  model streaming tokens for minutes is not killed mid-answer; non-streaming
+  probes keep the total `.timeout()`. A stream that fails before its first
+  chunk is retried once; after output starts, errors surface. SSE EOF without
+  `[DONE]`/finish_reason now yields a retryable `IncompleteStream`. Tests:
+  `test_slow_stream_survives_short_total_but_long_idle`,
+  `test_stream_without_first_delta_is_retried`,
+  `test_stream_error_after_first_delta_is_surfaced`,
+  `test_non_streaming_keeps_total_timeout`.
+- **F2 fast fallback** (`src-tauri/src/provider.rs`): connect errors are
+  excluded from same-provider backoff (`is_backoff_retryable`), so a dead
+  primary fails over immediately; `notify_once` now also fires when a
+  fallback profile (index > 0) succeeds. Verified: dead port
+  (`127.0.0.1:1`) failed in 0 ms, chain reached ToshLLM and returned
+  “OK! How can I assist you today?”.
+- **F3 GPU gating** (`src-tauri/src/audio.rs`, `config.rs`): whisper GPU is
+  used only on `cfg!(target_arch = "aarch64")`; new `stt_use_gpu:
+  Option<bool>` (serde default `None` = auto). Default STT model on x86_64 is
+  `ggml-base.en.bin`. This also explains the round-1 Metal abort on this
+  Intel/AMD host: the harness now pins CPU.
+- **F4 wake matching** (`src-tauri/src/voice.rs`, `audio.rs`, `config.rs`):
+  wake transcription seeds whisper with the wake phrase as
+  `initial_prompt`, and the matcher now scans every word window with a
+  vowel-collapsed phonetic key (Levenshtein over keys), per-position budgets
+  (first word +1 slack above exact), and an onset gate (first word must start
+  with h/x/z/s/c) plus a one-letter-word guard. Wake model default prefers
+  `ggml-tiny.en.bin`, then `ggml-base.en.bin`. Harness uses the production
+  model resolution and prints the model it used.
+  **Wake: 8/30 → 30/30 positives fired, 0/30 → 1/30 negatives** (the one
+  fire is “Hello Xenon”, which contains the wake word). Model:
+  `ggml-base.en.bin` (no `tiny.en` on this host). Runner:
+  `scripts/stress/wake-cpu.sh` → `out/wake.tsv`, `out/wake.log`.
+- **F5 vision capability** (`src-tauri/src/config.rs`, `agent.rs`, `hub.rs`,
+  `src/settings.html`): new/detected profiles default
+  `supports_vision: false` (serde default keeps old configs); the hub Test
+  persists `tools`/`vision` results onto the profile; at runtime, a provider
+  error mentioning image/vision/multimodal drops images for the session
+  (one notice) and retries without image parts.
+- **F6 microphone open** (`src-tauri/src/audio.rs`): logs “audio: opening
+  microphone…” before `open_capture()` and the open duration after; a
+  > 2 s open emits one notice. No permission changes.
+- **F7 headless steps** (`src-tauri/src/headless.rs`): `--agent-task` prints
+  each tool call with a `took: N.NNs` line before its result.
+
+Not verified: live TTS/voice-output changes (no audio device in this session),
+Soak (no running Xenon), and `agent-tasks.py` desktop steps (Screen Recording
+still denied on this host).
+
 ## Final gates
 
-- `cd src-tauri && cargo test 2>&1 | grep -E '^test result|FAILED'`: 164 passed, 0 failed, 16 ignored.
+- `cd src-tauri && cargo test 2>&1 | grep -E '^test result|FAILED'`: 172 passed, 0 failed, 16 ignored.
 - `cd src-tauri && cargo clippy --all-targets 2>&1 | tail -3`: `Finished dev profile ...`, exit 0, no warnings.
 - `scripts/stress/check-commands.sh`: `OK: 24 invoke commands registered; capabilities valid`.
+- `cargo test --release -- --ignored --nocapture stress_wake_harness`: 30/30 positives, 1/30 negatives (base.en, CPU).
 
 ## Needs human
 
@@ -124,8 +176,9 @@ a wake-specific prompt; see “Reported only”.
   vision-capable model) before expecting screenshot/click verification.
 - Run `scripts/stress/soak.sh` while Xenon is in `wake_word` mode for the
   20-minute sample.
-- Decide whether to ship a wake-specific prompt/model change; the current
-  `base.en` + strict matcher misses most positive utterances on this host.
+- Decide whether to ship a wake-specific prompt/model change; the round-2
+  phonetic matcher + `initial_prompt` now fires 30/30 positives with 1/30
+  negatives on `base.en` (CPU), so this is optional.
 - The current `agent-tasks.py` run on this host failed desktop checks because
   the ToshLLM vision endpoint returns 500 (`image input is not supported`) and
   headless capture cannot verify windows. Re-run after the provider/profile fix.

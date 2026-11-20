@@ -68,6 +68,7 @@ fn run(task: &str, profile: Option<&str>, cfg: &XenonConfig) -> i32 {
 
         let printer_outcome = outcome.clone();
         let printer = tokio::spawn(async move {
+            let mut step_start: Option<std::time::Instant> = None;
             while let Ok(action) = rx.recv().await {
                 match action {
                     AgentAction::SetPetState(state) => {
@@ -77,6 +78,7 @@ fn run(task: &str, profile: Option<&str>, cfg: &XenonConfig) -> i32 {
                     }
                     AgentAction::Speak(text) => println!("speak: {text}"),
                     AgentAction::ExecuteTool(call) => {
+                        step_start = Some(std::time::Instant::now());
                         println!("action: {} {}", call.name, call.args);
                         if call.name == "done" {
                             *printer_outcome.lock().unwrap() = Outcome::Done;
@@ -85,6 +87,9 @@ fn run(task: &str, profile: Option<&str>, cfg: &XenonConfig) -> i32 {
                         }
                     }
                     AgentAction::ToolResult(result) => {
+                        if let Some(t0) = step_start.take() {
+                            println!("  took: {:.2}s", t0.elapsed().as_secs_f64());
+                        }
                         if result.is_error {
                             println!(
                                 "  ! error: {}",

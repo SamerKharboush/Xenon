@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 2
 mkdir -p scripts/stress/out
 
-PID=$(pgrep -f 'Xenon.app/Contents/MacOS/Xenon' | head -n1 || true)
+PID=$(pgrep -f 'Xenon.app/Contents/MacOS/[Xx]enon' | head -n1 || true)
 if [ -z "${PID:-}" ]; then
   echo "soak: no running Xenon found; start wake_word mode and rerun" \
     | tee scripts/stress/out/soak.txt

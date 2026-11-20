@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 
 use crate::config::{Role, XenonConfig};
 use crate::events::{AgentAction, PetState, ToolCall, ToolResult};
-use crate::provider::{ChatMessage, ChatRequest, ChatRole, Provider};
+use crate::provider::{ChatMessage, ChatRequest, ChatRole, ContentPart, MessageContent, Provider};
 use crate::tools::{tools_to_schemas, Notes, Tool};
 
 /// Appended to the system prompt so the model knows the computer-control
@@ -225,6 +225,18 @@ fn is_tool_capability_error(err: &anyhow::Error) -> bool {
     mentions_tools && says_unsupported
 }
 
+/// True when the provider's error text says it cannot accept image parts
+/// (OpenAI-compatible servers answer 400/415/5xx with these phrases). A false
+/// positive just retries once without images and stops.
+fn is_image_unsupported_error(err: &anyhow::Error) -> bool {
+    let m = err.to_string().to_ascii_lowercase();
+    m.contains("image")
+        || m.contains("vision")
+        || m.contains("multimodal")
+        || m.contains("invalid content type")
+        || m.contains("unsupported content type")
+}
+
 pub struct Agent {
     /// Agent-role provider: the loop itself.
     provider: Arc<dyn Provider>,
@@ -238,7 +250,7 @@ pub struct Agent {
     /// False when the model has no native tool calling (text protocol).
     native_tools: bool,
     /// Whether the agent-role model accepts image parts.
-    vision: bool,
+    vision: AtomicBool,
     /// One-time notice when a text-only model first gets a screenshot result.
     vision_notice: AtomicBool,
     /// Task-scoped notes written by the `remember` tool.
@@ -291,7 +303,7 @@ impl Agent {
             config,
             abort,
             native_tools,
-            vision,
+            vision: AtomicBool::new(vision),
             vision_notice: AtomicBool::new(false),
             notes,
         }
@@ -429,11 +441,12 @@ impl Agent {
             .send(AgentAction::SetPetState(PetState::Thinking))
             .await;
 
+        let vision = self.vision.load(Ordering::SeqCst);
         let mut system = self.config.system_prompt.clone();
         if self.native_tools {
-            system.push_str(&tool_hint(&self.tools, self.vision));
+            system.push_str(&tool_hint(&self.tools, vision));
         } else {
-            system.push_str(&action_protocol_hint(&self.tools, self.vision));
+            system.push_str(&action_protocol_hint(&self.tools, vision));
         }
 
         let mut messages = vec![
@@ -449,6 +462,7 @@ impl Agent {
         let mut planned = false;
 
         for _ in 0..self.max_iterations {
+            let vision = self.vision.load(Ordering::SeqCst);
             if self.aborted() {
                 log::info!("agent turn aborted");
                 break;
@@ -481,6 +495,42 @@ impl Agent {
                         native = false;
                         continue;
                     }
+                    if self.vision.load(Ordering::SeqCst) && is_image_unsupported_error(&e) {
+                        self.vision.store(false, Ordering::SeqCst);
+                        log::warn!(
+                            "provider reports images unsupported; dropping images for this \
+                             task and retrying without them"
+                        );
+                        if !self.vision_notice.swap(true, Ordering::SeqCst) {
+                            let _ = emit
+                                .send(AgentAction::Speak(
+                                    "This provider doesn't support images, so I'll continue \
+                                     without pictures for this task."
+                                        .to_string(),
+                                ))
+                                .await;
+                        }
+                        // Strip image parts from the conversation and retry the turn.
+                        for m in messages.iter_mut() {
+                            if let MessageContent::Parts(parts) = &mut m.content {
+                                let had_image = parts
+                                    .iter()
+                                    .any(|p| matches!(p, ContentPart::ImageUrl { .. }));
+                                if had_image {
+                                    let text = parts
+                                        .iter()
+                                        .find_map(|p| match p {
+                                            ContentPart::Text { text } => Some(text.clone()),
+                                            _ => None,
+                                        })
+                                        .unwrap_or_else(|| "Sent a screenshot earlier.".into());
+                                    let role = m.role.clone();
+                                    *m = ChatMessage::text(role, text);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     return Err(e);
                 }
             };
@@ -492,7 +542,7 @@ impl Agent {
                     let result = self.run_tool(&tool_call, &emit).await;
                     self.notice_text_only(&emit, &result).await;
                     let terminal = matches!(tool_call.name.as_str(), "done" | "fail");
-                    push_tool_result(&mut messages, &tool_call, &result, self.vision)?;
+                    push_tool_result(&mut messages, &tool_call, &result, vision)?;
                     if terminal {
                         speak_terminal(&emit, &tool_call.name, &result).await;
                         break;
@@ -515,7 +565,7 @@ impl Agent {
                     let result = self.run_tool(&tool_call, &emit).await;
                     self.notice_text_only(&emit, &result).await;
                     let terminal = matches!(tool_call.name.as_str(), "done" | "fail");
-                    push_tool_result(&mut messages, &tool_call, &result, self.vision)?;
+                    push_tool_result(&mut messages, &tool_call, &result, vision)?;
                     if terminal {
                         speak_terminal(&emit, &tool_call.name, &result).await;
                         break;
@@ -539,7 +589,7 @@ impl Agent {
     /// Tell the user once that this model cannot see the screenshots that
     /// other tools still return, and that the agent is using text instead.
     async fn notice_text_only(&self, emit: &Sender<AgentAction>, result: &ToolResult) {
-        if self.vision || result.image.is_none() {
+        if self.vision.load(Ordering::SeqCst) || result.image.is_none() {
             return;
         }
         if !self.vision_notice.swap(true, Ordering::SeqCst) {

@@ -381,6 +381,8 @@ impl Worker {
 
     /// Build and play a cpal input stream, wiring a fresh frame channel.
     fn open_capture(&mut self) -> Result<()> {
+        log::info!("audio: opening microphone…");
+        let t0 = std::time::Instant::now();
         let host = cpal::default_host();
         let device = host
             .default_input_device()
@@ -458,6 +460,16 @@ impl Worker {
         };
         stream.play().context("start capture stream")?;
         self.stream = Some(stream);
+        let elapsed = t0.elapsed();
+        log::info!("audio: microphone open in {:.2}s", elapsed.as_secs_f64());
+        if elapsed.as_secs_f64() > 2.0 {
+            let app = self.app.clone();
+            let secs = elapsed.as_secs_f64();
+            let _ = app.emit(
+                "xenon-notice",
+                format!("Microphone took {secs:.1}s to open — slow, check focus/input devices."),
+            );
+        }
         Ok(())
     }
 
@@ -631,10 +643,11 @@ impl Worker {
     fn transcribe_wake(&mut self, audio: &[f32]) -> Option<String> {
         let path = self.wake_model_path();
         if self.wake_stt.is_none() {
-            match WhisperContext::new_with_params(
-                &path,
-                WhisperContextParameters::new(),
-            ) {
+            let mut params = WhisperContextParameters::new();
+            // whisper GPU only on Apple Silicon (Intel Metal is broken for
+            // large models); an explicit stt_use_gpu overrides the auto choice.
+            params.use_gpu(self.cfg.stt_use_gpu.unwrap_or(cfg!(target_arch = "aarch64")));
+            match WhisperContext::new_with_params(&path, params) {
                 Ok(ctx) => self.wake_stt = Some(ctx),
                 Err(e) => {
                     if !self.wake_notice_sent {
@@ -650,7 +663,8 @@ impl Worker {
             }
         }
         let ctx = self.wake_stt.as_ref()?;
-        match run_stt(ctx, audio, Some("en")) {
+        let prompt = self.cfg.effective_wake_phrase();
+        match run_stt(ctx, audio, Some("en"), Some(&prompt)) {
             Ok(Some(u)) => Some(u.text),
             Ok(None) => None,
             Err(e) => {
@@ -683,15 +697,14 @@ impl Worker {
                 );
             }
             log::info!("audio: loading whisper STT model from {path}");
-            self.stt = Some(WhisperContext::new_with_params(
-                &path,
-                WhisperContextParameters::default(),
-            )?);
+            let mut params = WhisperContextParameters::default();
+            params.use_gpu(self.cfg.stt_use_gpu.unwrap_or(cfg!(target_arch = "aarch64")));
+            self.stt = Some(WhisperContext::new_with_params(&path, params)?);
         }
         self.stt_last_used = Some(Instant::now());
         self.model_notice_sent = false;
         let ctx = self.stt.as_ref().expect("stt loaded");
-        run_stt(ctx, audio, lang)
+        run_stt(ctx, audio, lang, None)
     }
 
     fn load_vad(&mut self) -> Result<()> {
@@ -931,14 +944,28 @@ pub(crate) fn transcribe_samples(samples: &[f32], cfg: &XenonConfig) -> Result<S
     if path.trim().is_empty() || !std::path::Path::new(&path).exists() {
         anyhow::bail!("no whisper model available for transcription");
     }
-    let ctx = WhisperContext::new_with_params(&path, WhisperContextParameters::new())?;
-    transcribe_with_context(&ctx, samples)
+    let mut params = WhisperContextParameters::new();
+    params.use_gpu(cfg.stt_use_gpu.unwrap_or(cfg!(target_arch = "aarch64")));
+    let ctx = WhisperContext::new_with_params(&path, params)?;
+    let prompt = cfg.effective_wake_phrase();
+    transcribe_with_prompt(&ctx, samples, Some(&prompt))
 }
 
 /// Transcribe with an already-loaded context (harnesses reuse one context for
 /// many utterances instead of paying model load per call).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn transcribe_with_context(ctx: &WhisperContext, samples: &[f32]) -> Result<String> {
-    match run_stt(ctx, samples, None) {
+    transcribe_with_prompt(ctx, samples, None)
+}
+
+/// Like [`transcribe_with_context`], but seeds whisper with an initial prompt
+/// (used by the wake harness to bias the transcript toward the wake phrase).
+pub(crate) fn transcribe_with_prompt(
+    ctx: &WhisperContext,
+    samples: &[f32],
+    prompt: Option<&str>,
+) -> Result<String> {
+    match run_stt(ctx, samples, None, prompt) {
         Ok(Some(u)) => Ok(u.text),
         Ok(None) => Ok(String::new()),
         Err(e) => Err(e),
@@ -973,6 +1000,7 @@ fn run_stt(
     ctx: &WhisperContext,
     samples: &[f32],
     language: Option<&str>,
+    initial_prompt: Option<&str>,
 ) -> Result<Option<Utterance>> {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get() as i32)
@@ -981,6 +1009,9 @@ fn run_stt(
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_n_threads(threads);
     params.set_language(language);
+    if let Some(prompt) = initial_prompt {
+        params.set_initial_prompt(prompt);
+    }
     params.set_translate(false);
     params.set_no_context(true);
     params.set_single_segment(true);
@@ -1203,7 +1234,7 @@ mod tests {
             WhisperContextParameters::default(),
         )
         .expect("load STT model");
-        let out = run_stt(&ctx, &silence, Some("en")).expect("stt run");
+        let out = run_stt(&ctx, &silence, Some("en"), None).expect("stt run");
         assert!(out.is_none(), "silence should yield no Speech utterance");
     }
 }

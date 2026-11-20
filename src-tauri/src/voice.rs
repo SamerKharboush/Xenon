@@ -146,41 +146,129 @@ pub struct WakeMatch {
 
 /// Fuzzy-match `transcript` against `phrase`.
 ///
-/// Accepts an exact word-prefix, or a near-miss prefix within an edit-distance
-/// budget derived from `sensitivity` (0.0 exact .. 1.0 loose). The comparison
-/// is on the first N words, so "hey xenon open safari" yields the trailing
-/// "open safari", while "hey there" and "xerox" do not match "hey xenon".
+/// Scans every window of `phrase_words.len()` words and accepts the window
+/// with the lowest worst-word phonetic distance, within a per-position budget
+/// derived from `sensitivity`. Distance is Levenshtein over a vowel-collapsed
+/// phonetic key (so "hazing on" ≈ "hey xenon" while "xerox" stays apart).
+///
+/// Guards against false fires: the first word of the window must start with a
+/// wake-phrase onset sound (h/x/z for "hey xenon"), and a one-letter first
+/// word is only allowed when the second word is a near-exact match.
 pub fn match_wake(transcript: &str, phrase: &str, sensitivity: f32) -> Option<WakeMatch> {
     let phrase = normalize_text(phrase);
     if phrase.is_empty() {
         return None;
     }
     let phrase_words: Vec<&str> = phrase.split_whitespace().collect();
+    let phrase_keys: Vec<String> = phrase_words.iter().map(|w| phonetic_key(w)).collect();
     let normalized = normalize_text(transcript);
     let words: Vec<&str> = normalized.split_whitespace().collect();
-    if words.len() < phrase_words.len() {
+    let n = phrase_words.len();
+    if words.len() < n {
         return None;
     }
-    let budget = wake_distance_budget(sensitivity);
+    let budgets = wake_distance_budgets(sensitivity, n);
 
-    for (word, expected) in words[..phrase_words.len()]
-        .iter()
-        .zip(phrase_words.iter())
-    {
-        if levenshtein(word, expected) > budget {
-            return None;
-        }
-    }
-
-    let trailing = if words.len() > phrase_words.len() {
-        words[phrase_words.len()..].join(" ")
+    let start = find_wake_start(&words, &phrase_words, &phrase_keys, &budgets)?;
+    let trailing = if words.len() > start + n {
+        words[start + n..].join(" ")
     } else {
         String::new()
     };
     Some(WakeMatch {
-        matched_words: phrase_words.len(),
+        matched_words: n,
         trailing,
     })
+}
+
+/// Scan every window of `phrase_words.len()` words in `words` for the best
+/// (lowest worst-distance) fuzzy match within the per-position budgets.
+/// Returns the starting word index of the closest window.
+fn find_wake_start(
+    words: &[&str],
+    phrase_words: &[&str],
+    phrase_keys: &[String],
+    budgets: &[usize],
+) -> Option<usize> {
+    let n = phrase_words.len();
+    let mut best: Option<(usize, usize)> = None; // (start, worst_distance)
+    for start in 0..=words.len().saturating_sub(n) {
+        let first = words[start];
+        // The wake phrase's first word must sound like it starts the phrase:
+        // for "hey xenon" that means an h/x/z onset, not "wait"/"never".
+        if !phrase_starts_with(first, phrase_words[0]) {
+            continue;
+        }
+        // A one-letter first word ("a minute", "i need") only counts when the
+        // next word is a near-exact "xenon".
+        if first.chars().count() < 2 && n > 1 && levenshtein(words[start + 1], phrase_words[1]) > 2 {
+            continue;
+        }
+        let mut worst = 0usize;
+        let mut ok = true;
+        for (k, expected) in phrase_words.iter().enumerate() {
+            let d = word_distance(words[start + k], expected, &phrase_keys[k]);
+            if d > budgets[k] {
+                ok = false;
+                break;
+            }
+            worst = worst.max(d);
+        }
+        if ok && worst == 0 {
+            return Some(start); // exact window, no need to keep scanning
+        }
+        if ok && best.map_or(true, |(_, b)| worst < b) {
+            best = Some((start, worst));
+        }
+    }
+    best.map(|(s, _)| s)
+}
+
+/// True when `word` could be the first word of `phrase_first`: same initial
+/// consonant sound class (h/x/z all map to a sibilant/glottal onset here).
+fn phrase_starts_with(word: &str, phrase_first: &str) -> bool {
+    let onset = |c: char| matches!(c, 'h' | 'x' | 'z' | 's' | 'c');
+    match (word.chars().next(), phrase_first.chars().next()) {
+        (Some(a), Some(b)) => a == b || (onset(a) && onset(b)),
+        _ => false,
+    }
+}
+
+/// Distance between a heard word and an expected phrase word: Levenshtein over
+/// the vowel-collapsed phonetic key. Cheap, order-insensitive to exact vowels,
+/// so STT vowel drift ("hazy" vs "hey") costs little while consonant changes
+/// ("xerox" vs "xenon") still count.
+fn word_distance(heard: &str, _expected: &str, expected_key: &str) -> usize {
+    levenshtein(&phonetic_key(heard), expected_key)
+}
+
+/// Cheap phonetic normalization for wake-word fuzzy matching. Lowercases,
+/// keeps the first character, and drops every vowel and non-letter after it.
+/// "hey"→"hy", "xenon"→"xnn", "hazing"→"hzng", "hazy"→"hzy", "on"→"on".
+pub fn phonetic_key(word: &str) -> String {
+    let mut key = String::with_capacity(word.len());
+    for (i, ch) in word.chars().enumerate() {
+        let c = ch.to_ascii_lowercase();
+        if !c.is_ascii_alphabetic() {
+            continue;
+        }
+        if i == 0 || !matches!(c, 'a' | 'e' | 'i' | 'o' | 'u') {
+            key.push(c);
+        }
+    }
+    key
+}
+
+/// Per-position edit budgets for the wake matcher, from `sensitivity`
+/// (0.0 exact .. 1.0 loose). Above exact, the first word gets one extra edit
+/// of slack: it carries the "hey" onset, which STT most often mangles
+/// ("hazing on" for "hey xenon").
+pub fn wake_distance_budgets(sensitivity: f32, phrase_words: usize) -> Vec<usize> {
+    let base = wake_distance_budget(sensitivity);
+    let slack = if base == 0 { 0 } else { 1 };
+    (0..phrase_words)
+        .map(|i| if i == 0 { base + slack } else { base })
+        .collect()
 }
 
 /// How many edits the matcher tolerates at a given sensitivity.
@@ -613,6 +701,42 @@ mod tests {
         }
     }
 
+    /// Real base.en transcripts of "Hey Xenon …" on this host: the wake
+    /// phrase comes back as "Hazy-Non." / "Hazing on." / "Hey Z-Non,".
+    /// The matcher must fire on all of these without firing on plain speech.
+    #[test]
+    fn wake_matches_real_base_en_transcripts() {
+        let p = "hey xenon";
+        for t in [
+            "Hazy-Non.",
+            "Hazy none. Are you there?",
+            "Hazing on. What time is it?",
+            "Hey Z-Non, can you hear me?",
+            "Hazy-n'on. Look here.",
+            "Hazing on. Open Safari.",
+        ] {
+            assert!(match_wake(t, p, 0.5).is_some(), "should match {t:?}");
+        }
+        for t in [
+            "Hello there!",
+            "What time is it?",
+            "Open Safari.",
+            "Wait a minute",
+            "I need help",
+            "Never mind",
+        ] {
+            assert!(match_wake(t, p, 0.5).is_none(), "should not match {t:?}");
+        }
+    }
+
+    #[test]
+    fn wake_stt_lookalikes_stay_rejected() {
+        // "Never mind" phonetically brushes "hey xenon" (nvr ≈ hy, mnd ≈ xnn)
+        // but starts with the wrong onset sound.
+        assert!(match_wake("Never mind", "hey xenon", 1.0).is_none());
+        assert!(match_wake("Wait a minute", "hey xenon", 1.0).is_none());
+    }
+
     #[test]
     fn wake_negative_lookalikes() {
         let p = "hey xenon";
@@ -805,11 +929,12 @@ mod tests {
             eprintln!("skip: no whisper model");
             return;
         }
-        let ctx = whisper_rs::WhisperContext::new_with_params(
-            &model,
-            whisper_rs::WhisperContextParameters::new(),
-        )
-        .expect("load whisper");
+        eprintln!("wake model: {}", model);
+        // GPU (Metal) crashes whisper on Intel Macs with AMD GPUs
+        // (ggml-metal GGML_ASSERT(buf_dst)); keep CPU for the harness.
+        let mut params = whisper_rs::WhisperContextParameters::new();
+        params.use_gpu(false);
+        let ctx = whisper_rs::WhisperContext::new_with_params(&model, params).expect("load whisper");
 
         let positives = [
             "Hey Xenon", "Hey Xenon.", "Hey Xenon!", "Hey Xenon, are you there?",
