@@ -82,6 +82,13 @@ pub struct ProviderProfile {
     pub api_key: Option<String>,
     pub model: String,
     pub vision_model: String,
+    /// Model understands OpenAI-style `tools` (Provider Hub Test probes this).
+    /// `false` makes the agent use the JSON text-action protocol instead.
+    #[serde(default = "default_true")]
+    pub supports_tools: bool,
+    /// Model accepts image parts (screenshots). Needed for grounding.
+    #[serde(default = "default_true")]
+    pub supports_vision: bool,
 }
 
 impl ProviderProfile {
@@ -99,6 +106,8 @@ impl ProviderProfile {
             api_key,
             model: model.into(),
             vision_model: vision_model.into(),
+            supports_tools: true,
+            supports_vision: true,
         }
     }
 
@@ -122,29 +131,37 @@ impl ProviderProfile {
     }
 }
 
-/// Built-in presets for the Provider Hub (PRD §3.4). Base URLs include their
-/// own version segment — `normalize_base_url` leaves those untouched.
-#[allow(dead_code)]
-pub fn preset_profiles() -> Vec<ProviderProfile> {
-    vec![
-        ProviderProfile::new("Ollama", "http://localhost:11434/v1", None, "llama3.2", "llava"),
-        ProviderProfile::new("LM Studio", "http://localhost:1234/v1", None, "local-model", "local-model"),
-        ProviderProfile::new("OpenAI", "https://api.openai.com/v1", None, "gpt-4o-mini", "gpt-4o-mini"),
-        ProviderProfile::new(
-            "Gemini",
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            None,
-            "gemini-2.0-flash",
-            "gemini-2.0-flash",
-        ),
-        ProviderProfile::new(
-            "Anthropic",
-            "https://api.anthropic.com/v1",
-            None,
-            "claude-3-5-sonnet-20241022",
-            "claude-3-5-sonnet-20241022",
-        ),
-    ]
+/// Which profile fills which agent role. Empty string = use the primary
+/// (first in fallback order) profile.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentRoles {
+    /// Planning / plain chat model.
+    #[serde(default)]
+    pub chat: String,
+    /// Agent loop model (native tool calls or JSON text actions).
+    #[serde(default)]
+    pub agent: String,
+    /// Grounding / vision model used to locate elements on a screenshot.
+    #[serde(default)]
+    pub vision: String,
+}
+
+/// The three agent roles a profile can be assigned to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Chat,
+    Agent,
+    Vision,
+}
+
+impl Role {
+    fn field(self, roles: &AgentRoles) -> &str {
+        match self {
+            Role::Chat => &roles.chat,
+            Role::Agent => &roles.agent,
+            Role::Vision => &roles.vision,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +231,18 @@ pub struct XenonConfig {
     /// Draw Idle at 15 FPS instead of 60 (Settings -> Performance).
     #[serde(default = "default_true")]
     pub idle_power_saver: bool,
+    // --- agent ---
+    /// Provider profile per agent role (chat / agent / vision). Empty = primary.
+    #[serde(default)]
+    pub roles: AgentRoles,
+    /// `run_script` (AppleScript / shell) tool. Off by default; when on, every
+    /// call is confirmed by the user in a native dialog.
+    #[serde(default)]
+    pub allow_scripts: bool,
+    /// `browser_eval` (arbitrary JavaScript through Apple Events). Off by
+    /// default: it needs a per-browser macOS permission the user must grant.
+    #[serde(default)]
+    pub browser_eval_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -272,6 +301,9 @@ impl Default for XenonConfig {
             light_sprites: true,
             lazy_audio: true,
             idle_power_saver: true,
+            roles: AgentRoles::default(),
+            allow_scripts: false,
+            browser_eval_enabled: false,
         }
     }
 }
@@ -311,10 +343,25 @@ impl XenonConfig {
                 }
             };
             cfg.migrate();
+            // Plaintext keys written by older builds move into the Keychain;
+            // then every profile gets its key back from there.
+            crate::hub::migrate_plaintext_keys(&mut cfg);
+            crate::hub::hydrate_keys(&mut cfg);
             cfg
         } else {
             Self::default()
         }
+    }
+
+    /// Copy with every API key removed, so `save` can never write a secret to
+    /// disk (they live in the macOS Keychain).
+    pub(crate) fn without_secrets(&self) -> Self {
+        let mut c = self.clone();
+        c.provider.provider_api_key = None;
+        for p in &mut c.providers {
+            p.api_key = None;
+        }
+        c
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -322,7 +369,8 @@ impl XenonConfig {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let content = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        let content =
+            serde_json::to_string_pretty(&self.without_secrets()).map_err(|e| e.to_string())?;
         fs::write(&path, content).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -382,6 +430,39 @@ impl XenonConfig {
             .into_iter()
             .next()
             .unwrap_or_else(|| ProviderProfile::from_flat(&self.provider))
+    }
+
+    /// Profile assigned to *role*, or the primary profile when unassigned.
+    pub fn role_profile(&self, role: Role) -> ProviderProfile {
+        let name = role.field(&self.roles);
+        self.profiles_named(name)
+            .or_else(|| Some(self.primary()))
+            .unwrap_or_else(|| ProviderProfile::from_flat(&self.provider))
+    }
+
+    /// All profiles for *role*: the assigned profile first (so it is tried
+    /// before the fallbacks), then the rest in fallback order.
+    pub fn role_profiles(&self, role: Role) -> Vec<ProviderProfile> {
+        let chosen = self.role_profile(role);
+        let mut out = vec![chosen.clone()];
+        for p in self.ordered_profiles() {
+            if p.name != chosen.name {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    fn profiles_named(&self, name: &str) -> Option<ProviderProfile> {
+        if name.trim().is_empty() {
+            return None;
+        }
+        self.providers.iter().find(|p| p.name == name).cloned()
+    }
+
+    /// True when *role*'s model is known not to support native tool calling.
+    pub fn role_lacks_tools(&self, role: Role) -> bool {
+        !self.role_profile(role).supports_tools
     }
 }
 

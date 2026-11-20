@@ -103,6 +103,25 @@ pub struct ToolSchema {
     pub parameters: Value,
 }
 
+/// Wrap tool schemas in the OpenAI wire shape: `{"type":"function","function":{…}}`.
+/// Strict servers (e.g. llama.cpp) reject bare `{name,description,parameters}`
+/// objects with "Missing tool type".
+fn tool_entries(tools: &[ToolSchema]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatChunk {
     pub content: String,
@@ -389,7 +408,7 @@ impl Provider for OpenAICompatProvider {
             "temperature": req.temperature.unwrap_or(0.7),
         });
         if let Some(tools) = &req.tools {
-            body["tools"] = serde_json::to_value(tools)?;
+            body["tools"] = serde_json::json!(tool_entries(tools));
         }
         if let Some(max_tokens) = req.max_tokens {
             body["max_tokens"] = serde_json::json!(max_tokens);
@@ -566,6 +585,23 @@ mod tests {
         let json = serde_json::to_string(&schema).unwrap();
         let deserialized: ToolSchema = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, "test_tool");
+    }
+
+    /// Tool schemas go over the wire wrapped in `type:function` — llama.cpp and
+    /// other strict OpenAI-compatible servers reject bare schema objects.
+    #[test]
+    fn test_tool_entries_use_openai_function_wrapper() {
+        let entries = tool_entries(&[ToolSchema {
+            name: "ping".into(),
+            description: "pong".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["type"], "function");
+        assert_eq!(entries[0]["function"]["name"], "ping");
+        assert_eq!(entries[0]["function"]["description"], "pong");
+        assert_eq!(entries[0]["function"]["parameters"]["type"], "object");
+        assert!(entries[0]["name"].is_null(), "bare name leaked to wire");
     }
 
     /// Chat messages serialize with OpenAI's lowercase role strings.

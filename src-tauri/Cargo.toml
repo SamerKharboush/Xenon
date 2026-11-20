@@ -65,6 +65,9 @@ base64 = "0.22"
 # Config directory
 dirs = "5.0"
 
+# API keys in the macOS Keychain (never in config.json).
+keyring = "3"
+
 # Global cursor position for click-through hit-testing.
 # CGEventGetLocation needs no Accessibility grant (unlike enigo input synthesis).
 core-graphics = "0.24"

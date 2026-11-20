@@ -217,6 +217,35 @@
 
             <div id="profiles-list"></div>
             <button class="add-profile-btn" id="add-profile">+ Add Provider Profile</button>
+            <button class="add-profile-btn" id="detect-local" style="margin-top:8px;">Detect local providers (LM Studio, ToshLLM, XeonLLM, Ollama, 9router)</button>
+            <div class="hint" id="detect-status"></div>
+        </div>
+
+        <div class="section">
+            <h2>Agent Models &amp; Permissions</h2>
+            <div class="hint" style="margin-bottom:12px;">Choose which profile plays each role. Leave a role on "Default" to use the primary profile. Local models without native tool calling still work through the JSON text protocol.</div>
+            <div class="field">
+                <label for="role_chat">Chat / planning model</label>
+                <select id="role_chat"></select>
+            </div>
+            <div class="field">
+                <label for="role_agent">Agent loop model</label>
+                <select id="role_agent"></select>
+            </div>
+            <div class="field">
+                <label for="role_vision">Vision / grounding model</label>
+                <select id="role_vision"></select>
+            </div>
+            <div class="checkbox-field">
+                <input type="checkbox" id="browser_eval_enabled">
+                <label for="browser_eval_enabled">Allow browser_eval (arbitrary JavaScript in the browser)</label>
+            </div>
+            <div class="hint">Needs "Allow JavaScript from Apple Events" in the browser. Off by default.</div>
+            <div class="checkbox-field">
+                <input type="checkbox" id="allow_scripts">
+                <label for="allow_scripts">Allow run_script (AppleScript / shell)</label>
+            </div>
+            <div class="hint">Off by default. When on, every call asks you to confirm the exact code in a dialog.</div>
         </div>
 
         <div class="section">
@@ -348,6 +377,9 @@
         const { invoke } = window.__TAURI__.core;
 
         let config = {};
+        let presets = [];
+        // index -> model ids from the last "Load models" call.
+        const modelCache = {};
 
         // ---- Provider Profiles UI --------------------------------------------
 
@@ -389,6 +421,35 @@
             header.appendChild(actions);
             card.appendChild(header);
 
+            // Preset picker: fills name + base URL from the preset table.
+            const presetField = document.createElement('div');
+            presetField.className = 'field';
+            const presetLbl = document.createElement('label');
+            presetLbl.textContent = 'Preset';
+            const presetSel = document.createElement('select');
+            const blank = document.createElement('option');
+            blank.value = '';
+            blank.textContent = 'Custom / keep current';
+            presetSel.appendChild(blank);
+            for (const p of presets) {
+                const opt = document.createElement('option');
+                opt.value = p.name;
+                opt.textContent = p.local ? `${p.name} (local)` : p.name;
+                presetSel.appendChild(opt);
+            }
+            presetSel.addEventListener('change', (e) => {
+                const preset = presets.find((p) => p.name === e.target.value);
+                if (!preset) return;
+                profile.name = preset.name;
+                profile.base_url = preset.base_url;
+                profile.supports_tools = profile.supports_tools !== false;
+                profile.supports_vision = profile.supports_vision !== false;
+                renderProfiles();
+            });
+            presetField.appendChild(presetLbl);
+            presetField.appendChild(presetSel);
+            card.appendChild(presetField);
+
             // Name
             const nameField = makeField('Name', profile.name || '', 'text', (v) => { profile.name = v; });
             card.appendChild(nameField);
@@ -401,15 +462,107 @@
             const keyField = makeField('API Key', profile.api_key || '', 'password', (v) => { profile.api_key = v || null; });
             card.appendChild(keyField);
 
-            // Model
-            const modelField = makeField('Chat Model', profile.model || '', 'text', (v) => { profile.model = v; });
-            card.appendChild(modelField);
+            // Model with a dropdown fed by /models (free text still allowed).
+            card.appendChild(makeModelField('Chat Model', profile.model || '', index, (v) => { profile.model = v; }));
 
-            // Vision Model
-            const visionField = makeField('Vision Model', profile.vision_model || '', 'text', (v) => { profile.vision_model = v; });
-            card.appendChild(visionField);
+            // Vision Model with the same dropdown.
+            card.appendChild(makeModelField('Vision Model', profile.vision_model || '', index, (v) => { profile.vision_model = v; }));
+
+            // Model list + Test buttons.
+            const row = document.createElement('div');
+            row.className = 'profile-actions';
+            row.style.marginTop = '8px';
+
+            const loadBtn = document.createElement('button');
+            loadBtn.className = 'btn-sm secondary';
+            loadBtn.textContent = 'Load models';
+            loadBtn.onclick = () => loadModels(index, profile);
+            row.appendChild(loadBtn);
+
+            const testBtn = document.createElement('button');
+            testBtn.className = 'btn-sm secondary';
+            testBtn.textContent = 'Test';
+            testBtn.onclick = () => testProfile(index, profile);
+            row.appendChild(testBtn);
+
+            card.appendChild(row);
+
+            const status = document.createElement('div');
+            status.className = 'hint';
+            status.id = `profile-status-${index}`;
+            if (profile.supports_tools === false) status.textContent = 'Tools: off (text protocol)';
+            else if (profile.supports_vision === false) status.textContent = 'Vision: off';
+            card.appendChild(status);
 
             return card;
+        }
+
+        // Model field: <input> with a <datalist> dropdown. Typing free text is
+        // always allowed; "Load models" fills the datalist from /models.
+        function makeModelField(label, value, index, onChange) {
+            const field = document.createElement('div');
+            field.className = 'field';
+
+            const lbl = document.createElement('label');
+            lbl.textContent = label;
+
+            const listId = `models-${index}-${label.replace(/\s+/g, '-').toLowerCase()}`;
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = value;
+            input.setAttribute('list', listId);
+            input.addEventListener('input', (e) => onChange(e.target.value));
+
+            const datalist = document.createElement('datalist');
+            datalist.id = listId;
+            for (const m of modelCache[index] || []) {
+                const opt = document.createElement('option');
+                opt.value = m;
+                datalist.appendChild(opt);
+            }
+
+            field.appendChild(lbl);
+            field.appendChild(input);
+            field.appendChild(datalist);
+            return field;
+        }
+
+        async function loadModels(index, profile) {
+            let status = document.getElementById(`profile-status-${index}`);
+            if (status) status.textContent = 'Loading models…';
+            try {
+                const models = await invoke('list_provider_models', {
+                    baseUrl: profile.base_url || '',
+                    apiKey: profile.api_key || null,
+                });
+                modelCache[index] = models;
+                renderProfiles();
+                status = document.getElementById(`profile-status-${index}`);
+                if (status) status.textContent = models.length ? `Loaded ${models.length} models.` : 'No models found.';
+            } catch (e) {
+                status = document.getElementById(`profile-status-${index}`);
+                if (status) status.textContent = 'Load failed: ' + e;
+            }
+        }
+
+        async function testProfile(index, profile) {
+            const status = document.getElementById(`profile-status-${index}`);
+            if (status) status.textContent = 'Testing…';
+            try {
+                const result = await invoke('test_provider_profile', { profile });
+                // Store the capability flags on the profile.
+                profile.supports_tools = result.tools;
+                profile.supports_vision = result.vision;
+                const bits = [
+                    `${result.latency_ms} ms`,
+                    result.tools ? 'tools ✓' : 'tools ✗',
+                    result.vision ? 'vision ✓' : 'vision ✗',
+                ];
+                if (result.error) bits.push('error: ' + result.error);
+                if (status) status.textContent = bits.join(' · ');
+            } catch (e) {
+                if (status) status.textContent = 'Test failed: ' + e;
+            }
         }
 
         function makeField(label, value, type, onChange) {
@@ -435,6 +588,7 @@
             config.providers.forEach((p, i) => {
                 container.appendChild(makeProfileCard(p, i));
             });
+            renderRoleSelects();
         }
 
         function addProfile() {
@@ -444,6 +598,8 @@
                 api_key: null,
                 model: 'llama3.2',
                 vision_model: 'llava',
+                supports_tools: true,
+                supports_vision: true,
             });
             renderProfiles();
         }
@@ -506,11 +662,47 @@
                 document.getElementById('light_sprites').checked = config.light_sprites !== false;
                 document.getElementById('lazy_audio').checked = config.lazy_audio !== false;
                 document.getElementById('idle_power_saver').checked = config.idle_power_saver !== false;
+                document.getElementById('browser_eval_enabled').checked = config.browser_eval_enabled === true;
+                document.getElementById('allow_scripts').checked = config.allow_scripts === true;
 
+                renderRoleSelects();
                 renderProfiles();
             } catch (e) {
                 console.error('Failed to load config:', e);
             }
+        }
+
+        // Role dropdowns list every profile name plus a "Default" entry.
+        function renderRoleSelects() {
+            const roles = config.roles || {};
+            for (const [id, value] of [
+                ['role_chat', roles.chat || ''],
+                ['role_agent', roles.agent || ''],
+                ['role_vision', roles.vision || ''],
+            ]) {
+                const sel = document.getElementById(id);
+                const current = value;
+                sel.innerHTML = '';
+                const def = document.createElement('option');
+                def.value = '';
+                def.textContent = 'Default (primary profile)';
+                sel.appendChild(def);
+                for (const p of config.providers) {
+                    const opt = document.createElement('option');
+                    opt.value = p.name;
+                    opt.textContent = p.name;
+                    sel.appendChild(opt);
+                }
+                sel.value = current;
+            }
+        }
+
+        function collectRoles() {
+            config.roles = {
+                chat: document.getElementById('role_chat').value,
+                agent: document.getElementById('role_agent').value,
+                vision: document.getElementById('role_vision').value,
+            };
         }
 
         async function saveConfig() {
@@ -543,6 +735,9 @@
             config.light_sprites = document.getElementById('light_sprites').checked;
             config.lazy_audio = document.getElementById('lazy_audio').checked;
             config.idle_power_saver = document.getElementById('idle_power_saver').checked;
+            config.browser_eval_enabled = document.getElementById('browser_eval_enabled').checked;
+            config.allow_scripts = document.getElementById('allow_scripts').checked;
+            collectRoles();
 
             try {
                 await invoke('update_config', { newConfig: config });
@@ -554,7 +749,48 @@
 
         // ---- Event handlers --------------------------------------------------
 
+        async function loadPresets() {
+            try {
+                presets = await invoke('provider_presets');
+            } catch (e) {
+                console.error('Failed to load presets:', e);
+            }
+        }
+
+        async function detectLocal() {
+            const status = document.getElementById('detect-status');
+            status.textContent = 'Probing local ports…';
+            try {
+                const found = await invoke('detect_local_providers');
+                if (!found.length) {
+                    status.textContent = 'No local providers answered.';
+                    return;
+                }
+                for (const d of found) {
+                    const existing = config.providers.find((p) => p.name === d.name);
+                    if (existing) continue;
+                    const model = d.models[0] || '';
+                    config.providers.push({
+                        name: d.name,
+                        base_url: d.base_url,
+                        api_key: null,
+                        model,
+                        vision_model: model,
+                        supports_tools: true,
+                        supports_vision: true,
+                    });
+                    modelCache[config.providers.length - 1] = d.models;
+                }
+                config.fallback_order = config.providers.map((p) => p.name);
+                renderProfiles();
+                status.textContent = `Added ${found.map((d) => d.name).join(', ')}.`;
+            } catch (e) {
+                status.textContent = 'Detect failed: ' + e;
+            }
+        }
+
         document.getElementById('add-profile').addEventListener('click', addProfile);
+        document.getElementById('detect-local').addEventListener('click', detectLocal);
         document.getElementById('save').addEventListener('click', saveConfig);
         document.getElementById('cancel').addEventListener('click', () => window.close());
         document.getElementById('open-permissions').addEventListener('click', async () => {
@@ -569,6 +805,7 @@
             }
         });
 
+        loadPresets();
         loadConfig();
     </script>
 </body>
