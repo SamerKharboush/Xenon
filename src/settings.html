@@ -257,6 +257,7 @@
                     <option value="">Auto (detect from model folder)</option>
                     <option value="kokoro">Kokoro</option>
                     <option value="vits">VITS / Piper</option>
+                    <option value="zipvoice">ZipVoice (experimental cloning)</option>
                 </select>
                 <div class="hint">Auto uses Kokoro when voices.bin is present, otherwise VITS/Piper.</div>
             </div>
@@ -279,9 +280,10 @@
                 <label for="listen_mode">Listen Mode</label>
                 <select id="listen_mode">
                     <option value="hotkey">Hotkey (Cmd+Shift+Space)</option>
+                    <option value="wake_word">Wake word</option>
                     <option value="always">Always listening</option>
                 </select>
-                <div class="hint">Hotkey: the mic opens only when you press Cmd+Shift+Space. Always: the VAD is armed continuously.</div>
+                <div class="hint">Wake word: say "hey &lt;pet name&gt;" (tiny whisper, main model stays unloaded). Hotkey: mic opens only on Cmd+Shift+Space. Always: VAD armed continuously.</div>
             </div>
             <div class="field">
                 <label for="language">Language</label>
@@ -305,6 +307,53 @@
             <div class="field">
                 <label for="vad_model_path">Voice-Activity Model Path</label>
                 <input type="text" id="vad_model_path" placeholder="~/models/whisper/ggml-silero-v6.2.0.bin">
+            </div>
+        <div class="section">
+            <h2>Voice &amp; Wake word</h2>
+            <div class="field">
+                <label for="wake_phrase">Wake phrase</label>
+                <input type="text" id="wake_phrase" placeholder="hey Xenon">
+                <div class="hint">Empty uses "hey &lt;pet name&gt;" and follows renames. Custom text is kept verbatim.</div>
+            </div>
+            <div class="field">
+                <label for="wake_sensitivity">Wake sensitivity</label>
+                <input type="range" id="wake_sensitivity" min="0" max="1" step="0.05" value="0.5">
+                <div class="hint">0 exact, 0.5 one or two misheard letters, 1 loose (also allows barge-in while speaking).</div>
+            </div>
+            <div class="checkbox-field">
+                <input type="checkbox" id="wake_chime">
+                <label for="wake_chime">Soft chime when the wake word fires</label>
+            </div>
+            <div class="checkbox-field">
+                <input type="checkbox" id="click_to_talk">
+                <label for="click_to_talk">Single pet click starts listening (double click still opens Settings)</label>
+            </div>
+            <div class="field">
+                <label for="wake_model_path">Wake model path</label>
+                <input type="text" id="wake_model_path" placeholder="~/Library/Application Support/com.xenon.app/models/ggml-tiny.en.bin">
+                <div class="hint">Small whisper model used only while waiting for the wake word. Falls back to the main Whisper Model Path.</div>
+            </div>
+            <div class="field">
+                <label for="system_voice">System voice</label>
+                <input type="text" id="system_voice" placeholder="Samantha (en_US)">
+                <div class="hint">Used by the macOS `say` fallback and voice previews. Empty uses the system default.</div>
+            </div>
+            <div class="field">
+                <label for="voice_picker">Installed voices</label>
+                <select id="voice_picker"></select>
+                <button class="secondary btn-sm" id="preview-voice">Preview</button>
+                <div class="hint">Kokoro speakers, imported Piper/VITS folders and macOS system voices. Preview does not change the saved voice.</div>
+            </div>
+            <div class="field">
+                <label for="import_voice_path">Import voice folder</label>
+                <input type="text" id="import_voice_path" placeholder="~/Downloads/kokoro-en-v0_19">
+                <input type="text" id="import_voice_name" placeholder="my-voice">
+                <button class="secondary btn-sm" id="import-voice">Import</button>
+                <div class="hint">Copies the folder to models/voices/&lt;name&gt;. Piper needs model.onnx.json to generate tokens.txt.</div>
+            </div>
+            <div class="field">
+                <button class="secondary btn-sm" id="record-clone">Record clone sample (5-10 s)</button>
+                <div class="hint" id="clone-status">Experimental: needs a ZipVoice model folder with reference.wav / reference.txt support.</div>
             </div>
         </div>
 
@@ -497,6 +546,12 @@
                 document.getElementById('tts_speaker_id').value = config.tts_speaker_id ?? 0;
                 document.getElementById('tts_speed').value = config.tts_speed ?? 1.0;
                 document.getElementById('listen_mode').value = config.listen_mode || 'hotkey';
+                document.getElementById('wake_phrase').value = config.wake_phrase || '';
+                document.getElementById('wake_sensitivity').value = config.wake_sensitivity ?? 0.5;
+                document.getElementById('wake_chime').checked = config.wake_chime !== false;
+                document.getElementById('click_to_talk').checked = config.click_to_talk !== false;
+                document.getElementById('wake_model_path').value = config.wake_model_path || '';
+                document.getElementById('system_voice').value = config.system_voice || '';
                 document.getElementById('language').value = config.language || 'en';
                 document.getElementById('silence_ms').value = config.silence_ms ?? 700;
                 document.getElementById('stt_unload_minutes').value = config.stt_unload_minutes ?? 5;
@@ -534,6 +589,12 @@
             config.tts_speaker_id = Number(document.getElementById('tts_speaker_id').value) || 0;
             config.tts_speed = Number(document.getElementById('tts_speed').value) || 1.0;
             config.listen_mode = document.getElementById('listen_mode').value;
+            config.wake_phrase = document.getElementById('wake_phrase').value.trim();
+            config.wake_sensitivity = Number(document.getElementById('wake_sensitivity').value) || 0;
+            config.wake_chime = document.getElementById('wake_chime').checked;
+            config.click_to_talk = document.getElementById('click_to_talk').checked;
+            config.wake_model_path = document.getElementById('wake_model_path').value.trim();
+            config.system_voice = document.getElementById('system_voice').value.trim();
             config.language = document.getElementById('language').value.trim() || 'en';
             config.silence_ms = Number(document.getElementById('silence_ms').value) || 700;
             config.stt_unload_minutes = Number(document.getElementById('stt_unload_minutes').value) || 5;
@@ -552,11 +613,93 @@
             }
         }
 
+        // ---- Voice catalog ----------------------------------------------------
+
+        let voiceCatalog = { kokoro: [], custom: [], system: [] };
+
+        function addVoiceOptions(group, prefix, select) {
+            for (const voice of group || []) {
+                const option = document.createElement('option');
+                option.value = prefix + ':' + (prefix === 'kokoro' ? voice.speakerId : voice.name);
+                option.textContent = voice.name;
+                option.dataset.kind = voice.kind;
+                option.dataset.dir = voice.modelDir || '';
+                select.appendChild(option);
+            }
+        }
+
+        async function loadVoices() {
+            const select = document.getElementById('voice_picker');
+            try {
+                voiceCatalog = await invoke('list_voices');
+                select.innerHTML = '';
+                addVoiceOptions(voiceCatalog.kokoro, 'kokoro', select);
+                addVoiceOptions(voiceCatalog.custom, 'custom', select);
+                addVoiceOptions(voiceCatalog.system, 'system', select);
+                const wanted = config.system_voice
+                    ? 'system:' + config.system_voice
+                    : 'kokoro:' + (config.tts_speaker_id ?? 0);
+                if ([...select.options].some((o) => o.value === wanted)) select.value = wanted;
+            } catch (e) {
+                console.warn('voice catalog:', e);
+            }
+        }
+
+        function selectedVoice() {
+            const select = document.getElementById('voice_picker');
+            const option = select.selectedOptions[0];
+            if (!option) return null;
+            const [kind, value] = option.value.split(/:(.*)/);
+            return { kind, value, option };
+        }
+
         // ---- Event handlers --------------------------------------------------
 
         document.getElementById('add-profile').addEventListener('click', addProfile);
         document.getElementById('save').addEventListener('click', saveConfig);
         document.getElementById('cancel').addEventListener('click', () => window.close());
+        document.getElementById('voice_picker').addEventListener('change', (e) => {
+            const v = selectedVoice();
+            if (!v) return;
+            if (v.kind === 'kokoro') {
+                config.tts_speaker_id = Number(v.value) || 0;
+                document.getElementById('tts_speaker_id').value = config.tts_speaker_id;
+            } else if (v.kind === 'custom') {
+                config.tts_model_dir = v.option.dataset.dir;
+                config.tts_kind = v.option.dataset.kind === 'kokoro' ? 'kokoro' : 'vits';
+                document.getElementById('tts_model_dir').value = config.tts_model_dir;
+                document.getElementById('tts_kind').value = config.tts_kind;
+            } else if (v.kind === 'system') {
+                config.system_voice = v.value;
+                document.getElementById('system_voice').value = config.system_voice;
+            }
+        });
+        document.getElementById('preview-voice').addEventListener('click', async () => {
+            const v = selectedVoice();
+            const args = { text: 'Hi, I am your Xenon voice.' };
+            if (v && v.kind === 'system') args.systemVoice = v.value;
+            if (v && v.kind === 'kokoro') args.speakerId = Number(v.value) || 0;
+            args.speed = Number(document.getElementById('tts_speed').value) || 1.0;
+            try { await invoke('preview_voice', args); } catch (e) { alert('Preview failed: ' + e); }
+        });
+        document.getElementById('import-voice').addEventListener('click', async () => {
+            const path = document.getElementById('import_voice_path').value.trim();
+            const name = document.getElementById('import_voice_name').value.trim();
+            if (!path || !name) { alert('Enter a folder path and a voice name.'); return; }
+            try {
+                const dest = await invoke('import_voice_folder', { path, name });
+                alert('Imported to ' + dest);
+                await loadVoices();
+            } catch (e) { alert('Import failed: ' + e); }
+        });
+        document.getElementById('record-clone').addEventListener('click', async () => {
+            const status = document.getElementById('clone-status');
+            status.textContent = 'Recording 7 s…';
+            try {
+                const result = await invoke('record_clone', { seconds: 7 });
+                status.textContent = 'Saved ' + result.wav + ' — transcript: ' + result.transcript;
+            } catch (e) { status.textContent = 'Clone recording failed: ' + e; }
+        });
         document.getElementById('open-permissions').addEventListener('click', async () => {
             try {
                 const perms = await invoke('get_permissions');
@@ -569,7 +712,7 @@
             }
         });
 
-        loadConfig();
+        loadConfig().then(loadVoices);
     </script>
 </body>
 </html>

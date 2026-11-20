@@ -12,6 +12,9 @@ pub enum AudioEvent {
     /// The audio pipeline opened the mic / detected speech onset: show the
     /// Listening state + waveform.
     Listening,
+    /// The wake phrase was heard. `text` is Some when the command followed in
+    /// the same breath (the wake phrase has already been stripped).
+    Wake { text: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

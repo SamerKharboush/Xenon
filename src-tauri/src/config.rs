@@ -45,10 +45,22 @@ fn app_support_models() -> PathBuf {
         .join("Library/Application Support/com.xenon.app/models")
 }
 
-/// Default neural voice directory, populated by scripts/fetch-models.sh.
-fn default_tts_model_dir() -> String {
+/// Models directory, shared with the voice lane.
+pub(crate) fn models_dir() -> PathBuf {
     app_support_models()
-        .join("kokoro-en-v0_19")
+}
+
+/// Default neural voice directory, populated by scripts/fetch-models.sh.
+/// Prefer the multi-language Kokoro (ships lexicons); v0.19 is the fallback.
+pub(crate) fn default_tts_model_dir() -> String {
+    for name in ["kokoro-multi-lang-v1_0", "kokoro-en-v0_19"] {
+        let dir = app_support_models().join(name);
+        if dir.join("model.onnx").exists() {
+            return dir.to_string_lossy().to_string();
+        }
+    }
+    app_support_models()
+        .join("kokoro-multi-lang-v1_0")
         .to_string_lossy()
         .to_string()
 }
@@ -167,8 +179,9 @@ pub struct XenonConfig {
     pub wake_word_enabled: bool,
     pub wake_word: String,
     pub system_prompt: String,
-    /// "hotkey" (default) or "always".
-    #[serde(default = "default_listen_mode")]
+    /// "hotkey" (default for existing configs), "always", or "wake_word"
+    /// (default for new configs).
+    #[serde(default = "default_listen_mode_serde")]
     pub listen_mode: String,
     /// STT language code, or "auto"/"" to auto-detect.
     #[serde(default = "default_language")]
@@ -214,6 +227,29 @@ pub struct XenonConfig {
     /// Draw Idle at 15 FPS instead of 60 (Settings -> Performance).
     #[serde(default = "default_true")]
     pub idle_power_saver: bool,
+
+    // --- voice ---
+    /// Wake phrase. Empty means the built-in default: "hey {pet_name}", which
+    /// live-updates when the pet is renamed. A non-empty value is treated as
+    /// a user customisation and never rewritten.
+    #[serde(default)]
+    pub wake_phrase: String,
+    /// Wake-match tolerance, 0.0 (exact) .. 1.0 (loose).
+    #[serde(default = "default_wake_sensitivity")]
+    pub wake_sensitivity: f32,
+    /// Play a soft chime when the wake word fires.
+    #[serde(default = "default_true")]
+    pub wake_chime: bool,
+    /// Single click on the pet starts listening instead of the old tap greet.
+    #[serde(default = "default_true")]
+    pub click_to_talk: bool,
+    /// Small whisper model used only for wake-word spotting. Falls back to
+    /// `whisper_model_path` when this file is absent.
+    #[serde(default = "default_wake_model_path")]
+    pub wake_model_path: String,
+    /// macOS system voice for the `say` fallback (empty = system default).
+    #[serde(default)]
+    pub system_voice: String,
 }
 
 fn default_true() -> bool {
@@ -221,7 +257,30 @@ fn default_true() -> bool {
 }
 
 fn default_listen_mode() -> String {
+    // New configs (Default::default) get the wake word; old config files that
+    // lack the field use `default_listen_mode_serde` below so they keep the
+    // behaviour they already had.
+    "wake_word".to_string()
+}
+fn default_listen_mode_serde() -> String {
     "hotkey".to_string()
+}
+fn default_wake_sensitivity() -> f32 {
+    0.5
+}
+fn default_wake_model_path() -> String {
+    for c in [
+        app_support_models().join("ggml-tiny.en.bin"),
+        app_support_models().join("ggml-base.en.bin"),
+    ] {
+        if c.exists() {
+            return c.to_string_lossy().to_string();
+        }
+    }
+    app_support_models()
+        .join("ggml-tiny.en.bin")
+        .to_string_lossy()
+        .to_string()
 }
 fn default_language() -> String {
     "en".to_string()
@@ -272,6 +331,12 @@ impl Default for XenonConfig {
             light_sprites: true,
             lazy_audio: true,
             idle_power_saver: true,
+            wake_phrase: String::new(),
+            wake_sensitivity: default_wake_sensitivity(),
+            wake_chime: true,
+            click_to_talk: true,
+            wake_model_path: default_wake_model_path(),
+            system_voice: String::new(),
         }
     }
 }
@@ -382,6 +447,18 @@ impl XenonConfig {
             .into_iter()
             .next()
             .unwrap_or_else(|| ProviderProfile::from_flat(&self.provider))
+    }
+
+    /// The phrase the wake detector listens for. An empty `wake_phrase` means
+    /// "hey {pet_name}", so renaming the pet updates it automatically; a
+    /// non-empty value is the user's own phrase and is left alone.
+    pub fn effective_wake_phrase(&self) -> String {
+        let phrase = self.wake_phrase.trim();
+        if phrase.is_empty() {
+            format!("hey {}", self.pet_name)
+        } else {
+            phrase.to_string()
+        }
     }
 }
 
@@ -533,5 +610,49 @@ mod tests {
         assert!(cfg.light_sprites, "light_sprites must default to true");
         assert!(cfg.lazy_audio, "lazy_audio must default to true");
         assert!(cfg.idle_power_saver, "idle_power_saver must default to true");
+    }
+
+    /// New configs get the wake-word lane; old configs keep their hotkey mode.
+    #[test]
+    fn test_listen_mode_new_vs_old() {
+        assert_eq!(XenonConfig::default().listen_mode, "wake_word");
+        let old = r#"{
+            "pet_name": "Jarvis",
+            "provider_url": "http://127.0.0.1:8080",
+            "provider_api_key": null,
+            "model_name": "qwen3",
+            "voice_enabled": true,
+            "wake_word_enabled": true,
+            "wake_word": "Xenon",
+            "system_prompt": "hi"
+        }"#;
+        let cfg: XenonConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(cfg.listen_mode, "hotkey");
+    }
+
+    /// Voice-lane defaults apply to old configs and empty wake phrases follow
+    /// the pet name live.
+    #[test]
+    fn test_voice_defaults_and_effective_phrase() {
+        let old = r#"{
+            "pet_name": "Jarvis",
+            "provider_url": "http://127.0.0.1:8080",
+            "provider_api_key": null,
+            "model_name": "qwen3",
+            "voice_enabled": true,
+            "wake_word_enabled": true,
+            "wake_word": "Xenon",
+            "system_prompt": "hi"
+        }"#;
+        let mut cfg: XenonConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(cfg.wake_phrase, "");
+        assert_eq!(cfg.wake_sensitivity, 0.5);
+        assert!(cfg.wake_chime);
+        assert!(cfg.click_to_talk);
+        assert_eq!(cfg.effective_wake_phrase(), "hey Jarvis");
+        cfg.pet_name = "Nova".into();
+        assert_eq!(cfg.effective_wake_phrase(), "hey Nova");
+        cfg.wake_phrase = "yo computer".into();
+        assert_eq!(cfg.effective_wake_phrase(), "yo computer");
     }
 }

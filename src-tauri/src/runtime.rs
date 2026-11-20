@@ -23,6 +23,9 @@ pub struct Runtime {
     tts: Arc<Tts>,
     /// Set by Cmd+Shift+Escape to abort a running agent turn.
     abort: Arc<AtomicBool>,
+    /// Shared with the audio worker: true while the pet is Speaking, used as
+    /// an echo guard so it cannot wake itself on its own TTS.
+    speaking: Arc<AtomicBool>,
 }
 
 impl Runtime {
@@ -41,7 +44,13 @@ impl Runtime {
             app: None,
             tts,
             abort: Arc::new(AtomicBool::new(false)),
+            speaking: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Shared Speaking flag for the audio worker's wake echo guard.
+    pub fn speaking_flag(&self) -> Arc<AtomicBool> {
+        self.speaking.clone()
     }
 
     /// Attach the Tauri AppHandle so the presentation loop can emit
@@ -66,8 +75,9 @@ impl Runtime {
         let state = self.state.clone();
         let app = self.app.clone();
         let tts = self.tts.clone();
+        let speaking = self.speaking.clone();
         tauri::async_runtime::spawn(async move {
-            Self::presentation_loop(action_rx, state, app, tts).await;
+            Self::presentation_loop(action_rx, state, app, tts, speaking).await;
         });
 
         let audio_rx = self.audio_rx.clone();
@@ -88,6 +98,7 @@ impl Runtime {
         state: Arc<RwLock<PetState>>,
         app: Option<AppHandle>,
         tts: Arc<Tts>,
+        speaking: Arc<AtomicBool>,
     ) {
         while let Ok(action) = action_rx.recv().await {
             let next = match &action {
@@ -102,6 +113,11 @@ impl Runtime {
 
             match next {
                 Some(new_state) => {
+                    // Keep the echo guard in sync with the pet state.
+                    match new_state {
+                        PetState::Speaking => speaking.store(true, Ordering::Relaxed),
+                        _ => speaking.store(false, Ordering::Relaxed),
+                    }
                     let mut guard = state.write().await;
                     if *guard != new_state {
                         // Barge-in: leaving Speaking toward Listening means the
@@ -121,7 +137,12 @@ impl Runtime {
                         }
                     }
                 }
-                None => Self::watch_tts_drain(tts.clone(), state.clone(), app.clone()),
+                None => Self::watch_tts_drain(
+                    tts.clone(),
+                    state.clone(),
+                    app.clone(),
+                    speaking.clone(),
+                ),
             }
 
             if let AgentAction::Speak(text) = &action {
@@ -137,7 +158,12 @@ impl Runtime {
 
     /// TurnFinished arrived while audio is still playing: poll (async, never
     /// blocking a tokio worker) until the TTS queue drains, then emit Idle.
-    fn watch_tts_drain(tts: Arc<Tts>, state: Arc<RwLock<PetState>>, app: Option<AppHandle>) {
+    fn watch_tts_drain(
+        tts: Arc<Tts>,
+        state: Arc<RwLock<PetState>>,
+        app: Option<AppHandle>,
+        speaking: Arc<AtomicBool>,
+    ) {
         tauri::async_runtime::spawn(async move {
             for _ in 0..1200 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -149,6 +175,7 @@ impl Runtime {
             if *guard == PetState::Speaking {
                 *guard = PetState::Idle;
                 drop(guard);
+                speaking.store(false, Ordering::Relaxed);
                 if let Some(app) = &app {
                     let _ = app.emit("pet-state", &PetState::Idle);
                 }
@@ -188,6 +215,21 @@ impl Runtime {
                     }
                     abort.store(false, Ordering::SeqCst);
                     Self::run_agent(&utterance.text, &action_tx, &config, &abort, &app).await;
+                }
+                AudioEvent::Wake { text } => {
+                    // Wake fires before any command transcript; play the short
+                    // "noticed you" beat, then hand the same-breath command
+                    // straight to the agent (no second listen window).
+                    if let Some(app) = &app {
+                        let _ = app.emit("pet-wake", ());
+                    }
+                    let _ = action_tx
+                        .send(AgentAction::SetPetState(PetState::Listening))
+                        .await;
+                    if let Some(command) = text.filter(|s| !s.trim().is_empty()) {
+                        abort.store(false, Ordering::SeqCst);
+                        Self::run_agent(command.trim(), &action_tx, &config, &abort, &app).await;
+                    }
                 }
                 AudioEvent::Greet => {
                     let cfg = config.read().await;
@@ -234,11 +276,11 @@ impl Runtime {
         config: &Arc<RwLock<XenonConfig>>,
         state: &Arc<RwLock<PetState>>,
     ) -> bool {
-        let always = {
+        let guarded = {
             let cfg = config.read().await;
-            cfg.listen_mode == "always"
+            matches!(cfg.listen_mode.as_str(), "always" | "wake_word")
         };
-        always && matches!(*state.read().await, PetState::Speaking)
+        guarded && matches!(*state.read().await, PetState::Speaking)
     }
 
     async fn run_agent(
@@ -289,6 +331,21 @@ impl Runtime {
     /// (pet taps, text input, wake word) without owning the Runtime.
     pub fn audio_sender(&self) -> Sender<AudioEvent> {
         self.audio_tx.clone()
+    }
+
+    /// Voice picker Preview: one-off neural speaker/speed.
+    pub fn preview_neural(
+        &self,
+        text: &str,
+        speaker: Option<u32>,
+        speed: Option<f32>,
+    ) -> anyhow::Result<()> {
+        self.tts.preview_neural(text, speaker, speed)
+    }
+
+    /// Voice picker Preview: a macOS system voice.
+    pub fn preview_system(&self, voice: &str, text: &str) -> anyhow::Result<()> {
+        self.tts.preview_system(voice, text)
     }
 
     /// Performance toggle off: load the TTS model at startup.

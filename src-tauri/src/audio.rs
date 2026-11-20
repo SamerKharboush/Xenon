@@ -16,6 +16,7 @@ use async_channel::Sender;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,6 +30,7 @@ use whisper_rs::{
 use crate::audio_dsp::{resample_linear, Segmenter};
 use crate::config::XenonConfig;
 use crate::events::{AudioEvent, Utterance};
+use crate::voice;
 
 const TARGET_RATE: u32 = 16_000;
 /// ~one Silero frame at 16 kHz (whisper.cpp uses a 512-sample window).
@@ -39,6 +41,10 @@ const VAD_STRIDE_MS: u32 = 300;
 const PRE_ROLL_MS: u32 = 300;
 /// Hotkey force-listen closes after this long with no speech.
 const FORCE_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
+/// After the wake word, wait this long for the command before re-arming.
+const WAKE_LISTEN_TIMEOUT: Duration = Duration::from_secs(12);
+/// Wake-word segments are capped this short so a name is checked quickly.
+const WAKE_MAX_SPEECH_MS: u32 = 2_500;
 /// Emit `audio-level` at ~30 Hz.
 const LEVEL_INTERVAL: Duration = Duration::from_millis(33);
 /// Trim the in-session silence buffer past this length (bounds always-on RAM).
@@ -66,11 +72,12 @@ impl AudioPipeline {
         audio_tx: Sender<AudioEvent>,
         app: AppHandle,
         config: Arc<RwLock<XenonConfig>>,
+        speaking: Arc<AtomicBool>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("xenon-audio".into())
-            .spawn(move || worker(cmd_rx, app, config, audio_tx))
+            .spawn(move || worker(cmd_rx, app, config, audio_tx, speaking))
             .expect("spawn audio worker");
         Self { cmd_tx }
     }
@@ -104,6 +111,15 @@ struct Worker {
     stt: Option<WhisperContext>,
     stt_last_used: Option<Instant>,
     force: bool,
+    speaking: Arc<AtomicBool>,
+    awake: bool,
+    awake_until: Instant,
+    /// Wake fired with a same-breath command; let the agent own the state
+    /// instead of closing the window with a Silence event.
+    awake_with_command: bool,
+    wake_seg: Segmenter,
+    wake_stt: Option<WhisperContext>,
+    wake_notice_sent: bool,
     /// Capture is open but no hotkey session has started (lazy_audio = false).
     /// Frames are dropped until the hotkey flips this off.
     preloaded: bool,
@@ -117,6 +133,7 @@ fn worker(
     app: AppHandle,
     config: Arc<RwLock<XenonConfig>>,
     audio_tx: Sender<AudioEvent>,
+    speaking: Arc<AtomicBool>,
 ) {
     // Start in hotkey mode by default; always-on opens below.
     let initial_cfg = config.try_read().map(|c| c.clone()).unwrap_or_default();
@@ -140,13 +157,28 @@ fn worker(
         stt: None,
         stt_last_used: None,
         force: false,
+        speaking,
+        awake: false,
+        awake_until: Instant::now(),
+        awake_with_command: false,
+        wake_seg: Segmenter::new(
+            0.5,
+            32.0,
+            30,
+            initial_cfg.silence_ms as u32,
+            300,
+            WAKE_MAX_SPEECH_MS,
+        ),
+        wake_stt: None,
+        wake_notice_sent: false,
         preloaded: false,
         last_speech: Instant::now(),
         last_level: Instant::now(),
         model_notice_sent: false,
     };
 
-    if w.cfg.listen_mode == "always" {
+    // Wake-word mode keeps capture + VAD warm but the main STT model lazy.
+    if w.cfg.listen_mode == "always" || w.cfg.listen_mode == "wake_word" {
         w.open_session(false);
     } else if !w.cfg.lazy_audio {
         // Performance toggle off: warm the mic and VAD at startup.
@@ -197,6 +229,10 @@ impl Worker {
     }
 
     /// Refresh the cached config snapshot at most once every second.
+    fn wake_mode(&self) -> bool {
+        self.cfg.listen_mode == "wake_word"
+    }
+
     fn refresh_config(&mut self) {
         if self.cfg_loaded_at.elapsed() < Duration::from_secs(1) {
             return;
@@ -204,15 +240,30 @@ impl Worker {
         self.cfg_loaded_at = Instant::now();
         if let Ok(guard) = self.config.try_read() {
             let new = guard.clone();
-            // Rebuild the segmenter only if its timing inputs changed.
+            // Rebuild the segmenters only if their timing inputs changed.
             if new.silence_ms != self.cfg.silence_ms {
                 self.seg = Segmenter::new(0.5, 32.0, 30, new.silence_ms as u32, 300, 30_000);
+                self.wake_seg = Segmenter::new(
+                    0.5,
+                    32.0,
+                    30,
+                    new.silence_ms as u32,
+                    300,
+                    WAKE_MAX_SPEECH_MS,
+                );
             }
             self.cfg = new;
         }
     }
 
     fn on_force_listen(&mut self) {
+        // A hotkey/tray/pet click wakes the pipeline directly.
+        if self.wake_mode() {
+            self.awake = true;
+            self.awake_until = Instant::now() + WAKE_LISTEN_TIMEOUT;
+            self.awake_with_command = false;
+            self.wake_seg.reset();
+        }
         // Barge-in: tell the runtime to swap Speaking -> Listening. If TTS is
         // playing, task 3 stops it here (see runtime presentation_loop hook).
         self.emit(AudioEvent::ForceListen);
@@ -241,6 +292,7 @@ impl Worker {
         self.input_buf.clear();
         self.captured.clear();
         self.seg.reset();
+        self.wake_seg.reset();
         self.frames_committed = 0;
         self.since_vad = 0;
         self.force = false;
@@ -266,6 +318,7 @@ impl Worker {
         self.input_buf.clear();
         self.captured.clear();
         self.seg.reset();
+        self.wake_seg.reset();
         self.frames_committed = 0;
         self.since_vad = 0;
         self.last_speech = Instant::now();
@@ -280,8 +333,9 @@ impl Worker {
             self.close_session();
             return;
         }
-        if self.cfg.listen_mode != "always" {
-            // Hotkey mode: show Listening immediately.
+        if self.cfg.listen_mode == "hotkey" && force {
+            // Hotkey mode: show Listening immediately. Wake mode gets its
+            // Listening transition from the Wake event; always mode stays Idle.
             self.emit(AudioEvent::Listening);
         }
         log::info!(
@@ -318,6 +372,7 @@ impl Worker {
         self.input_buf.clear();
         self.captured.clear();
         self.seg.reset();
+        self.wake_seg.reset();
         self.frames_committed = 0;
         self.since_vad = 0;
         self.force = false;
@@ -459,22 +514,46 @@ impl Worker {
         let start_idx = self.frames_committed.min(probs.len());
 
         for p in &probs[start_idx..] {
+            let wake_listening = self.wake_mode() && !self.awake;
             let was_speaking = self.seg.in_speech();
-            if let Some((start, end)) = self.seg.push(*p) {
-                let pre = (PRE_ROLL_MS as usize * TARGET_RATE as usize) / 1000 / spf;
-                let s0 = start.saturating_sub(pre);
-                let s1 = (end * spf).min(self.captured.len());
-                let lo = (s0 * spf).min(self.captured.len());
-                if s1 > lo {
-                    let audio = self.captured[lo..s1].to_vec();
-                    self.on_segment(&audio);
+            let mut segment: Option<Vec<f32>> = None;
+            let mut wake_segment = false;
+
+            if !wake_listening {
+                if let Some((start, end)) = self.seg.push(*p) {
+                    let pre = (PRE_ROLL_MS as usize * TARGET_RATE as usize) / 1000 / spf;
+                    let s0 = start.saturating_sub(pre);
+                    let s1 = (end * spf).min(self.captured.len());
+                    let lo = (s0 * spf).min(self.captured.len());
+                    if s1 > lo {
+                        segment = Some(self.captured[lo..s1].to_vec());
+                    }
+                    self.seg.reset();
+                    self.frames_committed = 0;
+                    self.captured.clear();
+                    self.since_vad = 0;
                 }
-                // Reset the rolling buffer + segmenter: bounded memory in
-                // always-on mode; a fresh baseline for the next utterance.
-                self.seg.reset();
+            } else if let Some((start, end)) = self.wake_seg.push(*p) {
+                // Wake mode, not yet awake: feed a short-segment whisper
+                // segmenter instead of the main one.
+                let s1 = (end * spf).min(self.captured.len());
+                let lo = (start * spf).min(self.captured.len());
+                if s1 > lo {
+                    segment = Some(self.captured[lo..s1].to_vec());
+                    wake_segment = true;
+                }
+                self.wake_seg.reset();
                 self.frames_committed = 0;
                 self.captured.clear();
                 self.since_vad = 0;
+            }
+
+            if let Some(audio) = segment {
+                if wake_segment {
+                    self.on_wake_segment(&audio);
+                } else {
+                    self.on_segment(&audio);
+                }
                 if self.force {
                     // Hotkey window ends once an utterance is transcribed.
                     self.emit(AudioEvent::Silence);
@@ -482,7 +561,7 @@ impl Worker {
                 }
                 return;
             }
-            if !was_speaking && self.seg.in_speech() {
+            if !wake_listening && !was_speaking && self.seg.in_speech() {
                 // Speech onset: start the Listening waveform via the runtime.
                 self.emit(AudioEvent::Listening);
                 self.last_speech = Instant::now();
@@ -511,6 +590,82 @@ impl Worker {
                 self.emit(AudioEvent::Silence);
             }
         }
+    }
+
+    /// Short VAD segments transcribed by the small wake model. Main STT stays
+    /// unloaded until a wake phrase actually matches.
+    fn on_wake_segment(&mut self, audio: &[f32]) {
+        if self.awake {
+            return;
+        }
+        // Echo guard: don't let the pet wake itself while it speaks. High
+        // sensitivity deliberately allows barge-in.
+        if self.speaking.load(Ordering::Relaxed) && self.cfg.wake_sensitivity < 0.85 {
+            return;
+        }
+        let Some(text) = self.transcribe_wake(audio) else {
+            return;
+        };
+        let phrase = self.cfg.effective_wake_phrase();
+        if let Some(m) = voice::match_wake(&text, &phrase, self.cfg.wake_sensitivity) {
+            self.awake = true;
+            self.awake_until = Instant::now() + WAKE_LISTEN_TIMEOUT;
+            self.awake_with_command = !m.trailing.is_empty();
+            // Discard wake audio; the same-breath command starts fresh.
+            self.seg.reset();
+            self.wake_seg.reset();
+            self.captured.clear();
+            self.frames_committed = 0;
+            self.since_vad = 0;
+            self.emit(AudioEvent::Wake {
+                text: (!m.trailing.is_empty()).then_some(m.trailing),
+            });
+            if self.cfg.wake_chime {
+                play_chime();
+            }
+        }
+    }
+
+    /// Reuse the tiny wake STT context; return `None` on missing model or
+    /// empty/hallucinated transcript.
+    fn transcribe_wake(&mut self, audio: &[f32]) -> Option<String> {
+        let path = self.wake_model_path();
+        if self.wake_stt.is_none() {
+            match WhisperContext::new_with_params(
+                &path,
+                WhisperContextParameters::new(),
+            ) {
+                Ok(ctx) => self.wake_stt = Some(ctx),
+                Err(e) => {
+                    if !self.wake_notice_sent {
+                        self.wake_notice_sent = true;
+                        log::warn!("audio: wake model load failed: {e:#}");
+                        self.emit_notice(&format!(
+                            "Wake-word model missing ({e}). Run scripts/fetch-models.sh \
+                             or set wake_model_path in Settings -> Voice & Wake word."
+                        ));
+                    }
+                    return None;
+                }
+            }
+        }
+        let ctx = self.wake_stt.as_ref()?;
+        match run_stt(ctx, audio, Some("en")) {
+            Ok(Some(u)) => Some(u.text),
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!("audio: wake STT failed: {e:#}");
+                None
+            }
+        }
+    }
+
+    fn wake_model_path(&self) -> String {
+        let p = self.cfg.wake_model_path.trim();
+        if !p.is_empty() && std::path::Path::new(p).exists() {
+            return p.to_string();
+        }
+        self.cfg.whisper_model_path.clone()
     }
 
     /// Lazily load / reuse the whisper STT context and transcribe *audio*.
@@ -564,6 +719,21 @@ impl Worker {
                 self.stt_last_used = None;
             }
         }
+        // Wake-word listening window: close it when the timer runs out and the
+        // user did not already send a command (the agent owns the state then).
+        if self.wake_mode()
+            && self.awake
+            && !self.awake_with_command
+            && Instant::now() >= self.awake_until
+        {
+            self.awake = false;
+            self.seg.reset();
+            self.wake_seg.reset();
+            self.captured.clear();
+            self.frames_committed = 0;
+            self.since_vad = 0;
+            self.emit(AudioEvent::Silence);
+        }
         // Hotkey window timeout: after FORCE_IDLE_TIMEOUT with no trailing silence,
         // transcribe whatever was captured, then close.
         if self.seg.in_speech() {
@@ -576,13 +746,14 @@ impl Worker {
         {
             self.finish_and_close();
         }
-        // Bound always-on silence memory.
-        if self.stream.is_some() && !self.seg.in_speech() {
+        // Bound always-on silence memory (both segmenters).
+        if self.stream.is_some() && !self.seg.in_speech() && !self.wake_seg.in_speech() {
             let cap = (TARGET_RATE as usize) * (SILENCE_TRIM_MAX_MS as usize / 1000);
             if self.captured.len() > cap {
                 self.frames_committed = 0;
                 self.captured.clear();
                 self.seg.reset();
+                self.wake_seg.reset();
                 self.since_vad = 0;
             }
         }
@@ -616,6 +787,155 @@ impl Worker {
     fn emit_notice(&self, msg: &str) {
         log::warn!("audio notice: {msg}");
         let _ = self.app.emit("xenon-notice", msg.to_string());
+    }
+}
+
+/// Play a soft two-note chime when the wake word fires. Best-effort: any
+/// failure (no output device) is logged and ignored.
+fn play_chime() {
+    std::thread::spawn(|| {
+        let host = cpal::default_host();
+        let Some(device) = host.default_output_device() else {
+            log::warn!("audio: no output device for wake chime");
+            return;
+        };
+        let Ok(support) = device.default_output_config() else {
+            log::warn!("audio: no default output config for wake chime");
+            return;
+        };
+        let rate = support.sample_rate().0 as f32;
+        let spec = support.config();
+        let total = (rate * 0.24) as usize;
+        let note = 660.0f32;
+
+        let mut i = 0usize;
+        let write = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            for sample in data.iter_mut() {
+                if i >= total {
+                    *sample = 0.0;
+                    continue;
+                }
+                let t = i as f32 / rate;
+                let env = (1.0 - (t / 0.24)).clamp(0.0, 1.0).min(1.0);
+                let env = env * env;
+                *sample = (2.0 * std::f32::consts::PI * note * t).sin() * 0.08 * env;
+                i += 1;
+            }
+        };
+        let stream = match support.sample_format() {
+            SampleFormat::F32 => device.build_output_stream(
+                &spec,
+                write,
+                |e| log::warn!("audio: wake chime stream error: {e}"),
+                None,
+            ),
+            _ => {
+                log::warn!("audio: unsupported output format for wake chime");
+                return;
+            }
+        };
+        let Ok(stream) = stream else {
+            log::warn!("audio: failed to open wake chime stream");
+            return;
+        };
+        if stream.play().is_err() {
+            log::warn!("audio: failed to start wake chime stream");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    });
+}
+
+/// Record `seconds` of mono 16 kHz audio from the default input device. Used by
+/// the experimental voice-clone flow (Settings -> Voice & Wake word).
+pub(crate) fn record_samples(seconds: u32) -> Result<Vec<f32>> {
+    let seconds = seconds.clamp(3, 15);
+    let device = cpal::default_host()
+        .default_input_device()
+        .context("no default input device")?;
+    let cfg = device.default_input_config()?.clone();
+    let native_rate = cfg.sample_rate().0;
+    let channels = cfg.channels() as usize;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(512);
+    let push = move |frames: &[f32], channels: usize| {
+        let f: Vec<f32> = if channels <= 1 {
+            frames.to_vec()
+        } else {
+            let mut v = Vec::with_capacity(frames.len() / channels + 1);
+            let mut i = 0;
+            while i + channels <= frames.len() {
+                let mut s = 0.0;
+                for c in 0..channels {
+                    s += frames[i + c];
+                }
+                v.push(s / channels as f32);
+                i += channels;
+            }
+            v
+        };
+        let _ = tx.try_send(f);
+    };
+    let err_cb = |e| log::warn!("audio: record stream error: {e}");
+    let stream = match cfg.sample_format() {
+        SampleFormat::F32 => device.build_input_stream(
+            &cfg.config(),
+            move |data: &[f32], _| push(data, channels),
+            err_cb,
+            None,
+        )?,
+        SampleFormat::I16 => device.build_input_stream(
+            &cfg.config(),
+            move |data: &[i16], _| {
+                let f: Vec<f32> = data.iter().map(|&x| x as f32 / i16::MAX as f32).collect();
+                push(&f, channels);
+            },
+            err_cb,
+            None,
+        )?,
+        SampleFormat::I32 => device.build_input_stream(
+            &cfg.config(),
+            move |data: &[i32], _| {
+                let f: Vec<f32> = data.iter().map(|&x| x as f32 / i32::MAX as f32).collect();
+                push(&f, channels);
+            },
+            err_cb,
+            None,
+        )?,
+        other => anyhow::bail!("unsupported sample format: {other:?}"),
+    };
+    stream.play().context("start record stream")?;
+
+    let deadline = Instant::now() + Duration::from_secs(seconds as u64);
+    let mut raw: Vec<f32> = Vec::new();
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(frames) => raw.extend_from_slice(&frames),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    drop(stream);
+    if raw.is_empty() {
+        anyhow::bail!("recorded no audio");
+    }
+    Ok(resample_linear(&raw, native_rate, TARGET_RATE))
+}
+
+/// Transcribe already-captured mono 16 kHz samples with the small wake model
+/// (falls back to the main STT model). Returns an empty string on failure.
+pub(crate) fn transcribe_samples(samples: &[f32], cfg: &XenonConfig) -> Result<String> {
+    let mut path = cfg.wake_model_path.clone();
+    if path.trim().is_empty() || !std::path::Path::new(&path).exists() {
+        path = cfg.whisper_model_path.clone();
+    }
+    if path.trim().is_empty() || !std::path::Path::new(&path).exists() {
+        anyhow::bail!("no whisper model available for transcription");
+    }
+    let ctx = WhisperContext::new_with_params(&path, WhisperContextParameters::new())?;
+    match run_stt(&ctx, samples, None) {
+        Ok(Some(u)) => Ok(u.text),
+        Ok(None) => Ok(String::new()),
+        Err(e) => Err(e),
     }
 }
 

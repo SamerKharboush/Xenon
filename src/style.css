@@ -17,3 +17,32 @@ body {
     width: 100%;
     height: 100%;
 }
+
+#typed-message {
+    display: none;
+    position: fixed;
+    left: 50%;
+    bottom: 168px;
+    transform: translateX(-50%);
+    z-index: 10;
+}
+
+#typed-message.visible {
+    display: block;
+}
+
+#typed-input {
+    width: 260px;
+    padding: 9px 12px;
+    border: 1px solid rgba(255, 122, 161, 0.7);
+    border-radius: 14px;
+    background: rgba(28, 24, 32, 0.92);
+    color: #fff3e0;
+    font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    outline: none;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+#typed-input::placeholder {
+    color: rgba(255, 243, 224, 0.55);
+}

@@ -70,6 +70,7 @@ export class Animator {
 
         this.tapActive = false;
         this.tapStart = 0;
+        this.wakeBeatStart = 0;
 
         this.level = 0;
         this.speechLevel = 0;
@@ -144,7 +145,11 @@ export class Animator {
         this.prevState = this.state;
         this.state = newState;
         this.stateStart = now;
-        this.poseOverride = null;
+        // Keep a just-triggered wake surprise when transitioning to Listening.
+        const keepWakeBeat =
+            this.wakeBeatStart > 0 && now - this.wakeBeatStart < 900 &&
+            newState === STATES.LISTENING;
+        if (!keepWakeBeat) this.poseOverride = null;
         this.tapActive = false;
         this.idleBeatStart = 0;
         this.sleeping = false;
@@ -221,6 +226,13 @@ export class Animator {
             duration: dur,
             loop: false,
         };
+    }
+
+    /** Wake word fired: short surprise, then whatever the runtime sets. */
+    triggerWake(now = performance.now()) {
+        this.wakeBeatStart = now;
+        this.noteInteraction(now);
+        this.poseOverride = { pose: 'surprise', start: now, duration: 900, loop: false };
     }
 
     getPoseImage(pose) {

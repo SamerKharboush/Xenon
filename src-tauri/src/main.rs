@@ -11,6 +11,7 @@ mod screenshot;
 mod tools;
 mod tts;
 mod ui;
+mod voice;
 
 use std::sync::Arc;
 use tauri::{Manager, Runtime as TauriRuntime};
@@ -88,6 +89,9 @@ fn main() -> anyhow::Result<()> {
                     .audio_sender(),
                 app.handle().clone(),
                 config.clone(),
+                app.try_state::<Runtime>()
+                    .expect("runtime must be managed")
+                    .speaking_flag(),
             ));
 
             // Cmd+Shift+Space force-listen (barge-in from Speaking).
@@ -159,6 +163,13 @@ fn main() -> anyhow::Result<()> {
             ui::stop_speaking,
             permissions::get_permissions,
             permissions::open_permission_settings,
+            voice::start_listening,
+            voice::list_voices,
+            voice::import_voice_folder,
+            voice::preview_voice,
+            voice::record_clone,
+            voice::open_typed_message,
+            voice::set_typing,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -173,10 +184,21 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
 
     let show_item = MenuItem::with_id(app, "show", "Show Pet", true, None::<&str>)?;
     let talk_item = MenuItem::with_id(app, "talk", "Talk", true, None::<&str>)?;
+    let type_item = MenuItem::with_id(app, "type", "Type a message…", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&show_item, &talk_item, &settings_item, &sep, &quit_item])?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &show_item,
+            &talk_item,
+            &type_item,
+            &settings_item,
+            &sep,
+            &quit_item,
+        ],
+    )?;
 
     let mut builder = TrayIconBuilder::with_id("main")
         .tooltip("Xenon")
@@ -198,6 +220,9 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
                 } else {
                     log::warn!("tray Talk: audio pipeline not available");
                 }
+            }
+            "type" => {
+                let _ = voice::open_typed_message(app.app_handle().clone());
             }
             "settings" => {
                 let _ = ui::open_settings(app.app_handle().clone());
