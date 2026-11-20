@@ -11,9 +11,10 @@ mod screenshot;
 mod tools;
 mod tts;
 mod ui;
+mod updater;
 
 use std::sync::Arc;
-use tauri::{Manager, Runtime as TauriRuntime};
+use tauri::{Emitter, Manager, Runtime as TauriRuntime};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use tokio::sync::RwLock;
 
@@ -128,6 +129,12 @@ fn main() -> anyhow::Result<()> {
             app.manage(ui::AppState::new(audio_tx));
             app.manage(config.clone());
 
+            // In-app update check (GitHub Releases). Managed state + a single
+            // setup call that starts the 24 h scheduler.
+            let updater_state = std::sync::Arc::new(updater::UpdaterState::default());
+            app.manage(updater_state.clone());
+            updater::setup(app.handle(), config.clone(), updater_state);
+
             // macOS menu-bar tray (skipTaskbar means the Dock is hidden).
             setup_tray(app)?;
 
@@ -159,6 +166,10 @@ fn main() -> anyhow::Result<()> {
             ui::stop_speaking,
             permissions::get_permissions,
             permissions::open_permission_settings,
+            updater::get_update_status,
+            updater::check_now,
+            updater::skip_update,
+            updater::install_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -176,7 +187,20 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     let settings_item = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&show_item, &talk_item, &settings_item, &sep, &quit_item])?;
+    let menu = Menu::with_items(
+        app,
+        &[&show_item, &talk_item, &settings_item, &sep, &quit_item],
+    )?;
+
+    // Hand the tray menu + a detached update item to the updater. It appends
+    // the item ("Update to vX.Y.Z…") only when a newer release is found, so the
+    // menu stays clean until then.
+    if let Some(state) = app.try_state::<std::sync::Arc<updater::UpdaterState>>() {
+        let update_item =
+            MenuItem::with_id(app, "update", "Update available", false, None::<&str>)?;
+        *state.menu.blocking_write() = Some(menu.clone());
+        *state.update_item.blocking_write() = Some(update_item);
+    }
 
     let mut builder = TrayIconBuilder::with_id("main")
         .tooltip("Xenon")
@@ -201,6 +225,21 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             }
             "settings" => {
                 let _ = ui::open_settings(app.app_handle().clone());
+            }
+            "update" => {
+                // Same path as Settings → Update: download, verify, open DMG.
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(state) =
+                        app.try_state::<std::sync::Arc<updater::UpdaterState>>()
+                    {
+                        let st = state.inner().clone();
+                        if let Err(e) = updater::install_update_impl(&app, &st).await {
+                            log::warn!("tray update failed: {e}");
+                            let _ = app.emit("xenon-notice", format!("Update failed: {e}"));
+                        }
+                    }
+                });
             }
             "quit" => {
                 app.exit(0);

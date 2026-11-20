@@ -10,11 +10,30 @@ A local-first macOS menu-bar pet that listens, thinks, speaks, and drives your c
 - Hand-rolled ReAct agent loop (ADR-0004) with computer-control tools: `look`, `click`, `type_text`, `press_keys`, `scroll`, `open_app`, `wait`. Clicks use VLM grounding on a ≤512×512 screenshot mapped back to screen coordinates (Retina-aware). A verification screenshot is taken after each action; max steps configurable.
 - Provider Hub: OpenAI-compatible profiles with configurable fallback order. Presets for Ollama (`http://localhost:11434/v1`), LM Studio (`http://localhost:1234/v1`), OpenAI, Gemini, and Anthropic (OpenAI-compatible endpoints). Separate vision model per profile.
 
-## Install
+## Download
 
-Download `Xenon_0.2.0_universal.dmg` from a release, open it, and drag Xenon to Applications.
+Download the latest universal DMG from
+[GitHub Releases](https://github.com/SamerKharboush/Xenon/releases/latest)
+(`Xenon_<version>_universal.dmg`). It contains both Intel and Apple Silicon
+slices. Each release also ships a zipped `Xenon.app` and a `SHA256SUMS` file.
+
+Open the DMG and drag Xenon to Applications.
 
 The build is unsigned/ad-hoc (ADR-0007), so macOS Gatekeeper blocks it on first launch. Right-click the app → **Open**, then confirm. Do this once.
+
+### Automatic update check
+
+Xenon checks GitHub Releases for a newer version 60 seconds after launch (if it
+hasn't checked in the last 24 hours), then every 24 hours while running. When a
+new version is found the pet shows a bubble ("Xenon vX.Y.Z is available") and a
+**"Update to vX.Y.Z…"** tray item appears. Clicking it downloads the DMG to
+`~/Downloads`, verifies its SHA-256 against the release's `SHA256SUMS`, and opens
+it — you still drag it to Applications yourself. No update is ever installed
+silently.
+
+Settings → **Updates** lets you turn automatic checks off, force a check, see
+the result, or **Skip this version**. The last-check time and skipped version are
+stored in your config. See [RELEASING.md](RELEASING.md) for how releases are cut.
 
 ## First run
 
@@ -90,6 +109,7 @@ Core modules (`src-tauri/src/`):
 | `tools.rs` | Tool trait + implementations |
 | `tts.rs` | TTS engine (sherpa-onnx) |
 | `ui.rs` | Tauri window management (incl. lazy Settings/Onboarding windows) |
+| `updater.rs` | In-app update check against GitHub Releases (download + SHA-256 verify) |
 
 Two extra helper scripts live in `scripts/`: `measure-ram.sh` (memory, above) and
 `resize-sprites.sh` (regenerates `src/sprites/light/` from `src/sprites/`).

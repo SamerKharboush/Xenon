@@ -65,6 +65,12 @@ base64 = "0.22"
 # Config directory
 dirs = "5.0"
 
+# Version comparison for the in-app update check.
+semver = "1.0"
+
+# SHA-256 verification of the downloaded DMG (against the release SHA256SUMS).
+sha2 = "0.10"
+
 # Global cursor position for click-through hit-testing.
 # CGEventGetLocation needs no Accessibility grant (unlike enigo input synthesis).
 core-graphics = "0.24"

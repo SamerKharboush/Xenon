@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Universal (x86_64 + aarch64) build needs both Apple targets; macos-14 is
+    # Apple Silicon, which cross-compiles the Intel slice fine.
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the release notes can diff against the previous tag.
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          CONF=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' src-tauri/tauri.conf.json | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+          echo "conf_version=$CONF" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "tag_version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          else
+            # workflow_dispatch: tag is derived from the config version.
+            echo "tag=v$CONF" >> "$GITHUB_OUTPUT"
+            echo "tag_version=$CONF" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolved config version: $CONF"
+
+      - name: Verify tag matches tauri.conf.json version
+        run: |
+          TAGV="${{ steps.ver.outputs.tag_version }}"
+          CONFV="${{ steps.ver.outputs.conf_version }}"
+          echo "tag version:    $TAGV"
+          echo "conf version:   $CONFV"
+          if [ "$TAGV" != "$CONFV" ]; then
+            echo "::error::Tag version ($TAGV) does not match tauri.conf.json version ($CONFV). Bump the config and re-tag."
+            exit 1
+          fi
+
+      - name: Install Rust (stable + universal targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Cache tauri-cli
+        id: tauri-cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-tauri
+          key: tauri-cli-${{ runner.os }}-v2
+
+      - name: Install tauri-cli
+        if: steps.tauri-cli-cache.outputs.cache-hit != 'true'
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build universal DMG
+        working-directory: src-tauri
+        run: cargo tauri build --bundles app,dmg --target universal-apple-darwin
+
+      - name: Collect artifacts
+        id: artifacts
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.tag_version }}"
+          DIST=dist
+          rm -rf "$DIST" && mkdir -p "$DIST"
+
+          BUNDLE=src-tauri/target/universal-apple-darwin/release/bundle
+          DMG=$(find "$BUNDLE/dmg" -maxdepth 1 -name '*.dmg' | head -1)
+          APP=$(find "$BUNDLE/macos" -maxdepth 1 -name '*.app' | head -1)
+
+          if [ -z "$DMG" ] || [ ! -f "$DMG" ]; then
+            echo "::error::No DMG produced under $BUNDLE/dmg"; exit 1
+          fi
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "::error::No .app produced under $BUNDLE/macos"; exit 1
+          fi
+
+          DMG_NAME="Xenon_${VER}_universal.dmg"
+          ZIP_NAME="Xenon_${VER}_universal.app.zip"
+
+          cp "$DMG" "$DIST/$DMG_NAME"
+
+          # ditto preserves the macOS bundle metadata, unlike zip(1).
+          ditto -c -k --keepParent "$APP" "$DIST/$ZIP_NAME"
+
+          (
+            cd "$DIST"
+            shasum -a 256 "$DMG_NAME" "$ZIP_NAME" > SHA256SUMS
+          )
+
+          echo "dmg_name=$DMG_NAME" >> "$GITHUB_OUTPUT"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          ls -la "$DIST"
+
+      - name: Release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          PREV=$(git describe --tags --abbrev=0 "${GITHUB_REF}^" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            echo "body<<EOF" >> "$GITHUB_OUTPUT"
+            echo "## What's Changed" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            git log --pretty=format:'- %s (%h)' "$PREV..${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            echo "**Full Changelog**: https://github.com/SamerKharboush/Xenon/compare/$PREV...${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "body<<EOF" >> "$GITHUB_OUTPUT"
+            echo "## What's Changed" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            git log --pretty=format:'- %s (%h)' "${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Xenon ${{ steps.ver.outputs.tag_version }}
+          body: ${{ steps.notes.outputs.body }}
+          files: |
+            dist/Xenon_${{ steps.ver.outputs.tag_version }}_universal.dmg
+            dist/Xenon_${{ steps.ver.outputs.tag_version }}_universal.app.zip
+            dist/SHA256SUMS
