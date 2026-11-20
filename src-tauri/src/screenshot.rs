@@ -100,7 +100,30 @@ pub fn fit_downscale(w: u32, h: u32, max_side: u32) -> (u32, u32) {
 /// Capture the monitor under the cursor, or the primary monitor when the
 /// cursor cannot be located.
 pub fn capture() -> Result<Screenshot> {
+    maybe_request_screen_recording();
     capture_monitor(None)
+}
+
+/// On the agent's first screenshot, ask macOS for Screen Recording if it has
+/// not been granted yet (CGPreflight/CGRequestScreenCaptureAccess). This is the
+/// only place the app triggers the system prompt outside onboarding/Settings.
+/// Guarded by a process-wide one-shot flag; never touches TCC directly.
+fn maybe_request_screen_recording() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ASKED: AtomicBool = AtomicBool::new(false);
+    if ASKED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        if !CGPreflightScreenCaptureAccess() {
+            CGRequestScreenCaptureAccess();
+        }
+    }
+}
+
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess();
 }
 
 /// Capture a specific monitor by index, or the cursor/primary monitor when

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Xenon pet state preview</title>
+    <style>
+        html, body { margin: 0; padding: 0; background: transparent; }
+        body { width: 320px; height: 300px; overflow: hidden; }
+        #canvas { display: block; }
+    </style>
+    <!-- Stub the Tauri bridge the renderer expects; no real invoke/listen. -->
+    <script>
+        window.__TAURI__ = {
+            core: {
+                invoke: (cmd, args) => {
+                    if (cmd === 'get_config') {
+                        return Promise.resolve({ light_sprites: true, idle_power_saver: false, click_to_talk: true });
+                    }
+                    return Promise.resolve(null);
+                },
+            },
+            event: { listen: () => Promise.resolve(() => {}) },
+            window: { getCurrentWindow: () => ({ close: () => {}, startDragging: () => Promise.resolve() }) },
+            app: { exit: () => {} },
+        };
+    </script>
+</head>
+<body>
+    <canvas id="canvas" width="320" height="300"></canvas>
+    <script type="module" src="/pet/renderer.js"></script>
+    <script type="module">
+        // renderer.js auto-instantiates on DOMContentLoaded and exposes
+        // window.__xenonRenderer. Wait for it, then force a state + demo pose.
+        window.addEventListener('DOMContentLoaded', () => {
+            const params = new URLSearchParams(location.search);
+            const state = params.get('state') || 'Idle';
+            const ready = () => {
+                const r = window.__xenonRenderer;
+                if (!r) { setTimeout(ready, 50); return; }
+                r.animator.setState(state, performance.now());
+                if (state === 'Listening') {
+                    r.animator.setLevel(0.7);
+                } else if (state === 'Speaking') {
+                    r.animator.setSpeechLevel(0.6);
+                } else if (state === 'Agentic') {
+                    r.animator.setFocus(0.7, 0.4);
+                }
+            };
+            ready();
+        });
+    </script>
+</body>
+</html>

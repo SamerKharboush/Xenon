@@ -162,7 +162,7 @@ fn main() -> anyhow::Result<()> {
             // If permissions are missing, show the onboarding window (created
             // on demand so it costs no WebContent process until needed).
             let perms = permissions::get_permissions();
-            if !perms.accessibility || !perms.screen_recording {
+            if !perms.accessibility.granted || !perms.screen_recording.granted {
                 let _ = ui::show_onboarding(app.handle());
             }
 
@@ -181,6 +181,7 @@ fn main() -> anyhow::Result<()> {
             ui::open_settings,
             ui::stop_speaking,
             permissions::get_permissions,
+            permissions::request_permission,
             permissions::open_permission_settings,
             updater::get_update_status,
             updater::check_now,

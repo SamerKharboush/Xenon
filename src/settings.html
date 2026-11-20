@@ -411,9 +411,33 @@
             <div class="perm-section">
                 <div>
                     <div class="perm-label">macOS Permissions</div>
-                    <div class="perm-desc">Accessibility, Screen Recording, Microphone</div>
+                    <div class="perm-desc" id="perm-summary">Checking…</div>
                 </div>
-                <button class="secondary btn-sm" id="open-permissions">Check</button>
+                <button class="secondary btn-sm" id="open-permissions">Re-check</button>
+            </div>
+            <div class="perm-section">
+                <div>
+                    <div class="perm-label">Microphone</div>
+                    <div class="perm-desc" id="perm-mic">Checking…</div>
+                </div>
+                <button class="secondary btn-sm" id="req-mic">Request</button>
+                <button class="secondary btn-sm" id="open-mic">Settings</button>
+            </div>
+            <div class="perm-section">
+                <div>
+                    <div class="perm-label">Screen Recording</div>
+                    <div class="perm-desc" id="perm-screen">Checking…</div>
+                </div>
+                <button class="secondary btn-sm" id="req-screen">Request</button>
+                <button class="secondary btn-sm" id="open-screen">Settings</button>
+            </div>
+            <div class="perm-section">
+                <div>
+                    <div class="perm-label">Accessibility</div>
+                    <div class="perm-desc" id="perm-ax">Checking…</div>
+                </div>
+                <button class="secondary btn-sm" id="req-ax">Request</button>
+                <button class="secondary btn-sm" id="open-ax">Settings</button>
             </div>
         </div>
 
@@ -967,17 +991,54 @@
                 status.textContent = 'Saved ' + result.wav + ' — transcript: ' + result.transcript;
             } catch (e) { status.textContent = 'Clone recording failed: ' + e; }
         });
-        document.getElementById('open-permissions').addEventListener('click', async () => {
+        // ---- Permissions ------------------------------------------------------
+
+        function permText(entry) {
+            if (!entry) return 'unknown';
+            return entry.granted ? '✓ Granted' : ('✗ ' + (entry.state || 'not granted'));
+        }
+
+        async function refreshPermissions() {
             try {
-                const perms = await invoke('get_permissions');
-                const parts = [];
-                parts.push(`Accessibility: ${perms.accessibility ? '✓' : '✗'}`);
-                parts.push(`Screen Recording: ${perms.screen_recording ? '✓' : '✗'}`);
-                showStatus(parts.join(' • '));
+                const p = await invoke('get_permissions');
+                document.getElementById('perm-mic').textContent = permText(p.microphone);
+                document.getElementById('perm-screen').textContent = permText(p.screenRecording);
+                document.getElementById('perm-ax').textContent = permText(p.accessibility);
+                document.getElementById('perm-summary').textContent =
+                    `Accessibility: ${p.accessibility.granted ? '✓' : '✗'} • ` +
+                    `Screen Recording: ${p.screenRecording.granted ? '✓' : '✗'} • ` +
+                    `Microphone: ${p.microphone.granted ? '✓' : '✗'}`;
             } catch (e) {
-                showStatus('Could not check permissions: ' + e, true);
+                document.getElementById('perm-summary').textContent = 'Could not check permissions: ' + e;
             }
-        });
+        }
+
+        function wirePermRequest(btnId, area) {
+            document.getElementById(btnId).addEventListener('click', async () => {
+                try {
+                    await invoke('request_permission', { area });
+                } catch (e) {
+                    showStatus('Could not request ' + area + ': ' + e, true);
+                }
+                await refreshPermissions();
+            });
+        }
+        function wirePermOpen(btnId, area) {
+            document.getElementById(btnId).addEventListener('click', async () => {
+                try {
+                    await invoke('open_permission_settings', { area });
+                } catch (e) {
+                    showStatus('Could not open settings: ' + e, true);
+                }
+            });
+        }
+        document.getElementById('open-permissions').addEventListener('click', refreshPermissions);
+        wirePermRequest('req-mic', 'microphone');
+        wirePermRequest('req-screen', 'screen');
+        wirePermRequest('req-ax', 'accessibility');
+        wirePermOpen('open-mic', 'microphone');
+        wirePermOpen('open-screen', 'screen');
+        wirePermOpen('open-ax', 'accessibility');
 
         // ---- Updates ---------------------------------------------------------
 
@@ -1033,6 +1094,7 @@
         loadPresets();
 
         loadConfig().then(loadVoices);
+        refreshPermissions();
     </script>
 </body>
 </html>

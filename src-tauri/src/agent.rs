@@ -1284,6 +1284,93 @@ mod tests {
             .any(|a| matches!(a, AgentAction::Speak(s) if s.contains("text protocol"))));
     }
 
+    /// First sentence is spoken before the stream ends.
+    ///
+    /// A mock provider emits the first sentence, then waits 300 ms before
+    /// emitting the rest. The first `Speak` action must arrive measurably
+    /// before the stream finishes — i.e. the agent does not buffer the whole
+    /// completion before synthesising. This is the PRD §3.2 "speak before the
+    /// LLM finishes generating the full sentence" requirement, measured in ms.
+    #[tokio::test]
+    async fn test_first_sentence_spoken_before_stream_ends() {
+        struct SlowMockProvider;
+
+        #[async_trait]
+        impl Provider for SlowMockProvider {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream> {
+                Ok(Box::pin(futures::stream::unfold(0usize, |i| async move {
+                    if i == 3 {
+                        return None;
+                    }
+                    let content = match i {
+                        0 => "First sentence. ".to_string(),
+                        1 => "Second sentence. ".to_string(),
+                        _ => "Done.".to_string(),
+                    };
+                    let finish = if i == 2 { Some("stop".to_string()) } else { None };
+                    // Simulate the model still generating after the first
+                    // sentence is complete.
+                    if i < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                    Some((
+                        Ok(ChatChunk { content, tool_calls: vec![], finish_reason: finish }),
+                        i + 1,
+                    ))
+                })))
+            }
+
+            async fn chat(&self, _req: ChatRequest) -> Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        let provider = Arc::new(SlowMockProvider);
+        let agent = Arc::new(Agent::new(provider, vec![], crate::config::XenonConfig::default()));
+        let (tx, rx) = async_channel::bounded(32);
+
+        // Run the agent as a task so we can timestamp each Speak as it
+        // arrives on the channel, while the stream is still in progress.
+        let started = std::time::Instant::now();
+        let agent2 = agent.clone();
+        let handle = tokio::spawn(async move { agent2.run_utterance("Test", tx).await });
+        let mut speak_times: Vec<(String, u128)> = Vec::new();
+        while let Ok(a) = rx.recv().await {
+            if let AgentAction::Speak(s) = a {
+                speak_times.push((s, started.elapsed().as_millis()));
+            }
+        }
+        handle.await.unwrap().unwrap();
+        let total_ms = started.elapsed().as_millis();
+
+        assert!(
+            speak_times.iter().any(|(s, _)| s.contains("First sentence")),
+            "first sentence was not spoken"
+        );
+        let first_ms = speak_times
+            .iter()
+            .find(|(s, _)| s.contains("First sentence"))
+            .map(|(_, t)| *t)
+            .unwrap();
+        eprintln!(
+            "first sentence spoken at {first_ms} ms; stream total {total_ms} ms; speaks: {:?}",
+            speak_times.iter().map(|(s, t)| (s.as_str(), *t)).collect::<Vec<_>>()
+        );
+        // The stream had ~600 ms of post-first-sentence generation (2×300 ms).
+        // The first sentence must be spoken well before that.
+        assert!(
+            first_ms < 500,
+            "first sentence spoken at {first_ms} ms — too late (stream not streamed)"
+        );
+        assert!(
+            total_ms >= 500,
+            "stream ended too fast ({total_ms} ms) for the test to be meaningful"
+        );
+        // And the first sentence must precede the last.
+        let last_ms = speak_times.last().map(|(_, t)| *t).unwrap_or(u128::MAX);
+        assert!(first_ms < last_ms, "first sentence must precede the last");
+    }
+
     /// `remember` notes are fed back into the next turn.
     #[tokio::test]
     async fn test_agent_feeds_notes_back() {

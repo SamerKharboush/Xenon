@@ -126,6 +126,54 @@ struct Worker {
     last_speech: Instant,
     last_level: Instant,
     model_notice_sent: bool,
+    /// A wake_word/always session wants the mic open. When the stream is not
+    /// open (startup failure, device unplugged, stream error) the worker keeps
+    /// retrying open_capture() on a backoff instead of giving up until restart.
+    mic_want_open: bool,
+    /// When to next attempt open_capture(); None = no retry pending.
+    mic_retry_at: Option<Instant>,
+    /// Current retry delay (5 s → 30 s max, doubling).
+    mic_retry_delay: Duration,
+    /// Set by the cpal error callback (runs on cpal's thread) so the worker
+    /// reopens the stream on the next tick.
+    stream_failed: Arc<AtomicBool>,
+    /// Last mic-open error, for a one-shot "permission denied" vs device notice.
+    mic_error_notice_sent: bool,
+}
+
+/// Mic-open retry schedule: start at 5 s, double each failure, cap at 30 s.
+/// Pure so it is unit-testable without a device.
+fn next_mic_backoff(current: Duration) -> Duration {
+    const START: Duration = Duration::from_secs(5);
+    const MAX: Duration = Duration::from_secs(30);
+    if current.is_zero() {
+        return START;
+    }
+    let doubled = current.saturating_mul(2);
+    doubled.min(MAX)
+}
+
+/// Classify a mic-open failure so the user gets a precise message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicErrorKind {
+    /// Microphone TCC grant is missing/denied — point at System Settings.
+    PermissionDenied,
+    /// No input device, wrong format, unplugged — a device problem.
+    Device,
+}
+
+/// Classify by the underlying error text plus the live AVFoundation mic grant.
+/// cpal surfaces a missing macOS mic grant as "no supported input config …
+/// Unknown property"; the AV status is the authoritative signal.
+pub fn classify_mic_error(err_text: &str, mic_granted: bool) -> MicErrorKind {
+    let lower = err_text.to_ascii_lowercase();
+    let looks_like_permission =
+        lower.contains("no supported input config") || lower.contains("unknown property");
+    if !mic_granted || looks_like_permission {
+        MicErrorKind::PermissionDenied
+    } else {
+        MicErrorKind::Device
+    }
 }
 
 fn worker(
@@ -175,6 +223,11 @@ fn worker(
         last_speech: Instant::now(),
         last_level: Instant::now(),
         model_notice_sent: false,
+        mic_want_open: false,
+        mic_retry_at: None,
+        mic_retry_delay: Duration::from_secs(5),
+        stream_failed: Arc::new(AtomicBool::new(false)),
+        mic_error_notice_sent: false,
     };
 
     // Wake-word mode keeps capture + VAD warm but the main STT model lazy.
@@ -225,6 +278,7 @@ impl Worker {
 
         self.refresh_config();
         self.tick_timers();
+        self.tick_mic_retry();
         true
     }
 
@@ -252,7 +306,28 @@ impl Worker {
                     WAKE_MAX_SPEECH_MS,
                 );
             }
+            let listen_mode_changed = new.listen_mode != self.cfg.listen_mode;
+            let device_changed = new.whisper_model_path != self.cfg.whisper_model_path
+                || new.vad_model_path != self.cfg.vad_model_path;
             self.cfg = new;
+            if listen_mode_changed {
+                // Switching into/out of wake/always mode changes whether a
+                // warm mic is wanted. Reopen (or stop retrying) immediately.
+                if self.cfg.listen_mode == "always" || self.cfg.listen_mode == "wake_word" {
+                    if self.stream.is_none() {
+                        self.mic_want_open = true;
+                        self.mic_retry_at = Some(Instant::now());
+                    }
+                } else {
+                    self.mic_want_open = false;
+                    self.mic_retry_at = None;
+                }
+            }
+            if device_changed && self.stream.is_some() {
+                // Model paths changing mid-run: drop the stream so it reopens
+                // fresh against the (possibly new) device config.
+                self.stream_failed.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -323,25 +398,65 @@ impl Worker {
         self.since_vad = 0;
         self.last_speech = Instant::now();
 
-        if let Err(e) = self.open_capture() {
-            log::error!("audio: failed to open capture: {e:#}");
-            self.emit_notice(&format!(
-                "Couldn't open the microphone ({e}). Grant access in System \
-                 Settings -> Privacy & Security -> Microphone, then try the \
-                 hotkey again."
-            ));
-            self.close_session();
-            return;
+        // Wake-word / always mode keeps a warm mic: mark it wanted so the
+        // retry loop reopens on failure. Hotkey/always-with-force sessions do
+        // not keep retrying after the window closes.
+        self.mic_want_open = self.cfg.listen_mode == "always" || self.cfg.listen_mode == "wake_word";
+
+        match self.open_capture() {
+            Ok(()) => {
+                self.mic_retry_at = None;
+                self.mic_retry_delay = Duration::from_secs(5);
+                self.mic_error_notice_sent = false;
+            }
+            Err(e) => {
+                log::error!("audio: failed to open capture: {e:#}");
+                self.mic_error_notice(&e);
+                if self.mic_want_open {
+                    // Schedule a retry instead of giving up until restart.
+                    self.mic_retry_at = Some(Instant::now() + self.mic_retry_delay);
+                    self.mic_retry_delay = next_mic_backoff(self.mic_retry_delay);
+                    log::info!(
+                        "audio: will retry microphone in {:?}",
+                        self.mic_retry_delay
+                    );
+                }
+                self.close_session();
+            }
         }
         if self.cfg.listen_mode == "hotkey" && force {
             // Hotkey mode: show Listening immediately. Wake mode gets its
             // Listening transition from the Wake event; always mode stays Idle.
             self.emit(AudioEvent::Listening);
         }
-        log::info!(
-            "audio: capture open (force={force}, rate={} Hz)",
-            self.native_rate
-        );
+        if self.stream.is_some() {
+            log::info!(
+                "audio: capture open (force={force}, rate={} Hz)",
+                self.native_rate
+            );
+        }
+    }
+
+    /// One-shot user notice for a mic-open failure, distinguishing a missing
+    /// permission (→ System Settings) from a device error (unplugged/busy).
+    fn mic_error_notice(&mut self, err: &anyhow::Error) {
+        if self.mic_error_notice_sent {
+            return;
+        }
+        self.mic_error_notice_sent = true;
+        let mic_granted = crate::permissions::get_permissions().microphone.granted;
+        let text = err.to_string();
+        let msg = match classify_mic_error(&text, mic_granted) {
+            MicErrorKind::PermissionDenied => format!(
+                "Microphone access is off. Open System Settings → Privacy & Security → \
+                 Microphone and enable Xenon, then it will connect automatically. ({text})"
+            ),
+            MicErrorKind::Device => format!(
+                "Couldn't open the microphone ({text}). Check that a microphone is \
+                 connected and not in use by another app; Xenon will keep retrying."
+            ),
+        };
+        self.emit_notice(&msg);
     }
 
     /// Transcribe any still-open (partial) utterance, then close the session.
@@ -377,6 +492,9 @@ impl Worker {
         self.since_vad = 0;
         self.force = false;
         self.preloaded = false;
+        // Note: mic_want_open is intentionally NOT cleared here — open_session
+        // sets it and the retry loop owns it. Only a config change to hotkey
+        // mode or worker exit clears it.
     }
 
     /// Build and play a cpal input stream, wiring a fresh frame channel.
@@ -400,8 +518,11 @@ impl Worker {
         self.frame_rx = Some(frame_rx);
 
         let app = self.app.clone();
+        let failed = self.stream_failed.clone();
         let err_cb = move |e: cpal::StreamError| {
             log::warn!("audio: stream error: {e}");
+            // Wake/always mode: ask the worker to reopen on the next tick.
+            failed.store(true, Ordering::SeqCst);
             let _ = app.emit("xenon-notice", format!("Microphone stream error: {e}"));
         };
 
@@ -772,6 +893,59 @@ impl Worker {
         }
     }
 
+    /// Reopen the microphone on a backoff while a wake/always session wants it
+    /// open. Also reopens immediately when the cpal stream reports an error
+    /// (device unplugged / default input changed). Reset the backoff on success.
+    fn tick_mic_retry(&mut self) {
+        // A stream error (device unplugged, format change) triggers an
+        // immediate reopen, not waiting for the timer.
+        let stream_broken = self.stream_failed.swap(false, Ordering::SeqCst);
+
+        // Config may have switched us out of wake/always mode.
+        if self.cfg.listen_mode != "always" && self.cfg.listen_mode != "wake_word" {
+            self.mic_want_open = false;
+            self.mic_retry_at = None;
+            return;
+        }
+
+        // If the mic is already open, nothing to do.
+        if self.stream.is_some() && !stream_broken {
+            return;
+        }
+
+        let due = match self.mic_retry_at {
+            Some(at) => Instant::now() >= at,
+            None => true,
+        };
+        if !due && !stream_broken {
+            return;
+        }
+
+        // Device change / stream error: reopen now. If a stream is somehow
+        // still present, drop it first.
+        if self.stream.is_some() {
+            self.stream = None;
+            self.frame_rx = None;
+        }
+
+        match self.open_capture() {
+            Ok(()) => {
+                self.mic_retry_at = None;
+                self.mic_retry_delay = Duration::from_secs(5);
+                self.mic_error_notice_sent = false;
+                log::info!("audio: microphone reopened");
+            }
+            Err(e) => {
+                log::warn!("audio: microphone reopen failed: {e:#}");
+                self.mic_error_notice(&e);
+                let delay = self.mic_retry_delay;
+                self.mic_retry_at = Some(Instant::now() + delay);
+                self.mic_retry_delay = next_mic_backoff(self.mic_retry_delay);
+                log::info!("audio: will retry microphone in {:?}", self.mic_retry_delay);
+            }
+        }
+    }
+
     fn maybe_emit_level(&mut self) {
         // ~30 Hz, and only while a speech segment is open (i.e. Listening).
         if self.last_level.elapsed() < LEVEL_INTERVAL {
@@ -1061,6 +1235,47 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert!((v[0] - 0.0).abs() < 1e-6);
         assert!((v[1] - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mic_backoff_starts_at_5s_doubles_and_caps_at_30s() {
+        // 0 (unset) -> 5s
+        assert_eq!(next_mic_backoff(Duration::ZERO), Duration::from_secs(5));
+        // 5 -> 10 -> 20 -> 30 (capped) -> 30 ...
+        let mut d = next_mic_backoff(Duration::ZERO);
+        assert_eq!(d, Duration::from_secs(5));
+        d = next_mic_backoff(d);
+        assert_eq!(d, Duration::from_secs(10));
+        d = next_mic_backoff(d);
+        assert_eq!(d, Duration::from_secs(20));
+        d = next_mic_backoff(d);
+        assert_eq!(d, Duration::from_secs(30));
+        d = next_mic_backoff(d);
+        assert_eq!(d, Duration::from_secs(30), "must cap at 30s");
+    }
+
+    #[test]
+    fn classify_mic_error_distinguishes_permission_from_device() {
+        // Missing grant -> permission denied even with a generic cpal message.
+        let cpal_perm = "no supported input config: A backend-specific error has occurred: Unknown property";
+        assert_eq!(
+            classify_mic_error(cpal_perm, false),
+            MicErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            classify_mic_error(cpal_perm, true),
+            MicErrorKind::PermissionDenied,
+            "the 'unknown property' signature means permission regardless of the bool"
+        );
+        // Grant present + a real device error -> device.
+        assert_eq!(
+            classify_mic_error("no default input device", true),
+            MicErrorKind::Device
+        );
+        assert_eq!(
+            classify_mic_error("device not found", true),
+            MicErrorKind::Device
+        );
     }
 
     #[test]

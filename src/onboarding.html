@@ -83,6 +83,7 @@
                 <div class="permission-title">Accessibility</div>
                 <div class="permission-desc">Required to click, type, and press keyboard shortcuts. Go to System Settings → Privacy &amp; Security → Accessibility and toggle on Xenon.</div>
                 <span id="status-accessibility" class="status-badge status-missing">Checking…</span><br>
+                <button class="open-settings-btn" id="request-accessibility" onclick="requestPermission('accessibility')">Request</button>
                 <button class="open-settings-btn" onclick="openSettings('accessibility')">Open Settings</button>
             </div>
         </div>
@@ -93,6 +94,7 @@
                 <div class="permission-title">Screen Recording</div>
                 <div class="permission-desc">Required to take screenshots so Xenon can see what is on screen. Go to System Settings → Privacy &amp; Security → Screen Recording and toggle on Xenon.</div>
                 <span id="status-screen" class="status-badge status-missing">Checking…</span><br>
+                <button class="open-settings-btn" id="request-screen" onclick="requestPermission('screen')">Request</button>
                 <button class="open-settings-btn" onclick="openSettings('screen')">Open Settings</button>
             </div>
         </div>
@@ -103,6 +105,7 @@
                 <div class="permission-title">Microphone</div>
                 <div class="permission-desc">Required for voice input. Go to System Settings → Privacy &amp; Security → Microphone and toggle on Xenon.</div>
                 <span id="status-microphone" class="status-badge status-missing">Required for voice</span><br>
+                <button class="open-settings-btn" id="request-microphone" onclick="requestPermission('microphone')">Request</button>
                 <button class="open-settings-btn" onclick="openSettings('microphone')">Open Settings</button>
             </div>
         </div>
@@ -116,13 +119,15 @@
     <script>
         const { invoke } = window.__TAURI__.core;
 
-        function setStatus(id, ok, okText, missingText) {
+        function setStatus(id, entry, okText, missingText) {
             const el = document.getElementById(id);
-            if (ok) {
+            const granted = entry ? entry.granted : false;
+            if (granted) {
                 el.textContent = okText;
                 el.className = 'status-badge status-ok';
             } else {
-                el.textContent = missingText;
+                const state = entry && entry.state ? entry.state : 'not-granted';
+                el.textContent = missingText.replace('{state}', state);
                 el.className = 'status-badge status-missing';
             }
         }
@@ -131,15 +136,11 @@
             try {
                 const perms = await invoke('get_permissions');
                 setStatus('status-accessibility', perms.accessibility, '✓ Granted', '✗ Not granted');
-                setStatus('status-screen', perms.screen_recording, '✓ Granted', '✗ Not granted');
-
-                // Microphone is not checked via FFI; show a hint.
-                const micEl = document.getElementById('status-microphone');
-                micEl.textContent = 'Check in Settings';
-                micEl.className = 'status-badge status-missing';
+                setStatus('status-screen', perms.screenRecording, '✓ Granted', '✗ Not granted');
+                setStatus('status-microphone', perms.microphone, '✓ Granted', '✗ {state}');
 
                 // Auto-close if everything granted.
-                if (perms.accessibility && perms.screen_recording) {
+                if (perms.accessibility.granted && perms.screenRecording.granted && perms.microphone.granted) {
                     document.getElementById('done-btn').textContent = 'Done ✓';
                 }
             } catch (e) {
@@ -153,6 +154,20 @@
             } catch (e) {
                 console.error('open_permission_settings failed:', e);
             }
+        }
+
+        // Request the permission in-app where the OS allows it (mic, screen),
+        // then re-read the real status. Accessibility only opens Settings.
+        async function requestPermission(area) {
+            const btn = document.getElementById('request-' + area);
+            if (btn) { btn.disabled = true; btn.textContent = 'Requesting…'; }
+            try {
+                await invoke('request_permission', { area });
+            } catch (e) {
+                console.error('request_permission failed:', e);
+            }
+            await checkPermissions();
+            if (btn) { btn.disabled = false; btn.textContent = 'Request'; }
         }
 
         function checkAgain() {

@@ -77,6 +77,14 @@ keyring = "3"
 # CGEventGetLocation needs no Accessibility grant (unlike enigo input synthesis).
 core-graphics = "0.24"
 
+# macOS permission status: AVFoundation reports the *real* Microphone grant
+# (AVCaptureDevice authorizationStatusForMediaType:) and requests it from the
+# onboarding/settings button. MIT/Apache; already in the tree via xcap/cpal.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSDictionary", "NSValue"] }
+objc2-av-foundation = { version = "0.3", features = ["AVCaptureDevice", "AVMediaFormat", "block2"] }
+block2 = "0.6"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

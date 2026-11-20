@@ -10,6 +10,13 @@
 #
 # After this prints, run:
 #   git push origin main && git push origin v0.3.0
+#
+# CI (.github/workflows/release.yml) builds the app bundle, re-signs it with
+# scripts/sign-app.sh (stable identifier requirement so TCC permission grants
+# survive rebuilds), then packages scripts/make-dmg.sh output into the DMG.
+# For a LOCAL build, run scripts/sign-app.sh on the app bundle BEFORE making a
+# DMG — a plain `cargo tauri build --bundles dmg` would drop the signature and
+# reintroduce the cdhash/TCC problem.
 set -euo pipefail
 
 usage() {

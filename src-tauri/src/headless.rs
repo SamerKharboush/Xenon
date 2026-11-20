@@ -28,12 +28,12 @@ pub fn run_from_args(cfg: &XenonConfig) -> Option<i32> {
 
 fn run(task: &str, profile: Option<&str>, cfg: &XenonConfig) -> i32 {
     let perms = crate::permissions::get_permissions();
-    if !perms.accessibility || !perms.screen_recording {
+    if !perms.accessibility.granted || !perms.screen_recording.granted {
         eprintln!(
             "warning: macOS permissions missing (accessibility: {}, screen recording: {}). \
              Desktop steps will fail until both are granted in System Settings → \
              Privacy & Security.",
-            perms.accessibility, perms.screen_recording
+            perms.accessibility.granted, perms.screen_recording.granted
         );
     }
 

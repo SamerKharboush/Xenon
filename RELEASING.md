@@ -31,10 +31,30 @@ match it. The release workflow **fails** if a tag's version differs from
    git push origin v0.3.0
    ```
 
-   The push of `v*` triggers `.github/workflows/release.yml`, which builds the
-   universal DMG, zips the `.app` (`ditto -c -k --keepParent`), computes
-   `SHA256SUMS`, and creates the GitHub Release with notes generated from the
-   commits since the previous tag.
+    The push of `v*` triggers `.github/workflows/release.yml`, which:
+
+    1. builds the universal app bundle (`cargo tauri build --bundles app`);
+    2. re-signs it with `scripts/sign-app.sh` — ad-hoc, but with a stable
+       `designated => identifier "com.xenon.app"` requirement so macOS TCC keeps
+       the Microphone / Screen Recording / Accessibility grants across rebuilds
+       (a cdhash signature loses them on every build);
+    3. packages the signed app into `Xenon_<ver>_universal.dmg` with
+       `scripts/make-dmg.sh` (background + drag-to-Applications layout);
+    4. zips the `.app` (`ditto -c -k --keepParent`, signature preserved),
+       computes `SHA256SUMS`, and creates the GitHub Release with notes from the
+       commits since the previous tag.
+
+    ### Local build
+
+    ```bash
+    cd src-tauri && cargo tauri build --bundles app
+    scripts/sign-app.sh src-tauri/target/release/bundle/macos/Xenon.app
+    scripts/make-dmg.sh src-tauri/target/release/bundle/macos/Xenon.app dist/Xenon_local.dmg
+    ```
+
+    > Users upgrading from v0.2.0 must re-grant Microphone and Screen Recording
+    > once: the earlier build was cdhash-signed, so macOS treats it as a
+    > different app. This is a one-time step.
 
 ### Manual trigger
 
