@@ -30,6 +30,8 @@ fn api_url() -> String {
     std::env::var("XENON_UPDATE_API").unwrap_or_else(|_| API_URL.to_string())
 }
 const USER_AGENT: &str = "Xenon-Updater";
+/// Public Releases page, shown when a download ultimately fails.
+const RELEASES_PAGE: &str = "https://github.com/SamerKharboush/Xenon/releases";
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const STARTUP_DELAY: Duration = Duration::from_secs(60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -242,10 +244,54 @@ pub fn status_from(pending: Option<&PendingUpdate>, current: &str) -> UpdateStat
 
 // --- network -----------------------------------------------------------------
 
+fn http_timeout() -> Duration {
+    std::env::var("XENON_UPDATE_HTTP_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(HTTP_TIMEOUT)
+}
+
+/// Client for the small API / SHA256SUMS requests: a 10 s *total* timeout is
+/// fine there. The DMG download uses `download_client` instead — a total
+/// timeout would cut a large body mid-stream (the v0.3.0 → v0.3.1 bug).
 fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
-        .timeout(HTTP_TIMEOUT)
+        .timeout(http_timeout())
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Knobs for the DMG download. Injectable so tests can shrink timeouts.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadConfig {
+    /// TCP connect timeout.
+    pub connect_timeout: Duration,
+    /// Idle timeout *between chunks* (not a total deadline).
+    pub read_timeout: Duration,
+    /// Retries after a mid-body error (each resumes via HTTP Range).
+    pub max_retries: u32,
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(15),
+            read_timeout: Duration::from_secs(30),
+            max_retries: 3,
+        }
+    }
+}
+
+/// Client for the DMG download: no total timeout, an idle read timeout, and
+/// redirects followed (GitHub assets redirect to objects.githubusercontent.com).
+fn download_client(cfg: &DownloadConfig) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(cfg.connect_timeout)
+        .read_timeout(cfg.read_timeout)
+        .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .map_err(|e| e.to_string())
 }
@@ -492,12 +538,11 @@ async fn download_and_open(
         format!("Downloading Xenon v{}…", p.version),
     );
 
-    let client = http_client()?;
-
     // Fetch and verify the checksum first (so we can bail before downloading
-    // a multi-hundred-MB DMG that we can't validate).
+    // a multi-hundred-MB DMG that we can't validate). The small API client's
+    // 10 s total timeout is fine here.
     let expected = if let Some(url) = &p.checksums_url {
-        match fetch_checksums(&client, url).await {
+        match fetch_checksums(&http_client()?, url).await {
             Ok(sums) => expected_checksum(&sums, &p.dmg_name),
             Err(e) => {
                 log::warn!("checksum fetch failed: {e}");
@@ -508,75 +553,14 @@ async fn download_and_open(
         None
     };
 
-    let resp = client
-        .get(&p.dmg_url)
-        .send()
-        .await
-        .map_err(|e| format!("download failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("download HTTP {}", resp.status().as_u16()));
-    }
-
-    // Stream to disk so a multi-hundred-MB DMG never sits in memory, hashing
-    // incrementally and emitting progress via `xenon-notice`.
-    use futures_util::StreamExt;
-    use sha2::{Digest, Sha256};
-    use std::io::Write;
-
-    let total = resp.content_length().unwrap_or(0);
-    let mut file = std::fs::File::create(&dest).map_err(|e| e.to_string())?;
-    let mut hasher = Sha256::new();
-    let mut written: u64 = 0;
-    let mut last_pct: i64 = -1;
-    let mut last_notice = std::time::Instant::now();
-
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("download body failed: {e}"))?;
-        file.write_all(&chunk).map_err(|e| e.to_string())?;
-        hasher.update(&chunk);
-        written += chunk.len() as u64;
-
-        // Emit progress at most every ~5 s and only on a new 10% step.
-        // `total == 0` (unknown size) → -1, so no percentage is shown.
-        let pct: i64 = written
-            .saturating_mul(100)
-            .checked_div(total)
-            .map(|p| p as i64)
-            .unwrap_or(-1);
-        if pct >= 0 && pct != last_pct && last_notice.elapsed().as_secs() >= 5 {
-            last_pct = pct;
-            last_notice = std::time::Instant::now();
-            notify(
-                app,
-                format!(
-                    "Downloading Xenon v{}… {}%",
-                    p.version, pct
-                ),
-            );
-        }
-    }
-    file.flush().map_err(|e| e.to_string())?;
-    drop(file);
-
-    let digest = format!("{:x}", hasher.finalize());
-
-    if let Some(want) = &expected {
-        if !want.eq_ignore_ascii_case(&digest) {
-            let _ = fs::remove_file(&dest);
-            return Err(format!(
-                "checksum mismatch: expected {want}, got {digest}"
-            ));
-        }
-    } else {
-        log::warn!("no SHA-256 available for {}; skipping verification", p.dmg_name);
-    }
+    let cfg = DownloadConfig::default();
+    download_verified(&p.dmg_url, &dest, expected.as_deref(), &cfg, app, &p.version).await?;
 
     notify(
         app,
         format!(
             "Verified ({} MB). Opening — drag Xenon to Applications.",
-            (written as f64 / 1_048_576.0).round() as u64
+            (file_len(&dest) as f64 / 1_048_576.0).round() as u64
         ),
     );
 
@@ -590,6 +574,201 @@ async fn download_and_open(
     }
 
     log::info!("update DMG downloaded to {}", dest.display());
+    Ok(())
+}
+
+fn file_len(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Parse the total size out of a `Content-Range: bytes 0-9/123` header.
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    value
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// Stream `url` into `dest` (via a `.part` file), retrying up to
+/// `cfg.max_retries` times. A retry resumes with `Range: bytes=<written>-`
+/// when the server answers 206; if it answers 200 the partial file is
+/// discarded and the download restarts. The SHA-256 is hashed from the
+/// finished file and the `.part` is renamed only after it verifies.
+async fn download_verified(
+    url: &str,
+    dest: &std::path::Path,
+    expected: Option<&str>,
+    cfg: &DownloadConfig,
+    app: Option<&tauri::AppHandle>,
+    version: &str,
+) -> Result<(), String> {
+    use futures_util::StreamExt;
+    use sha2::{Digest, Sha256};
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut part = dest.as_os_str().to_os_string();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&part)
+        .map_err(|e| e.to_string())?;
+
+    let mut written: u64 = 0;
+    let mut total: u64 = 0;
+    let mut last_step: i64 = -1;
+    let mut attempt: u32 = 0;
+
+    loop {
+        // A fresh client per attempt: a connection that timed out or broke
+        // mid-body must not be reused from the pool.
+        let client = download_client(cfg)?;
+        let mut req = client.get(url);
+        if written > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={written}-"));
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt < cfg.max_retries {
+                    attempt += 1;
+                    log::warn!("download attempt {attempt} failed: {e}; resuming at {written}");
+                    continue;
+                }
+                let _ = fs::remove_file(&part);
+                return Err(format!(
+                    "download failed: {e} — download manually from {RELEASES_PAGE}"
+                ));
+            }
+        };
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            // Resume: keep the bytes already on disk (drop any stale tail).
+            file.set_len(written).map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::Start(written)).map_err(|e| e.to_string())?;
+            if let Some(v) = resp.headers().get(reqwest::header::CONTENT_RANGE) {
+                if let Some(t) = v.to_str().ok().and_then(parse_content_range_total) {
+                    total = t;
+                }
+            }
+        } else if status.is_success() {
+            // Server ignored the Range header: restart from scratch.
+            if written > 0 {
+                log::warn!("server ignored Range (HTTP {status}); restarting download");
+            }
+            file.set_len(0).map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            written = 0;
+            last_step = -1;
+            total = resp.content_length().unwrap_or(0);
+        } else {
+            let _ = fs::remove_file(&part);
+            return Err(format!(
+                "download HTTP {status} — download manually from {RELEASES_PAGE}"
+            ));
+        }
+
+        let mut failed: Option<String> = None;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    failed = Some(format!("download body failed: {e}"));
+                    break;
+                }
+            };
+            if let Err(e) = file.write_all(&chunk) {
+                failed = Some(e.to_string());
+                break;
+            }
+            written += chunk.len() as u64;
+
+            // Progress every 10%, with MB done/total (or just MB when the
+            // server didn't advertise a size).
+            let pct: i64 = written
+                .saturating_mul(100)
+                .checked_div(total)
+                .map(|p| p as i64)
+                .unwrap_or(-1);
+            let step: i64 = if total > 0 {
+                pct / 10
+            } else {
+                // Unknown size: emit once per MB.
+                (written / 1_048_576) as i64
+            };
+            if step != last_step {
+                last_step = step;
+                let mb = |n: u64| (n as f64 / 1_048_576.0).round() as u64;
+                if total > 0 {
+                    notify(
+                        app,
+                        format!(
+                            "Downloading Xenon v{version}… {pct}% ({} MB / {} MB)",
+                            mb(written),
+                            mb(total)
+                        ),
+                    );
+                } else {
+                    notify(
+                        app,
+                        format!("Downloading Xenon v{version}… {} MB", mb(written)),
+                    );
+                }
+            }
+        }
+
+        if let Some(e) = failed {
+            if attempt < cfg.max_retries {
+                attempt += 1;
+                file.flush().ok();
+                log::warn!("download attempt {attempt} failed: {e}; resuming at {written}");
+                continue;
+            }
+            let _ = fs::remove_file(&part);
+            return Err(format!(
+                "{e} — download manually from {RELEASES_PAGE}"
+            ));
+        }
+
+        file.flush().map_err(|e| e.to_string())?;
+        break;
+    }
+    drop(file);
+
+    // Hash the finished file (works for both fresh and resumed downloads).
+    let digest = {
+        use std::io::Read;
+        let mut f = std::fs::File::open(&part).map_err(|e| e.to_string())?;
+        let mut h = Sha256::new();
+        let mut buf = [0u8; 128 * 1024];
+        loop {
+            let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        format!("{:x}", h.finalize())
+    };
+
+    if let Some(want) = expected {
+        if !want.eq_ignore_ascii_case(&digest) {
+            let _ = fs::remove_file(&part);
+            return Err(format!("checksum mismatch: expected {want}, got {digest}"));
+        }
+    } else {
+        log::warn!("no SHA-256 available for {}; skipping verification", dest.display());
+    }
+
+    fs::rename(&part, dest).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -876,6 +1055,233 @@ def456  Xenon_0.3.0_universal.app.zip
         eprintln!("updater mock: wrong hash refused");
     }
 
+    fn test_body(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 8192];
+        let n = sock.read(&mut buf).await.unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    }
+
+    fn response_head(status: &str, len: usize, extra: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nContent-Length: {len}\r\n{extra}Connection: close\r\n\r\n")
+    }
+
+    fn dl_config(read_ms: u64, retries: u32) -> DownloadConfig {
+        DownloadConfig {
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_millis(read_ms),
+            max_retries: retries,
+        }
+    }
+
+    /// (a) A slow stream (total time > the 10 s API timeout in production)
+    /// completes: the download client has no total deadline.
+    #[tokio::test]
+    async fn download_slow_stream_completes() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let body = test_body(8192);
+        let hash = sha256_hex(&body);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body2 = body.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut sock).await;
+            let head = response_head("200 OK", body2.len(), "Content-Type: application/octet-stream\r\n");
+            sock.write_all(head.as_bytes()).await.unwrap();
+            let chunk = (body2.len() / 8).max(1);
+            for piece in body2.chunks(chunk) {
+                sock.write_all(piece).await.unwrap();
+                sock.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("xenon-dl-slow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("slow.dmg");
+        let cfg = dl_config(5000, 0);
+        download_verified(
+            &format!("http://{addr}/dmg"),
+            &dest,
+            Some(&hash),
+            &cfg,
+            None,
+            "9.9.9",
+        )
+        .await
+        .expect("slow stream should complete");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b) A connection dropped mid-body resumes with `Range` and the final
+    /// file's SHA-256 still verifies.
+    #[tokio::test]
+    async fn download_resumes_after_drop() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let body = test_body(8192);
+        let hash = sha256_hex(&body);
+        let split = body.len() / 2;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body2 = body.clone();
+        tokio::spawn(async move {
+            // First connection: send half, then drop.
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut sock).await;
+            let head = response_head("200 OK", body2.len(), "Content-Type: application/octet-stream\r\n");
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(&body2[..split]).await.unwrap();
+            sock.flush().await.unwrap();
+            drop(sock);
+
+            // Second connection: must carry a Range header; answer 206.
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let req = read_request(&mut sock).await;
+            let start = req
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("range: bytes=")
+                        .map(str::to_string)
+                })
+                .and_then(|v| v.split('-').next().map(str::to_string))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("no Range header on resume: {req}"));
+            let head = response_head(
+                "206 Partial Content",
+                body2.len() - start,
+                &format!("Content-Range: bytes {start}-{}/{}\r\n", body2.len() - 1, body2.len()),
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(&body2[start..]).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let dir = std::env::temp_dir().join(format!("xenon-dl-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("resume.dmg");
+        let cfg = dl_config(2000, 1);
+        download_verified(
+            &format!("http://{addr}/dmg"),
+            &dest,
+            Some(&hash),
+            &cfg,
+            None,
+            "9.9.9",
+        )
+        .await
+        .expect("resume should verify");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (c) A server that ignores `Range` (answers 200) causes a restart and
+    /// the final file still verifies.
+    #[tokio::test]
+    async fn download_restarts_when_range_ignored() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let body = test_body(8192);
+        let hash = sha256_hex(&body);
+        let split = body.len() / 2;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body2 = body.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut sock).await;
+            let head = response_head("200 OK", body2.len(), "Content-Type: application/octet-stream\r\n");
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(&body2[..split]).await.unwrap();
+            sock.flush().await.unwrap();
+            drop(sock);
+
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut sock).await;
+            // Ignore Range: full 200 response.
+            let head = response_head("200 OK", body2.len(), "Content-Type: application/octet-stream\r\n");
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(&body2).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let dir = std::env::temp_dir().join(format!("xenon-dl-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("restart.dmg");
+        let cfg = dl_config(2000, 1);
+        download_verified(
+            &format!("http://{addr}/dmg"),
+            &dest,
+            Some(&hash),
+            &cfg,
+            None,
+            "9.9.9",
+        )
+        .await
+        .expect("restart should verify");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (d) An idle stall longer than the read timeout retries, then fails with
+    /// the manual-download hint.
+    #[tokio::test]
+    async fn download_stall_retries_then_fails_with_hint() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let body = test_body(8192);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let _ = read_request(&mut sock).await;
+                let head = response_head("200 OK", body.len(), "Content-Type: application/octet-stream\r\n");
+                sock.write_all(head.as_bytes()).await.unwrap();
+                sock.write_all(&body[..1000]).await.unwrap();
+                sock.flush().await.unwrap();
+                // Stall past the client's read timeout.
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                drop(sock);
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("xenon-dl-stall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("stall.dmg");
+        let cfg = dl_config(150, 1);
+        let err = download_verified(
+            &format!("http://{addr}/dmg"),
+            &dest,
+            None,
+            &cfg,
+            None,
+            "9.9.9",
+        )
+        .await
+        .expect_err("stalled download must fail");
+        assert!(err.contains("download manually"), "{err}");
+        assert!(err.contains("releases"), "{err}");
+        assert!(!dest.exists(), "failed download must not leave a final file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Live check against the real GitHub API. Ignored by default (needs
     /// network); run with `cargo test -- --ignored fetch_latest_live`.
     /// The repo has no releases today, so this must return `Ok(None)` (404) and
@@ -892,5 +1298,36 @@ def456  Xenon_0.3.0_universal.app.zip
             }
             Err(e) => panic!("fetch_latest returned an error: {e}"),
         }
+    }
+
+    /// Live download of the latest real release DMG into a temp dir. Set
+    /// `XENON_UPDATE_NO_OPEN=1`; run with
+    /// `cargo test -- --ignored download_live -- --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn download_live() {
+        let release = fetch_latest().await.expect("fetch").expect("release");
+        let dmg = find_dmg(&release).expect("dmg asset");
+        let p = PendingUpdate {
+            version: release.tag_name.clone(),
+            dmg_name: dmg.name.clone(),
+            dmg_url: dmg.browser_download_url.clone(),
+            checksums_url: find_checksums(&release).map(|a| a.browser_download_url.clone()),
+        };
+        let dir = std::env::temp_dir().join(format!("xenon-dl-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XENON_UPDATE_DOWNLOAD_DIR", &dir);
+        std::env::set_var("XENON_UPDATE_NO_OPEN", "1");
+
+        let started = std::time::Instant::now();
+        download_and_open(None, &p).await.expect("live download");
+        eprintln!(
+            "live: downloaded {} in {:?} ({} MB), SHA-256 verified",
+            p.dmg_name,
+            started.elapsed(),
+            file_len(&dir.join(&p.dmg_name)) / 1_048_576
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
