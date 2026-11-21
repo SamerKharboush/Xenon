@@ -1,6 +1,6 @@
 [package]
 name = "xenon"
-version = "0.3.0"
+version = "0.3.1"
 description = "Xenon - lightweight local-first desktop companion for macOS"
 authors = ["Xenon contributors"]
 license = "MIT"
