@@ -6,10 +6,12 @@
 /// Linear-interpolation resampler from `from` Hz to `to` Hz.
 ///
 /// Output length is `round(input.len() * to / from)` so a sine stays a sine
-/// at the same physical frequency. Streaming callers may invoke this per
-/// block; sub-sample drift at block seams is corrected upstream by recomputing
-/// the samples-per-frame ratio from the live buffer, so a single stateless
-/// call is sufficient and keeps this function trivial to test.
+/// at the same physical frequency. When downsampling, a short box low-pass is
+/// applied first: plain linear interpolation would just decimate, and content
+/// above the target Nyquist would fold back into the passband and garble
+/// speech for STT (this is what made 48 kHz USB-mic capture transcribe
+/// "Hey Jarvis" as "page harvest"). Streaming callers may invoke this per
+/// block; a single stateless call is sufficient and keeps this trivial to test.
 pub fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
     if input.is_empty() || from == 0 || to == 0 {
         return Vec::new();
@@ -19,19 +21,117 @@ pub fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
     }
 
     let ratio = from as f64 / to as f64;
+    // Anti-alias before decimating. Upsampling needs no filter.
+    let filtered: Vec<f32>;
+    let src: &[f32] = if ratio > 1.0 {
+        filtered = box_lowpass(input, ratio.round().max(1.0) as usize);
+        &filtered
+    } else {
+        input
+    };
+
     let out_len = ((input.len() as f64) * to as f64 / from as f64).round() as usize;
-    let last = input.len() - 1;
+    let last = src.len() - 1;
 
     let mut out = Vec::with_capacity(out_len);
     for n in 0..out_len {
         let p = n as f64 * ratio;
         let i0 = p.floor() as usize;
         let frac = (p - i0 as f64) as f32;
-        let s0 = input[i0.min(last)];
-        let s1 = input[(i0 + 1).min(last)];
+        let s0 = src[i0.min(last)];
+        let s1 = src[(i0 + 1).min(last)];
         out.push(s0 + (s1 - s0) * frac);
     }
     out
+}
+
+/// Centered moving-average low-pass with `width` taps (edges clamped). Cheap
+/// anti-alias for small integer downsample ratios like 48k -> 16k.
+fn box_lowpass(input: &[f32], width: usize) -> Vec<f32> {
+    let w = width.max(1);
+    let n = input.len();
+    let mut out = vec![0.0f32; n];
+    let half = (w - 1) / 2;
+    for (i, o) in out.iter_mut().enumerate() {
+        let lo = i.saturating_sub(half);
+        let hi = (i + w - half).min(n);
+        *o = input[lo..hi].iter().sum::<f32>() / (hi - lo) as f32;
+    }
+    out
+}
+
+/// RMS of a mono f32 slice. `0.0` for an empty slice.
+pub fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// Wake segments worth a whisper pass are 0.4-3.0 s long.
+pub const WAKE_MIN_SEG_MS: u32 = 400;
+pub const WAKE_MAX_SEG_MS: u32 = 3_000;
+/// Only the first ~2.0 s of a wake segment is transcribed: the wake phrase
+/// leads, the tail is the command (handled after the wake fires).
+pub const WAKE_TRANSCRIBE_MS: u32 = 2_000;
+
+/// A wake segment must be this many times the adaptive noise floor to be worth
+/// an STT pass. Filters room/fan noise that the VAD alone lets through.
+pub const WAKE_ENERGY_FACTOR: f32 = 2.5;
+/// ...and above this absolute RMS, so near-silent digital noise never fires.
+pub const WAKE_ENERGY_ABS_MIN: f32 = 0.005;
+
+/// Adaptive noise floor + energy gate for wake-word segments. Cheap and
+/// deterministic (same observe/pass sequence -> same result) so it unit-tests
+/// without audio. The floor tracks the room; `passes` keeps only segments that
+/// stand out from it.
+#[derive(Debug, Clone)]
+pub struct NoiseGate {
+    floor: f32,
+    init: bool,
+}
+
+impl Default for NoiseGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NoiseGate {
+    pub fn new() -> Self {
+        Self {
+            floor: 0.0,
+            init: false,
+        }
+    }
+
+    pub fn floor(&self) -> f32 {
+        self.floor
+    }
+
+    /// Learn the room level from one frame of input RMS. `in_speech` frames are
+    /// skipped so the talker never inflates the floor.
+    pub fn observe(&mut self, frame_rms: f32, in_speech: bool) {
+        if !self.init {
+            if frame_rms > 0.0 {
+                self.floor = frame_rms;
+                self.init = true;
+            }
+            return;
+        }
+        if in_speech || frame_rms <= 0.0 {
+            return;
+        }
+        // Rise quickly toward a louder room, fall slowly so a brief quiet dip
+        // doesn't crater the floor (which would make noise pass the gate).
+        let a = if frame_rms > self.floor { 0.05 } else { 0.01 };
+        self.floor += a * (frame_rms - self.floor);
+    }
+
+    /// Whether a segment of RMS `seg_rms` clears the energy gate.
+    pub fn passes(&self, seg_rms: f32) -> bool {
+        self.init && seg_rms >= self.floor * WAKE_ENERGY_FACTOR && seg_rms >= WAKE_ENERGY_ABS_MIN
+    }
 }
 
 /// Streaming speech segmenter over a per-frame probability stream.
@@ -58,6 +158,10 @@ pub struct Segmenter {
     frames_seen: usize,
     seg_start: usize,
     seg_len: usize,
+    /// Length (frames) of the segment closed by the most recent `push`, when
+    /// it was dropped for being shorter than `min_frames`. `None` otherwise.
+    /// Read by the audio worker for debug logging of dropped segments.
+    last_too_short: Option<usize>,
 }
 
 impl Segmenter {
@@ -82,12 +186,19 @@ impl Segmenter {
             frames_seen: 0,
             seg_start: 0,
             seg_len: 0,
+            last_too_short: None,
         }
     }
 
     /// Whether a speech segment is currently open (mic is in an utterance).
     pub fn in_speech(&self) -> bool {
         self.active
+    }
+
+    /// Length (frames) of the segment dropped as too short by the most recent
+    /// [`Self::push`], or `None` when that push did not close a short segment.
+    pub fn last_too_short(&self) -> Option<usize> {
+        self.last_too_short
     }
 
     /// Reset all state (e.g. when the listen session is torn down or the
@@ -105,12 +216,14 @@ impl Segmenter {
             frames_seen: 0,
             seg_start: 0,
             seg_len: 0,
+            last_too_short: None,
         };
     }
 
     /// Advance the segmenter by one frame worth of probability.
     /// Returns a completed `(start_frame, end_frame_exclusive)` when ready.
     pub fn push(&mut self, prob: f32) -> Option<(usize, usize)> {
+        self.last_too_short = None;
         let idx = self.frames_seen;
         self.frames_seen += 1;
         let is_speech = prob >= self.threshold;
@@ -151,6 +264,7 @@ impl Segmenter {
         self.speech_run = 0;
         self.silence_run = 0;
         if len < self.min_frames {
+            self.last_too_short = Some(len);
             None
         } else {
             Some((start, start + len))
@@ -251,6 +365,44 @@ mod tests {
     #[test]
     fn resample_empty_input() {
         assert!(resample_linear(&[], 48_000, 16_000).is_empty());
+    }
+
+    // ---- noise gate ---------------------------------------------------
+
+    #[test]
+    fn noise_gate_learns_floor_and_rejects_noise() {
+        let mut g = NoiseGate::new();
+        // Establish a room floor around 0.02 from quiet frames.
+        for _ in 0..50 {
+            g.observe(0.02, false);
+        }
+        assert!((g.floor() - 0.02).abs() < 0.01, "floor={}", g.floor());
+        // Room-noise-level segment does not pass.
+        assert!(!g.passes(0.025));
+        // A loud speech-like segment does.
+        assert!(g.passes(0.2));
+    }
+
+    #[test]
+    fn noise_gate_ignores_speech_frames_when_learning() {
+        let mut g = NoiseGate::new();
+        for _ in 0..50 {
+            g.observe(0.02, false);
+        }
+        let floor = g.floor();
+        // Loud frames flagged as speech must not raise the floor.
+        for _ in 0..50 {
+            g.observe(0.5, true);
+        }
+        assert!((g.floor() - floor).abs() < 1e-3, "floor moved to {}", g.floor());
+    }
+
+    #[test]
+    fn noise_gate_abs_min_blocks_near_silence() {
+        let mut g = NoiseGate::new();
+        g.observe(0.0001, false);
+        // Even if the floor is tiny, near-silence never clears the abs min.
+        assert!(!g.passes(0.001));
     }
 
     // ---- segmenter ----------------------------------------------------

@@ -142,6 +142,9 @@ pub struct WakeMatch {
     /// Words after the wake phrase, if the command followed in the same
     /// breath. Empty when the user only said the wake phrase.
     pub trailing: String,
+    /// Worst per-word phonetic distance of the accepted window. Diagnostics
+    /// only (`RUST_LOG=xenon=debug`), never part of the match decision.
+    pub distance: usize,
 }
 
 /// Fuzzy-match `transcript` against `phrase`.
@@ -169,7 +172,7 @@ pub fn match_wake(transcript: &str, phrase: &str, sensitivity: f32) -> Option<Wa
     }
     let budgets = wake_distance_budgets(sensitivity, n);
 
-    let start = find_wake_start(&words, &phrase_words, &phrase_keys, &budgets)?;
+    let (start, distance) = find_wake_start(&words, &phrase_words, &phrase_keys, &budgets)?;
     let trailing = if words.len() > start + n {
         words[start + n..].join(" ")
     } else {
@@ -178,18 +181,20 @@ pub fn match_wake(transcript: &str, phrase: &str, sensitivity: f32) -> Option<Wa
     Some(WakeMatch {
         matched_words: n,
         trailing,
+        distance,
     })
 }
 
 /// Scan every window of `phrase_words.len()` words in `words` for the best
 /// (lowest worst-distance) fuzzy match within the per-position budgets.
-/// Returns the starting word index of the closest window.
+/// Returns the starting word index of the closest window and its worst
+/// per-word distance.
 fn find_wake_start(
     words: &[&str],
     phrase_words: &[&str],
     phrase_keys: &[String],
     budgets: &[usize],
-) -> Option<usize> {
+) -> Option<(usize, usize)> {
     let n = phrase_words.len();
     let mut best: Option<(usize, usize)> = None; // (start, worst_distance)
     for start in 0..=words.len().saturating_sub(n) {
@@ -215,13 +220,13 @@ fn find_wake_start(
             worst = worst.max(d);
         }
         if ok && worst == 0 {
-            return Some(start); // exact window, no need to keep scanning
+            return Some((start, 0)); // exact window, no need to keep scanning
         }
         if ok && best.map_or(true, |(_, b)| worst < b) {
             best = Some((start, worst));
         }
     }
-    best.map(|(s, _)| s)
+    best
 }
 
 /// True when `word` could be the first word of `phrase_first`: same initial

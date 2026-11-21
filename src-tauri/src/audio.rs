@@ -27,7 +27,10 @@ use whisper_rs::{
     WhisperVadContextParams,
 };
 
-use crate::audio_dsp::{resample_linear, Segmenter};
+use crate::audio_dsp::{
+    rms, resample_linear, NoiseGate, Segmenter, WAKE_MAX_SEG_MS, WAKE_MIN_SEG_MS,
+    WAKE_TRANSCRIBE_MS,
+};
 use crate::config::XenonConfig;
 use crate::events::{AudioEvent, Utterance};
 use crate::voice;
@@ -43,12 +46,13 @@ const PRE_ROLL_MS: u32 = 300;
 const FORCE_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
 /// After the wake word, wait this long for the command before re-arming.
 const WAKE_LISTEN_TIMEOUT: Duration = Duration::from_secs(12);
-/// Wake-word segments are capped this short so a name is checked quickly.
-const WAKE_MAX_SPEECH_MS: u32 = 2_500;
 /// Emit `audio-level` at ~30 Hz.
 const LEVEL_INTERVAL: Duration = Duration::from_millis(33);
-/// Trim the in-session silence buffer past this length (bounds always-on RAM).
-const SILENCE_TRIM_MAX_MS: u64 = 60_000;
+/// When idle (no segment open) keep only this much recent audio. The VAD scans
+/// the whole buffer every tick, so an ever-growing idle buffer makes wake-word
+/// CPU grow without bound. A wake utterance can't be missed: onset is detected
+/// from the recent window, and this is far longer than the 300 ms pre-roll.
+const IDLE_KEEP_MS: u64 = 3_000;
 /// Don't run VAD until we've buffered at least this many 16 kHz samples.
 const MIN_VAD_SAMPLES: usize = VAD_WINDOW * 2;
 
@@ -125,6 +129,8 @@ struct Worker {
     preloaded: bool,
     last_speech: Instant,
     last_level: Instant,
+    /// Last time an input RMS diagnostic was logged (5 s cadence).
+    last_rms_log: Instant,
     model_notice_sent: bool,
     /// A wake_word/always session wants the mic open. When the stream is not
     /// open (startup failure, device unplugged, stream error) the worker keeps
@@ -139,6 +145,12 @@ struct Worker {
     stream_failed: Arc<AtomicBool>,
     /// Last mic-open error, for a one-shot "permission denied" vs device notice.
     mic_error_notice_sent: bool,
+    /// Adaptive noise floor + energy gate so wake STT only runs on segments
+    /// that stand out from room/fan noise.
+    noise_gate: NoiseGate,
+    /// Rolling wall-clock window + time spent in wake STT, for the duty cap.
+    wake_duty_window_start: Instant,
+    wake_duty_stt: Duration,
 }
 
 /// Mic-open retry schedule: start at 5 s, double each failure, cap at 30 s.
@@ -214,20 +226,24 @@ fn worker(
             32.0,
             30,
             initial_cfg.silence_ms as u32,
-            300,
-            WAKE_MAX_SPEECH_MS,
+            WAKE_MIN_SEG_MS,
+            WAKE_MAX_SEG_MS,
         ),
         wake_stt: None,
         wake_notice_sent: false,
         preloaded: false,
         last_speech: Instant::now(),
         last_level: Instant::now(),
+        last_rms_log: Instant::now(),
         model_notice_sent: false,
         mic_want_open: false,
         mic_retry_at: None,
         mic_retry_delay: Duration::from_secs(5),
         stream_failed: Arc::new(AtomicBool::new(false)),
         mic_error_notice_sent: false,
+        noise_gate: NoiseGate::new(),
+        wake_duty_window_start: Instant::now(),
+        wake_duty_stt: Duration::ZERO,
     };
 
     // Wake-word mode keeps capture + VAD warm but the main STT model lazy.
@@ -302,8 +318,8 @@ impl Worker {
                     32.0,
                     30,
                     new.silence_ms as u32,
-                    300,
-                    WAKE_MAX_SPEECH_MS,
+                    WAKE_MIN_SEG_MS,
+                    WAKE_MAX_SEG_MS,
                 );
             }
             let listen_mode_changed = new.listen_mode != self.cfg.listen_mode;
@@ -512,6 +528,38 @@ impl Worker {
         let channels = cfg.channels as usize;
         let rate = cfg.sample_rate.0;
         self.native_rate = rate;
+        if rate == TARGET_RATE {
+            log::debug!("audio: capture at native {rate} Hz, no resample (channels={channels})");
+        } else {
+            log::debug!(
+                "audio: resample path {rate} Hz -> {TARGET_RATE} Hz (channels={channels})"
+            );
+        }
+
+        // The first mic open can block for a long time while macOS shows the
+        // permission prompt (or while a device is being configured). Watch for
+        // a slow open and surface a "waiting for permission" notice from a
+        // background thread, so the pet bubble explains the wait instead of
+        // looking frozen. Logged at info so it is visible without debug logs.
+        let opened = Arc::new(AtomicBool::new(false));
+        let _open_done = OpenDone(opened.clone());
+        if self.mic_want_open {
+            let app = self.app.clone();
+            let flag = opened.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(2));
+                if !flag.load(Ordering::SeqCst) {
+                    log::info!(
+                        "audio: microphone open still pending after 2s; emitting permission-wait notice"
+                    );
+                    let _ = app.emit(
+                        "xenon-notice",
+                        "Waiting for microphone permission — accept the system prompt or check \
+                         System Settings → Privacy & Security → Microphone.",
+                    );
+                }
+            });
+        }
 
         let (frame_tx, frame_rx): (SyncSender<Vec<f32>>, Receiver<Vec<f32>>) =
             mpsc::sync_channel(64);
@@ -584,12 +632,11 @@ impl Worker {
         let elapsed = t0.elapsed();
         log::info!("audio: microphone open in {:.2}s", elapsed.as_secs_f64());
         if elapsed.as_secs_f64() > 2.0 {
-            let app = self.app.clone();
             let secs = elapsed.as_secs_f64();
-            let _ = app.emit(
-                "xenon-notice",
-                format!("Microphone took {secs:.1}s to open — slow, check focus/input devices."),
-            );
+            let msg =
+                format!("Microphone took {secs:.1}s to open — slow, check focus/input devices.");
+            log::info!("audio: {msg}");
+            let _ = self.app.emit("xenon-notice", msg);
         }
         Ok(())
     }
@@ -601,7 +648,12 @@ impl Worker {
             self.input_buf.clear();
             return;
         }
+        // Track the room's noise floor (skipping frames while a segment is open
+        // so the talker never inflates it). Used to gate wake STT below.
+        let in_speech = self.seg.in_speech() || self.wake_seg.in_speech();
+        self.noise_gate.observe(rms(frames), in_speech);
         self.input_buf.extend_from_slice(frames);
+        self.log_input_rms(frames);
         // Enough new native-rate audio to make one resample block.
         let block_need = (self.native_rate as usize * VAD_STRIDE_MS as usize) / 1000;
         // VAD re-run cadence, measured in 16 kHz samples.
@@ -649,11 +701,14 @@ impl Worker {
         for p in &probs[start_idx..] {
             let wake_listening = self.wake_mode() && !self.awake;
             let was_speaking = self.seg.in_speech();
+            let was_wake_speaking = self.wake_seg.in_speech();
             let mut segment: Option<Vec<f32>> = None;
             let mut wake_segment = false;
 
             if !wake_listening {
                 if let Some((start, end)) = self.seg.push(*p) {
+                    let dur_ms = (end - start) as f32 * spf as f32 / TARGET_RATE as f32 * 1000.0;
+                    log::debug!("vad: speech end dur={dur_ms:.0}ms frames={start}..{end}");
                     let pre = (PRE_ROLL_MS as usize * TARGET_RATE as usize) / 1000 / spf;
                     let s0 = start.saturating_sub(pre);
                     let s1 = (end * spf).min(self.captured.len());
@@ -665,12 +720,20 @@ impl Worker {
                     self.frames_committed = 0;
                     self.captured.clear();
                     self.since_vad = 0;
+                } else if let Some(len) = self.seg.last_too_short() {
+                    log::debug!("vad: speech segment dropped (too short: {len} frames)");
+                } else if !was_speaking && self.seg.in_speech() {
+                    log::debug!("vad: speech start");
                 }
             } else if let Some((start, end)) = self.wake_seg.push(*p) {
                 // Wake mode, not yet awake: feed a short-segment whisper
                 // segmenter instead of the main one.
+                let dur_ms = (end - start) as f32 * spf as f32 / TARGET_RATE as f32 * 1000.0;
+                log::debug!("vad: wake speech end dur={dur_ms:.0}ms frames={start}..{end}");
+                let pre = (PRE_ROLL_MS as usize * TARGET_RATE as usize) / 1000 / spf;
+                let s0 = start.saturating_sub(pre);
                 let s1 = (end * spf).min(self.captured.len());
-                let lo = (start * spf).min(self.captured.len());
+                let lo = (s0 * spf).min(self.captured.len());
                 if s1 > lo {
                     segment = Some(self.captured[lo..s1].to_vec());
                     wake_segment = true;
@@ -679,6 +742,10 @@ impl Worker {
                 self.frames_committed = 0;
                 self.captured.clear();
                 self.since_vad = 0;
+            } else if let Some(len) = self.wake_seg.last_too_short() {
+                log::debug!("vad: wake speech segment dropped (too short: {len} frames)");
+            } else if !was_wake_speaking && self.wake_seg.in_speech() {
+                log::debug!("vad: wake speech start");
             }
 
             if let Some(audio) = segment {
@@ -734,29 +801,82 @@ impl Worker {
         // Echo guard: don't let the pet wake itself while it speaks. High
         // sensitivity deliberately allows barge-in.
         if self.speaking.load(Ordering::Relaxed) && self.cfg.wake_sensitivity < 0.85 {
+            log::debug!("wake: segment dropped (echo guard: pet is speaking)");
             return;
         }
-        let Some(text) = self.transcribe_wake(audio) else {
+        // Duty cap: never let wake STT exceed ~25% of wall time. Skip this
+        // segment if the rolling window is already over budget (we drop, never
+        // queue, so a backlog can't build up).
+        if self.wake_duty_over_budget() {
+            log::debug!("wake: segment dropped (duty cap ~25% reached)");
+            return;
+        }
+        // Energy gate: only transcribe segments that stand out from the room's
+        // adaptive noise floor. This is what keeps idle CPU near zero when the
+        // VAD fires on fan/room noise.
+        let seg_rms = rms(audio);
+        if !self.noise_gate.passes(seg_rms) {
+            log::debug!(
+                "wake: segment dropped (energy gate rms={seg_rms:.4} floor={:.4})",
+                self.noise_gate.floor()
+            );
+            return;
+        }
+        // Only the first ~2 s carries the wake phrase; the tail is the command.
+        let cap = (WAKE_TRANSCRIBE_MS as usize * TARGET_RATE as usize) / 1000;
+        let head = &audio[..audio.len().min(cap)];
+        let started = Instant::now();
+        let result = self.transcribe_wake(head);
+        self.wake_duty_stt += started.elapsed();
+        let Some(text) = result else {
+            log::debug!("wake: segment dropped (empty/hallucinated wake transcript)");
             return;
         };
         let phrase = self.cfg.effective_wake_phrase();
-        if let Some(m) = voice::match_wake(&text, &phrase, self.cfg.wake_sensitivity) {
-            self.awake = true;
-            self.awake_until = Instant::now() + WAKE_LISTEN_TIMEOUT;
-            self.awake_with_command = !m.trailing.is_empty();
-            // Discard wake audio; the same-breath command starts fresh.
-            self.seg.reset();
-            self.wake_seg.reset();
-            self.captured.clear();
-            self.frames_committed = 0;
-            self.since_vad = 0;
-            self.emit(AudioEvent::Wake {
-                text: (!m.trailing.is_empty()).then_some(m.trailing),
-            });
-            if self.cfg.wake_chime {
-                play_chime();
+        let sens = self.cfg.wake_sensitivity;
+        let budgets = voice::wake_distance_budgets(sens, phrase.split_whitespace().count());
+        match voice::match_wake(&text, &phrase, sens) {
+            Some(m) => {
+                log::debug!(
+                    "wake: transcript={text:?} phrase={phrase:?} matched=true dist={} budgets={budgets:?}",
+                    m.distance
+                );
+                self.awake = true;
+                self.awake_until = Instant::now() + WAKE_LISTEN_TIMEOUT;
+                self.awake_with_command = !m.trailing.is_empty();
+                // Discard wake audio; the same-breath command starts fresh.
+                self.seg.reset();
+                self.wake_seg.reset();
+                self.captured.clear();
+                self.frames_committed = 0;
+                self.since_vad = 0;
+                self.emit(AudioEvent::Wake {
+                    text: (!m.trailing.is_empty()).then_some(m.trailing),
+                });
+                if self.cfg.wake_chime {
+                    play_chime();
+                }
+            }
+            None => {
+                log::debug!(
+                    "wake: transcript={text:?} phrase={phrase:?} matched=false budgets={budgets:?}"
+                );
             }
         }
+    }
+
+    /// True when wake STT has used more than ~25% of the current 10 s window.
+    /// Rolls the window over when it elapses. Cheap: two Instant compares.
+    fn wake_duty_over_budget(&mut self) -> bool {
+        const WINDOW: Duration = Duration::from_secs(10);
+        let now = Instant::now();
+        if now.duration_since(self.wake_duty_window_start) >= WINDOW {
+            self.wake_duty_window_start = now;
+            self.wake_duty_stt = Duration::ZERO;
+            return false;
+        }
+        let elapsed = now.duration_since(self.wake_duty_window_start);
+        self.wake_duty_stt * 100 > elapsed * 25
     }
 
     /// Reuse the tiny wake STT context; return `None` on missing model or
@@ -784,8 +904,13 @@ impl Worker {
             }
         }
         let ctx = self.wake_stt.as_ref()?;
-        let prompt = self.cfg.effective_wake_phrase();
-        match run_stt(ctx, audio, Some("en"), Some(&prompt)) {
+        // Do NOT seed whisper with the wake phrase as the initial prompt:
+        // whisper treats the prompt as already-transcribed context and drops
+        // the matching prefix from its output (e.g. returns "What is two plus
+        // two?" for "Hey Jarvis. What is two plus two?"), so the matcher never
+        // sees the wake phrase and the wake never fires. The wake harness
+        // transcribes without a prompt (30/30 positives), so match that path.
+        match run_stt(ctx, audio, Some("en"), None, 2) {
             Ok(Some(u)) => Some(u.text),
             Ok(None) => None,
             Err(e) => {
@@ -825,7 +950,7 @@ impl Worker {
         self.stt_last_used = Some(Instant::now());
         self.model_notice_sent = false;
         let ctx = self.stt.as_ref().expect("stt loaded");
-        run_stt(ctx, audio, lang, None)
+        run_stt(ctx, audio, lang, None, 8)
     }
 
     fn load_vad(&mut self) -> Result<()> {
@@ -880,14 +1005,20 @@ impl Worker {
         {
             self.finish_and_close();
         }
-        // Bound always-on silence memory (both segmenters).
+        // Bound the silence buffer so the VAD (which re-scans the whole buffer
+        // every tick) can't make idle CPU grow without bound. When no segment is
+        // open, keep only the last few seconds. A segment in progress is bounded
+        // by its own max_frames cap and clears on close, so it needs no trim.
         if self.stream.is_some() && !self.seg.in_speech() && !self.wake_seg.in_speech() {
-            let cap = (TARGET_RATE as usize) * (SILENCE_TRIM_MAX_MS as usize / 1000);
-            if self.captured.len() > cap {
-                self.frames_committed = 0;
-                self.captured.clear();
+            let keep = ((TARGET_RATE as u64) * IDLE_KEEP_MS / 1000) as usize;
+            if self.captured.len() > keep {
+                let drop = self.captured.len() - keep;
+                self.captured.drain(..drop);
+                // Dropped samples shift every frame index; the segmenters index
+                // into `captured`, so rebase them (idle: no open segment).
                 self.seg.reset();
                 self.wake_seg.reset();
+                self.frames_committed = 0;
                 self.since_vad = 0;
             }
         }
@@ -965,6 +1096,22 @@ impl Worker {
         let _ = self.app.emit("audio-level", AudioLevel { rms });
     }
 
+    /// Log the raw input RMS once every 5 s while capturing. Debug-only so
+    /// transcripts stay private; lets a live run show whether the mic is
+    /// actually delivering signal (vs. a dead device / muted channel).
+    fn log_input_rms(&mut self, frames: &[f32]) {
+        if self.last_rms_log.elapsed() < Duration::from_secs(5) || frames.is_empty() {
+            return;
+        }
+        self.last_rms_log = Instant::now();
+        let rms = (frames.iter().map(|s| s * s).sum::<f32>() / frames.len() as f32).sqrt();
+        log::debug!(
+            "audio: input rms={rms:.4} over {} native frames at {} Hz",
+            frames.len(),
+            self.native_rate
+        );
+    }
+
     fn emit(&self, event: AudioEvent) {
         if self.audio_tx.try_send(event).is_err() {
             log::warn!("audio: agent channel full, dropped event");
@@ -974,6 +1121,17 @@ impl Worker {
     fn emit_notice(&self, msg: &str) {
         log::warn!("audio notice: {msg}");
         let _ = self.app.emit("xenon-notice", msg.to_string());
+    }
+}
+
+/// Cancels the slow-open watchdog: flips the flag to `true` when the open
+/// attempt finishes (success or failure), so a watchdog that has not fired yet
+/// stays quiet.
+struct OpenDone(Arc<AtomicBool>);
+
+impl Drop for OpenDone {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1139,7 +1297,7 @@ pub(crate) fn transcribe_with_prompt(
     samples: &[f32],
     prompt: Option<&str>,
 ) -> Result<String> {
-    match run_stt(ctx, samples, None, prompt) {
+    match run_stt(ctx, samples, None, prompt, 8) {
         Ok(Some(u)) => Ok(u.text),
         Ok(None) => Ok(String::new()),
         Err(e) => Err(e),
@@ -1175,11 +1333,12 @@ fn run_stt(
     samples: &[f32],
     language: Option<&str>,
     initial_prompt: Option<&str>,
+    max_threads: i32,
 ) -> Result<Option<Utterance>> {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get() as i32)
         .unwrap_or(4)
-        .min(8);
+        .min(max_threads.max(1));
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_n_threads(threads);
     params.set_language(language);
@@ -1449,7 +1608,454 @@ mod tests {
             WhisperContextParameters::default(),
         )
         .expect("load STT model");
-        let out = run_stt(&ctx, &silence, Some("en"), None).expect("stt run");
+        let out = run_stt(&ctx, &silence, Some("en"), None, 8).expect("stt run");
         assert!(out.is_none(), "silence should yield no Speech utterance");
+    }
+
+    /// Synthesize *text* at an arbitrary sample rate as mono f32 via `say` +
+    /// `afconvert` (the 48 kHz path needs a native-rate source).
+    fn say_wav_rate(text: &str, rate: u32) -> Option<Vec<f32>> {
+        let dir = std::env::temp_dir().join(format!(
+            "xenon-live-{rate}-{}-{}",
+            std::process::id(),
+            text.chars().filter(|c| c.is_alphanumeric()).collect::<String>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let aiff = dir.join("a.aiff");
+        let wav = dir.join("a.wav");
+        let ok = std::process::Command::new("/usr/bin/say")
+            .arg("-o")
+            .arg(&aiff)
+            .arg(text)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return None;
+        }
+        let ok = std::process::Command::new("/usr/bin/afconvert")
+            .args(["-f", "WAVE", "-d"])
+            .arg(format!("LEI16@{rate}"))
+            .args(["-c", "1"])
+            .arg(&aiff)
+            .arg(&wav)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return None;
+        }
+        let wave = sherpa_onnx::Wave::read(&wav.to_string_lossy())?;
+        let samples = wave.samples().to_vec();
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(samples)
+    }
+
+    /// Harness 3: the live 48 kHz capture path. A USB mic opens at 48 kHz, but
+    /// the VAD/STT run at 16 kHz, so the worker resamples each native block.
+    /// This feeds a synthesized "Hey Jarvis. What is two plus two?" at 48 kHz
+    /// through the SAME native-block accumulation -> resample -> Silero VAD ->
+    /// short-segment wake path the worker uses (`on_frames` / `run_vad` wake
+    /// branch) and asserts the wake fires. The 16 kHz shortcut harness
+    /// (`wake_audio_hey_xenon_fires`) would miss a resampling, channel, or
+    /// wake-window bug, which is exactly what this guards.
+    #[test]
+    #[ignore = "synthesizes 48 kHz audio + loads real models; run with -- --ignored stress_wake_live_rate"]
+    fn stress_wake_live_rate() {
+        let mut cfg = XenonConfig {
+            pet_name: "Jarvis".into(),
+            wake_phrase: String::new(),
+            ..Default::default()
+        };
+        if let Ok(path) = std::env::var("XENON_WAKE_MODEL") {
+            cfg.wake_model_path = path;
+        }
+        // Resolve the wake model exactly like Worker::wake_model_path().
+        let wake_path = {
+            let p = cfg.wake_model_path.trim();
+            if !p.is_empty() && std::path::Path::new(p).exists() {
+                p.to_string()
+            } else {
+                cfg.whisper_model_path.clone()
+            }
+        };
+        if !std::path::Path::new(&wake_path).exists()
+            || !std::path::Path::new(&cfg.vad_model_path).exists()
+        {
+            eprintln!(
+                "skip: models absent (wake={wake_path}, vad={})",
+                cfg.vad_model_path
+            );
+            return;
+        }
+        let Some(mut samples48) = say_wav_rate("Hey Jarvis. What is two plus two?", 48_000) else {
+            eprintln!("skip: say/afconvert unavailable");
+            return;
+        };
+        // The mic keeps capturing after the phrase; append trailing silence so
+        // the segmenter sees the 700 ms gap that closes the wake segment.
+        samples48.extend(std::iter::repeat(0.0f32).take(48_000 * 2));
+        let native_rate = 48_000u32;
+        let phrase = cfg.effective_wake_phrase();
+
+        // --- capture -> resample (mirror Worker::on_frames) ---
+        let block_need = (native_rate as usize * VAD_STRIDE_MS as usize) / 1000;
+        let vad_need = (TARGET_RATE as usize * VAD_STRIDE_MS as usize) / 1000;
+        let mut input_buf: Vec<f32> = Vec::new();
+        let mut captured: Vec<f32> = Vec::new();
+        let mut since_vad = 0usize;
+
+        // --- VAD + wake segmenter (mirror Worker::run_vad wake branch) ---
+        let mut pctx = WhisperVadContextParams::default();
+        pctx.set_n_threads(2);
+        pctx.set_use_gpu(false);
+        let mut vad = WhisperVadContext::new(&cfg.vad_model_path, pctx).expect("load VAD model");
+        let mut seg = Segmenter::new(0.5, 32.0, 30, cfg.silence_ms as u32, WAKE_MIN_SEG_MS, WAKE_MAX_SEG_MS);
+
+        let mut wparams = WhisperContextParameters::new();
+        wparams.use_gpu(false);
+        let ctx = WhisperContext::new_with_params(&wake_path, wparams).expect("load wake model");
+
+        let mut frames_committed = 0usize;
+        let mut fired = false;
+
+        // cpal delivers ~10 ms chunks at the device rate.
+        'outer: for chunk in samples48.chunks(480) {
+            input_buf.extend_from_slice(chunk);
+            if input_buf.len() < block_need.max(1) {
+                continue;
+            }
+            let block = std::mem::take(&mut input_buf);
+            let r16 = resample_linear(&block, native_rate, TARGET_RATE);
+            captured.extend_from_slice(&r16);
+            since_vad += r16.len();
+            if captured.len() < MIN_VAD_SAMPLES || since_vad < vad_need {
+                continue;
+            }
+            since_vad = 0;
+            vad.detect_speech(&captured).expect("vad detect");
+            let probs = vad.probabilities().to_vec();
+            if probs.is_empty() {
+                continue;
+            }
+            let spf = (captured.len() / probs.len()).max(1);
+            let mut completed = false;
+            for p in &probs[frames_committed.min(probs.len())..] {
+                if let Some((start, end)) = seg.push(*p) {
+                    // Mirror Worker: keep PRE_ROLL_MS before the VAD onset so
+                    // whisper hears the full first word (slicing at the exact
+                    // onset garbled "Hey Jarvis" -> "page harvest").
+                    let pre = (PRE_ROLL_MS as usize * TARGET_RATE as usize) / 1000 / spf;
+                    let s0 = start.saturating_sub(pre);
+                    let s1 = (end * spf).min(captured.len());
+                    let lo = (s0 * spf).min(captured.len());
+                    if s1 > lo {
+                        let audio = captured[lo..s1].to_vec();
+                        let dur_ms =
+                            (end - start) as f32 * spf as f32 / TARGET_RATE as f32 * 1000.0;
+                        // Same call the worker makes in transcribe_wake (no
+                        // initial prompt; seeding the phrase makes whisper drop
+                        // the wake phrase from the transcript).
+                        let text =
+                            transcribe_with_context(&ctx, &audio).unwrap_or_default();
+                        eprintln!(
+                            "wake segment frames={start}..{end} dur={dur_ms:.0}ms transcript={text:?}"
+                        );
+                        if crate::voice::match_wake(&text, &phrase, cfg.wake_sensitivity).is_some()
+                        {
+                            fired = true;
+                        }
+                    }
+                    seg.reset();
+                    frames_committed = 0;
+                    captured.clear();
+                    since_vad = 0;
+                    completed = true;
+                    break;
+                }
+            }
+            if completed {
+                if fired {
+                    break 'outer;
+                }
+                continue 'outer;
+            }
+            frames_committed = probs.len();
+        }
+        assert!(
+            fired,
+            "48 kHz wake phrase did not fire; capture -> resample -> VAD -> wake path broken"
+        );
+    }
+
+    /// Deterministic brown-noise generator (2 min of "room") at 48 kHz. Cheap;
+    /// no external deps so the CPU harness is reproducible.
+    fn brown_noise_48k(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        let mut last = 0.0f32;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            // xorshift white noise -> brown via leaky integration.
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let white = ((s >> 40) as f32 / (1u64 << 24) as f32) - 1.0; // ~[-1,1]
+            last = (last + 0.02 * white) / 1.02;
+            out.push(last);
+        }
+        // Normalize to a realistic room level (~0.03 RMS).
+        let rms = rms(&out).max(1e-6);
+        let g = 0.03 / rms;
+        for v in &mut out {
+            *v *= g;
+        }
+        out
+    }
+
+    /// Harness 4: 2 minutes of room noise + a few non-wake sentences through
+    /// the SAME 48 kHz capture -> resample -> VAD -> wake-gate -> STT path the
+    /// worker uses. Reports wake-STT invocations, CPU seconds, and average CPU
+    /// as a fraction of one core over the 120 s of audio. Also asserts 30/30 on
+    /// a positive wake set. Set XENON_WAKE_NO_GATE=1 to measure the pre-fix
+    /// behaviour (no energy/duty gate) for before/after comparison.
+    #[test]
+    #[ignore = "synthesizes 2 min noise + loads real models; run with -- --ignored stress_wake_cpu"]
+    fn stress_wake_cpu() {
+        use std::time::Instant;
+
+        let mut cfg = XenonConfig {
+            pet_name: "Jarvis".into(),
+            wake_phrase: String::new(),
+            ..Default::default()
+        };
+        if let Ok(path) = std::env::var("XENON_WAKE_MODEL") {
+            cfg.wake_model_path = path;
+        }
+        let wake_path = {
+            let p = cfg.wake_model_path.trim();
+            if !p.is_empty() && std::path::Path::new(p).exists() {
+                p.to_string()
+            } else {
+                cfg.whisper_model_path.clone()
+            }
+        };
+        if !std::path::Path::new(&wake_path).exists()
+            || !std::path::Path::new(&cfg.vad_model_path).exists()
+        {
+            eprintln!("skip: models absent (wake={wake_path})");
+            return;
+        }
+        let gate_on = std::env::var_os("XENON_WAKE_NO_GATE").is_none();
+        let native_rate = 48_000u32;
+        let phrase = cfg.effective_wake_phrase();
+        let total_audio_s = 120.0f64;
+        let total48 = (native_rate as f64 * total_audio_s) as usize;
+
+        // --- 2 min of room noise with a few non-wake sentences sprinkled in ---
+        let mut audio48 = brown_noise_48k(total48, 0x1234_5678_9abc_def0);
+        let non_wake = ["What is the weather?", "Hello there", "Testing one two three"];
+        let mut cursor = native_rate as usize * 10; // start after 10 s
+        for s in non_wake {
+            if let Some(mut clip) = say_wav_rate(s, 48_000) {
+                // Scale clip to a natural level over the noise floor.
+                for v in &mut clip {
+                    *v = *v * 0.5 + 0.02;
+                }
+                let end = (cursor + clip.len()).min(audio48.len());
+                let n = end - cursor;
+                audio48[cursor..end].copy_from_slice(&clip[..n]);
+                cursor += native_rate as usize * 15; // space them out
+            }
+        }
+
+        // --- VAD + wake segmenter + gate (mirror Worker) ---
+        let mut pctx = WhisperVadContextParams::default();
+        pctx.set_n_threads(2);
+        pctx.set_use_gpu(false);
+        let mut vad = WhisperVadContext::new(&cfg.vad_model_path, pctx).expect("load VAD model");
+        let mut seg = Segmenter::new(0.5, 32.0, 30, cfg.silence_ms as u32, WAKE_MIN_SEG_MS, WAKE_MAX_SEG_MS);
+        let mut noise_gate = NoiseGate::new();
+
+        let mut wparams = WhisperContextParameters::new();
+        wparams.use_gpu(false);
+        let ctx = WhisperContext::new_with_params(&wake_path, wparams).expect("load wake model");
+
+        let block_need = (native_rate as usize * VAD_STRIDE_MS as usize) / 1000;
+        let vad_need = (TARGET_RATE as usize * VAD_STRIDE_MS as usize) / 1000;
+        let mut input_buf: Vec<f32> = Vec::new();
+        let mut captured: Vec<f32> = Vec::new();
+        let mut since_vad = 0usize;
+        let mut frames_committed = 0usize;
+
+        let mut stt_calls = 0u32;
+        let mut stt_cpu = Duration::ZERO;
+        let mut vad_cpu = Duration::ZERO;
+        // Duty-cap window (mirror Worker).
+        let mut duty_start = Instant::now();
+        let mut duty_stt = Duration::ZERO;
+
+        for chunk in audio48.chunks(480) {
+            let in_speech = seg.in_speech();
+            noise_gate.observe(rms(chunk), in_speech);
+            input_buf.extend_from_slice(chunk);
+            if input_buf.len() < block_need.max(1) {
+                continue;
+            }
+            let block = std::mem::take(&mut input_buf);
+            let r16 = resample_linear(&block, native_rate, TARGET_RATE);
+            captured.extend_from_slice(&r16);
+            since_vad += r16.len();
+            if captured.len() < MIN_VAD_SAMPLES || since_vad < vad_need {
+                continue;
+            }
+            since_vad = 0;
+            let vt = Instant::now();
+            vad.detect_speech(&captured).expect("vad detect");
+            vad_cpu += vt.elapsed();
+            let probs = vad.probabilities().to_vec();
+            if probs.is_empty() {
+                continue;
+            }
+            let spf = (captured.len() / probs.len()).max(1);
+            let mut completed = false;
+            for p in &probs[frames_committed.min(probs.len())..] {
+                if let Some((start, end)) = seg.push(*p) {
+                    let pre = (PRE_ROLL_MS as usize * TARGET_RATE as usize) / 1000 / spf;
+                    let s0 = start.saturating_sub(pre);
+                    let s1 = (end * spf).min(captured.len());
+                    let lo = (s0 * spf).min(captured.len());
+                    if s1 > lo {
+                        let audio = captured[lo..s1].to_vec();
+                        // Gate decision (mirror on_wake_segment). No-gate =
+                        // pre-fix behaviour: every VAD segment gets an STT pass.
+                        let mut run = true;
+                        if gate_on {
+                            let now = Instant::now();
+                            if now.duration_since(duty_start) >= Duration::from_secs(10) {
+                                duty_start = now;
+                                duty_stt = Duration::ZERO;
+                            } else {
+                                let el = now.duration_since(duty_start);
+                                if duty_stt * 100 > el * 25 {
+                                    run = false;
+                                }
+                            }
+                            if !noise_gate.passes(rms(&audio)) {
+                                run = false;
+                            }
+                        }
+                        if run {
+                            let cap = (WAKE_TRANSCRIBE_MS as usize * TARGET_RATE as usize) / 1000;
+                            let head = &audio[..audio.len().min(cap)];
+                            let t = Instant::now();
+                            let text =
+                                transcribe_with_context(&ctx, head).unwrap_or_default();
+                            let dt = t.elapsed();
+                            stt_calls += 1;
+                            stt_cpu += dt;
+                            duty_stt += dt;
+                            let _ = crate::voice::match_wake(&text, &phrase, cfg.wake_sensitivity);
+                        }
+                    }
+                    seg.reset();
+                    frames_committed = 0;
+                    captured.clear();
+                    since_vad = 0;
+                    completed = true;
+                    break;
+                }
+            }
+            if completed {
+                continue;
+            }
+            frames_committed = probs.len();
+            // Mirror Worker tick_timers: cap the idle buffer so the VAD window
+            // (and thus per-tick CPU) stays bounded.
+            if !seg.in_speech() {
+                let keep = ((TARGET_RATE as u64) * IDLE_KEEP_MS / 1000) as usize;
+                if captured.len() > keep {
+                    let drop = captured.len() - keep;
+                    captured.drain(..drop);
+                    seg.reset();
+                    frames_committed = 0;
+                    since_vad = 0;
+                }
+            }
+        }
+
+        let audio_s = total_audio_s;
+        let stt_cpu_s = stt_cpu.as_secs_f64();
+        let total_cpu_s = stt_cpu_s + vad_cpu.as_secs_f64();
+        let avg_cpu_pct = total_cpu_s / audio_s * 100.0;
+        eprintln!(
+            "wake-cpu: model={} gate={} invocations={} stt_cpu={:.2}s vad_cpu={:.2}s avg_cpu={:.1}%",
+            std::path::Path::new(&wake_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            gate_on,
+            stt_calls,
+            stt_cpu_s,
+            vad_cpu.as_secs_f64(),
+            avg_cpu_pct,
+        );
+
+        // --- Positive set: 30/30 must still wake through the gated path ---
+        let positives = [
+            "Hey Jarvis",
+            "Hey Jarvis, are you there?",
+            "Hey Jarvis, what time is it?",
+            "Hey Jarvis, open Safari",
+            "Hey Jarvis, stop",
+            "Hey Jarvis, hello",
+            "Hey Jarvis, can you hear me?",
+            "Hey Jarvis, thanks",
+            "Hey Jarvis, tell me a joke",
+            "Hey Jarvis, play music",
+            "Hey Jarvis, turn it down",
+            "Hey Jarvis, turn it up",
+            "Hey Jarvis, next",
+            "Hey Jarvis, done",
+            "Hey Jarvis, yes",
+            "Hey Jarvis, no",
+            "Hey Jarvis, wait",
+            "Hey Jarvis, come back",
+            "Hey Jarvis, I need help",
+            "Hey Jarvis, good morning",
+            "Hey Jarvis, good night",
+            "Hey Jarvis, read this",
+            "Hey Jarvis, look here",
+            "Hey Jarvis, remember this",
+            "Hey Jarvis, do the thing",
+            "Hey Jarvis, thanks a lot",
+            "Hey Jarvis, help me",
+            "Hey Jarvis, listen up",
+            "Hey Jarvis, over here",
+            "Hey Jarvis, what is two plus two?",
+        ];
+        let mut pos_hits = 0u32;
+        for text in positives {
+            let Some(samples) = say_wav_rate(text, 16_000) else {
+                continue;
+            };
+            // Same gate: only the first ~2 s, then match.
+            let cap = (WAKE_TRANSCRIBE_MS as usize * TARGET_RATE as usize) / 1000;
+            let head = &samples[..samples.len().min(cap)];
+            let transcript = transcribe_with_context(&ctx, head).unwrap_or_default();
+            if crate::voice::match_wake(&transcript, &phrase, cfg.wake_sensitivity).is_some() {
+                pos_hits += 1;
+            }
+        }
+        eprintln!(
+            "wake-cpu: positive {pos_hits}/{} (cap {}ms head)",
+            positives.len(),
+            WAKE_TRANSCRIBE_MS
+        );
+        assert_eq!(
+            pos_hits,
+            positives.len() as u32,
+            "positive wake recall dropped below 30/30 with the gate"
+        );
     }
 }
