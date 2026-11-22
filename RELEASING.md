@@ -53,7 +53,7 @@ match it. The release workflow **fails** if a tag's version differs from
     ```
 
     Only the `xenon` binary is bundled (`autobins = false` in `Cargo.toml`);
-    the mock MCP server used by tests runs via `xenon --mcp-mock-server`, so
+    the mock MCP server used by tests runs inside the test executable, so
     `Xenon.app/Contents/MacOS/` stays clean and `codesign` succeeds. CI runs
     `cargo test` (mock tests included) before any bundle step.
 

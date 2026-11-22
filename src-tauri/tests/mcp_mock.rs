@@ -1,18 +1,27 @@
-//! Integration test: spawn the Xenon binary in mock-server mode
-    //! (`xenon --mcp-mock-server`) and speak the stdio JSON-RPC protocol
-    //! directly. `cargo test` builds the `xenon` bin, so no separate mock bin
-    //! is needed and nothing extra lands in release bundles.
+//! Integration test: spawn the mock MCP server from this very test binary
+//! (`current_exe --exact mcp_mock_server_entry --nocapture` with
+//! `XENON_MCP_MOCK_CHILD=1`) and speak the stdio JSON-RPC protocol directly.
+//! No external binary is built or bundled, so this works on a clean checkout.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-/// Path to the `xenon` binary built by `cargo test`. `current_exe()` is
-/// `target/<profile>/deps/<test-hash>`; the bin lives one level up.
-fn xenon_bin() -> std::path::PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let profile_dir = exe.parent().and_then(|p| p.parent()).expect("profile dir");
-    profile_dir.join("xenon")
+/// Name of the guarded entry test (no module prefix in an integration test).
+const ENTRY: &str = "mcp_mock_server_entry";
+/// Env var the spawner sets; the entry test only serves when it is present.
+const ENV: &str = "XENON_MCP_MOCK_CHILD";
+
+/// Guarded entry point used as the mock server child process. Returns
+/// immediately during a normal `cargo test` run.
+#[test]
+fn mcp_mock_server_entry() {
+    let spawned = std::env::var_os(ENV).is_some()
+        && std::env::args().any(|a| a == "--exact")
+        && std::env::args().any(|a| a == "--nocapture");
+    if spawned {
+        xenon_lib::mcp_mock::run();
+    }
 }
 
 fn spawn() -> (
@@ -20,8 +29,9 @@ fn spawn() -> (
     std::process::ChildStdin,
     BufReader<std::process::ChildStdout>,
 ) {
-    let mut child = Command::new(xenon_bin())
-        .arg("--mcp-mock-server")
+    let mut child = Command::new(std::env::current_exe().expect("current_exe"))
+        .args(["--exact", ENTRY, "--nocapture"])
+        .env(ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -38,10 +48,16 @@ fn send(stdin: &mut std::process::ChildStdin, value: serde_json::Value) {
     stdin.flush().unwrap();
 }
 
+/// Read the next JSON-RPC message, skipping libtest's banner/progress lines.
 fn recv(reader: &mut BufReader<std::process::ChildStdout>) -> serde_json::Value {
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read response");
-    serde_json::from_str(line.trim()).expect("parse response")
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read response");
+        assert!(n > 0, "mock server closed stdout");
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            return v;
+        }
+    }
 }
 
 fn id_is(v: &serde_json::Value, id: u64) -> bool {

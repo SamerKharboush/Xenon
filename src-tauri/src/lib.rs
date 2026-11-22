@@ -6,6 +6,6 @@
 //! target; it intentionally re-exports nothing to avoid double-compiling
 //! the module tree.
 
-/// Placeholder so the crate has at least one item.
-#[allow(dead_code)]
-fn _lib_placeholder() {}
+/// Built-in mock MCP server (`mcp_mock`). Declared here as well as in
+/// `main.rs` so `tests/mcp_mock.rs` can drive it without a separate binary.
+pub mod mcp_mock;

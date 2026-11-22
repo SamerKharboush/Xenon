@@ -10,6 +10,7 @@ mod headless;
 mod hub;
 mod mcp;
 mod mcp_import;
+mod mcp_mock;
 mod mcpui;
 mod permissions;
 mod presets;
@@ -35,10 +36,11 @@ use runtime::Runtime;
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Built-in mock MCP server (tests spawn `xenon --mcp-mock-server` and speak
-    // JSON-RPC over stdin/stdout). Must run before any config or Tauri init.
+    // Built-in mock MCP server (tests spawn the test binary with a guarded
+    // entry test; `xenon --mcp-mock-server` is the manual equivalent). Must
+    // run before any config or Tauri init.
     if std::env::args().any(|a| a == "--mcp-mock-server") {
-        mcp::mock::run();
+        mcp_mock::run();
         std::process::exit(0);
     }
 

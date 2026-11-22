@@ -273,9 +273,11 @@ cargo test -- --ignored
 ```
 
 The mock MCP server (used by `mcp.rs` unit tests and `tests/mcp_mock.rs`) is
-not a separate binary: tests spawn `xenon --mcp-mock-server` (the test-built
-`xenon` bin) and speak JSON-RPC over stdio. This keeps `Xenon.app/Contents/
-MacOS/` clean — only `xenon` is bundled, so codesign succeeds.
+not a separate binary. Tests spawn their **own test executable** with a guarded
+entry test (`current_exe --exact ...::mcp_mock_server_entry --nocapture` plus
+`XENON_MCP_MOCK_CHILD=1`) and speak JSON-RPC over stdio. Nothing outside the
+test binary is needed, so `cargo test` works on a clean checkout, and
+`Xenon.app/Contents/MacOS/` stays clean so `codesign` succeeds.
 
 ### Stress harnesses
 
