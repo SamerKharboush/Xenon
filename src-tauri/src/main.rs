@@ -252,6 +252,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     let talk_item = MenuItem::with_id(app, "talk", "Talk", true, None::<&str>)?;
     let type_item = MenuItem::with_id(app, "type", "Type a message…", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+    let check_item = MenuItem::with_id(app, "check-updates", "Check for Updates…", true, None::<&str>)?;
     let support_item = MenuItem::with_id(app, "support", "Support Xenon ♥", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
@@ -262,6 +263,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             &talk_item,
             &type_item,
             &settings_item,
+            &check_item,
             &support_item,
             &sep,
             &quit_item,
@@ -304,6 +306,15 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             }
             "settings" => {
                 let _ = ui::open_settings(app.app_handle().clone());
+            }
+            "check-updates" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = updater::check_now_impl(&app).await {
+                        log::warn!("tray update check failed: {e}");
+                        let _ = app.emit("xenon-notice", format!("Update check failed: {e}"));
+                    }
+                });
             }
             "support" => {
                 // Open Settings scrolled to the Support section.

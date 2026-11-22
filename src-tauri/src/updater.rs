@@ -2,20 +2,22 @@
 //!
 //! Flow: GET `/releases/latest` → compare semver → if newer, show a pet-bubble
 //! notice and (on demand) download the universal DMG to `~/Downloads`, verify
-//! its SHA-256 against `SHA256SUMS`, then `open` it so the user can drag the
-//! app to Applications. Nothing is installed silently.
+//! its SHA-256 against `SHA256SUMS`, mount it read-only, verify the bundled
+//! app, then stage it next to the running bundle and relaunch after exit.
 //!
-//! Check schedule: 60 s after launch if the last check was > 24 h ago, then
-//! every 24 h while running. `last_update_check` (unix seconds) and
-//! `skipped_version` persist in the config.
+//! Check schedule: 10 s after launch if the last check was > 6 h ago, then
+//! every 6 h while running (plus once whenever Settings opens). `last_update_check`
+//! (unix seconds) and `skipped_version` persist in the config.
 
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::sync::RwLock;
 
 use crate::ui::ArcRwLockConfig;
@@ -32,8 +34,8 @@ fn api_url() -> String {
 const USER_AGENT: &str = "Xenon-Updater";
 /// Public Releases page, shown when a download ultimately fails.
 const RELEASES_PAGE: &str = "https://github.com/SamerKharboush/Xenon/releases";
-const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const STARTUP_DELAY: Duration = Duration::from_secs(60);
+const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const STARTUP_DELAY: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One asset of a GitHub Release (only the fields we read).
@@ -242,6 +244,434 @@ pub fn status_from(pending: Option<&PendingUpdate>, current: &str) -> UpdateStat
     }
 }
 
+// --- in-place install helpers (pure parts unit-tested) ---------------------
+
+const BUNDLE_ID: &str = "com.xenon.app";
+const APPLICATIONS: &str = "/Applications";
+
+/// Where an in-place install may write. `Fallback` keeps the old
+/// download-and-open behaviour (the user drags the app themselves).
+#[derive(Debug, PartialEq, Eq)]
+pub enum InstallTarget {
+    Install { target: PathBuf, staged: PathBuf },
+    Fallback(String),
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+fn plist_string_on(line: &str) -> Option<String> {
+    let start = line.find("<string>")?;
+    let rest = &line[start + "<string>".len()..];
+    let end = rest.find("</string>")?;
+    Some(xml_unescape(&rest[..end]))
+}
+
+/// All `<string>` values following `<key>{key}</key>` in an XML plist.
+/// Handles the one-value-per-line format emitted by `hdiutil -plist` and
+/// `plutil -convert xml1 -o -`.
+fn plist_strings_for(xml: &str, key: &str) -> Vec<String> {
+    let needle = format!("<key>{key}</key>");
+    let lines: Vec<&str> = xml.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains(&needle) {
+            continue;
+        }
+        // Same line (e.g. `<key>k</key><string>v</string>`).
+        if let Some(after) = line.split_once(&needle).map(|(_, s)| s) {
+            if let Some(v) = plist_string_on(after) {
+                out.push(v);
+                continue;
+            }
+        }
+        for next in lines.iter().skip(i + 1).take(3) {
+            if let Some(v) = plist_string_on(next) {
+                out.push(v);
+                break;
+            }
+            if next.contains("<key>") {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Mount points from an `hdiutil attach -plist` blob. A DMG can carry several
+/// partitions; callers pick the one containing `Xenon.app`.
+pub fn parse_mount_points(plist: &str) -> Vec<String> {
+    plist_strings_for(plist, "mount-point")
+}
+
+/// Verify the app's `Info.plist` XML against the release version + bundle ID.
+pub fn verify_bundle_plist(xml: &str, expected_version: &str) -> Result<(), String> {
+    let id = plist_strings_for(xml, "CFBundleIdentifier")
+        .into_iter()
+        .next()
+        .ok_or("Info.plist has no CFBundleIdentifier")?;
+    let version = plist_strings_for(xml, "CFBundleShortVersionString")
+        .into_iter()
+        .next()
+        .ok_or("Info.plist has no CFBundleShortVersionString")?;
+    let expected = parse_version(expected_version)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| expected_version.trim_start_matches(['v', 'V']).to_string());
+    if id != BUNDLE_ID {
+        return Err(format!("wrong bundle identifier: {id}"));
+    }
+    if version != expected {
+        return Err(format!("wrong bundle version: {version} (expected {expected})"));
+    }
+    Ok(())
+}
+
+fn version_component(version: &str) -> String {
+    version
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// True when a directory can hold the staged copy (owner/group/other write
+/// bit). A metadata failure is treated as "not writable" so we never try to
+/// swap a bundle we cannot replace.
+#[cfg(unix)]
+pub fn app_dir_writable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|m| !m.permissions().readonly() && m.permissions().mode() & 0o222 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+pub fn app_dir_writable(_: &Path) -> bool {
+    false
+}
+
+/// Compute the install target and the hidden staged copy next to the running
+/// bundle. Only `/Applications/Xenon.app` is eligible; a relocated (e.g.
+/// translocated) bundle must fall back to opening the DMG.
+pub fn install_paths(exe: &Path, version: &str) -> InstallTarget {
+    let Some(bundle) = exe.parent().and_then(Path::parent).and_then(Path::parent) else {
+        return InstallTarget::Fallback("cannot locate the running app bundle".to_string());
+    };
+    if bundle.file_name().and_then(|s| s.to_str()) != Some("Xenon.app") {
+        return InstallTarget::Fallback("not running from Xenon.app".to_string());
+    }
+    let path = bundle.to_string_lossy().to_string();
+    if path.contains("AppTranslocation")
+        || path.starts_with("/private/var/folders/")
+        || path.starts_with("/var/folders/")
+    {
+        return InstallTarget::Fallback("running from a translocated path".to_string());
+    }
+    let Some(parent) = bundle.parent() else {
+        return InstallTarget::Fallback("cannot locate the Applications folder".to_string());
+    };
+    if parent != Path::new(APPLICATIONS) {
+        return InstallTarget::Fallback(format!("app is not in {APPLICATIONS}"));
+    }
+    InstallTarget::Install {
+        target: bundle.to_path_buf(),
+        staged: parent.join(format!(".Xenon-update-{}.app", version_component(version))),
+    }
+}
+
+/// Shell-quote a path for the helper script.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Detached swap helper. `$1` = staged app, `$2` = target app, `$3` = trash
+/// destination (e.g. `~/.Trash/Xenon 0.3.0 123.app`). Commands are injected so
+/// the pure text can be checked and the ignored integration test can run a swap
+/// without a real Trash, /Applications, or `open`.
+pub fn helper_script(wait: &str, trash: &str, launch: &str, restore: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+trap '' HUP\n\
+staged=$1\ntarget=$2\ndest=$3\n\
+log() {{ f=${{XENON_UPDATE_LOG:-$HOME/Library/Logs/Xenon/update.log}}; mkdir -p \"$(dirname \"$f\")\" && echo \"$1\" >> \"$f\"; }}\n\
+{wait}\n\
+if {trash}; then log \"trash old ok\"; else log \"trash old failed\"; {restore}; rm -rf \"$staged\" 2>/dev/null || true; {launch}; log \"relaunch old\"; exit 1; fi\n\
+if mv \"$staged\" \"$target\"; then log \"move staged ok\"; else log \"move staged failed\"; {restore}; rm -rf \"$staged\" 2>/dev/null || true; {launch}; log \"relaunch old\"; exit 1; fi\n\
+xattr -dr com.apple.quarantine \"$target\" 2>/dev/null || true\n\
+{launch}\n\
+log \"launch ok\"\n"
+    )
+}
+
+fn helper_script_path() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("xenon-finish-update-{}-{nanos}.sh", std::process::id()))
+}
+
+/// Restore the old bundle after a failed swap, if it was moved to the trash
+/// destination and the staged copy is not in place.
+fn restore_old_cmd() -> &'static str {
+    r#"if [ ! -e "$target" ] && [ -e "$dest" ]; then mv "$dest" "$target" || ditto "$dest" "$target"; fi"#
+}
+
+/// Commands used by the production swap helper. `$dest` is the trash path
+/// (e.g. `~/.Trash/Xenon 0.3.0 123.app`) passed by Rust as `$3`.
+fn production_helper_script(pid: u32, _trash_dest: &Path) -> String {
+    let wait = format!("while kill -0 {pid} 2>/dev/null; do sleep 0.2; done");
+    let trash = r#"if mv "$target" "$dest"; then :; else ditto "$target" "$dest" && rm -rf "$target"; fi"#;
+    let launch = r#"open -a "$target" >/dev/null 2>&1"#;
+    helper_script(&wait, trash, launch, restore_old_cmd())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn run_swap_helper(
+    staged: &Path,
+    target: &Path,
+    trash: &str,
+    wait: &str,
+    launch: &str,
+) -> Result<String, String> {
+    let trash_dest = target.parent().unwrap_or(Path::new("/tmp")).join("old.app");
+    run_swap_helper_with_dest(staged, target, &trash_dest, trash, wait, launch)
+}
+
+fn run_swap_helper_with_dest(
+    staged: &Path,
+    target: &Path,
+    trash_dest: &Path,
+    trash: &str,
+    wait: &str,
+    launch: &str,
+) -> Result<String, String> {
+    let script = write_helper_script_text(&helper_script(wait, trash, launch, restore_old_cmd()))?;
+    let out = Command::new("/bin/sh")
+        .arg(&script)
+        .arg(staged)
+        .arg(target)
+        .arg(trash_dest)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let _ = fs::remove_file(&script);
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Mounted DMG; always detached (even on an early error) by `Drop`.
+struct MountedDmg {
+    mount: PathBuf,
+}
+
+impl Drop for MountedDmg {
+    fn drop(&mut self) {
+        let _ = Command::new("hdiutil")
+            .arg("detach")
+            .arg(&self.mount)
+            .arg("-quiet")
+            .output();
+    }
+}
+
+fn verify_bundle(app: &Path, version: &str) -> Result<(), String> {
+    let info = app.join("Contents/Info.plist");
+    let plist = Command::new("plutil")
+        .args(["-convert", "xml1", "-o", "-"])
+        .arg(&info)
+        .output()
+        .map_err(|e| format!("plutil: {e}"))?;
+    if !plist.status.success() {
+        return Err(format!("cannot read {}", info.display()));
+    }
+    verify_bundle_plist(&String::from_utf8_lossy(&plist.stdout), version)?;
+
+    let sig = Command::new("codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(app)
+        .output()
+        .map_err(|e| format!("codesign: {e}"))?;
+    if !sig.status.success() {
+        return Err(format!(
+            "codesign verification failed: {}",
+            String::from_utf8_lossy(&sig.stderr).trim()
+        ));
+    }
+
+    let req = Command::new("codesign")
+        .args(["-dr", "-"])
+        .arg(app)
+        .output()
+        .map_err(|e| format!("codesign -dr: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&req.stdout),
+        String::from_utf8_lossy(&req.stderr)
+    );
+    if !req.status.success() || !text.contains("identifier \"com.xenon.app\"") {
+        return Err(format!("designated requirement is not {BUNDLE_ID}: {}", text.trim()));
+    }
+    Ok(())
+}
+
+fn open_dmg(dmg: &Path) -> Result<(), String> {
+    if std::env::var_os("XENON_UPDATE_NO_OPEN").is_none() {
+        Command::new("open")
+            .arg(dmg)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    } else {
+        log::info!("update harness: skipping `open` (XENON_UPDATE_NO_OPEN)");
+    }
+    Ok(())
+}
+
+/// Downloaded + SHA-verified DMG → in-place install, or the old open-and-drag
+/// fallback when the running bundle is not in writable `/Applications`.
+fn install_dmg<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    dmg: &Path,
+    version: &str,
+) -> Result<(), String> {
+    notify(Some(app), "Installing…");
+    let exe = std::env::current_exe().map_err(|e| format!("running bundle path: {e}"))?;
+    let (target, staged) = match install_paths(&exe, version) {
+        InstallTarget::Install { target, staged } => (target, staged),
+        InstallTarget::Fallback(reason) => return install_fallback(app, dmg, &reason),
+    };
+    if !app_dir_writable(target.parent().expect("bundle has a parent")) {
+        return install_fallback(app, dmg, &format!("{} is not writable", target.parent().unwrap().display()));
+    }
+
+    let result = swap_in_place(app, dmg, version, &target, &staged);
+    if result.is_err() {
+        // Never touch the running bundle on failure; drop only our staged copy.
+        let _ = fs::remove_dir_all(&staged);
+    }
+    result
+}
+
+fn install_fallback<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    dmg: &Path,
+    reason: &str,
+) -> Result<(), String> {
+    log::info!("in-place update unavailable: {reason}");
+    open_dmg(dmg)?;
+    notify(
+        Some(app),
+        format!("Automatic install needs /Applications ({reason}). Drag Xenon to Applications."),
+    );
+    Ok(())
+}
+
+fn swap_in_place<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    dmg: &Path,
+    version: &str,
+    target: &Path,
+    staged: &Path,
+) -> Result<(), String> {
+    let mount = std::env::temp_dir().join(format!(
+        "xenon-dmg-mount-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&mount).map_err(|e| e.to_string())?;
+    let out = Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-readonly", "-plist", "-mountpoint"])
+        .arg(&mount)
+        .arg(dmg)
+        .output()
+        .map_err(|e| format!("hdiutil attach: {e}"))?;
+    if !out.status.success() {
+        let _ = fs::remove_dir(&mount);
+        return Err(format!(
+            "mount failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mounted = MountedDmg { mount };
+
+    let points = parse_mount_points(&String::from_utf8_lossy(&out.stdout));
+    let app_in_dmg = points
+        .iter()
+        .map(|p| PathBuf::from(p).join("Xenon.app"))
+        .find(|p| p.is_dir())
+        .ok_or("DMG has no mounted Xenon.app")?;
+    verify_bundle(&app_in_dmg, version)?;
+
+    if staged.exists() {
+        fs::remove_dir_all(staged).map_err(|e| e.to_string())?;
+    }
+    let ditto = Command::new("ditto")
+        .arg(&app_in_dmg)
+        .arg(staged)
+        .output()
+        .map_err(|e| format!("ditto: {e}"))?;
+    if !ditto.status.success() {
+        return Err(format!(
+            "staging copy failed: {}",
+            String::from_utf8_lossy(&ditto.stderr).trim()
+        ));
+    }
+    drop(mounted);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let trash_dest = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".Trash")
+        .join(format!("Xenon {} {nanos}.app", version_component(CURRENT_VERSION)));
+
+    let script = write_helper_script_text(&production_helper_script(
+        std::process::id(),
+        &trash_dest,
+    ))?;
+    Command::new("/bin/sh")
+        .arg(&script)
+        .arg(staged)
+        .arg(target)
+        .arg(&trash_dest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("swap helper: {e}"))?;
+
+    notify(Some(app), "Restarting…");
+    // Give the bubble a moment to paint before the process exits.
+    std::thread::sleep(Duration::from_millis(500));
+    app.exit(0);
+    Ok(())
+}
+
+fn write_helper_script_text(text: &str) -> Result<PathBuf, String> {
+    let path = helper_script_path();
+    fs::write(&path, text).map_err(|e| e.to_string())?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 // --- network -----------------------------------------------------------------
 
 fn http_timeout() -> Duration {
@@ -332,8 +762,8 @@ async fn fetch_latest() -> Result<Option<Release>, String> {
 /// Run one update check: fetch, compare, update shared state, notify the user.
 /// `force` ignores the "already checked recently" gate and always contacts the
 /// API (used by the Settings "Check now" button).
-pub async fn check_once(
-    app: &tauri::AppHandle,
+pub async fn check_once<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     config: &ArcRwLockConfig,
     state: &UpdaterState,
     force: bool,
@@ -415,7 +845,7 @@ pub async fn check_once(
     // Reveal + relabel the tray item ("Update to vX.Y.Z…").
     state.show_update_item(&latest_tag).await;
 
-    let notice = format!("Xenon v{} is available", latest_tag);
+    let notice = format!("Update to v{latest_tag} available");
     let _ = app.emit("xenon-notice", notice.clone());
     log::info!("update available: {latest_tag}");
 
@@ -445,8 +875,8 @@ pub async fn skip_pending(config: &ArcRwLockConfig, state: &UpdaterState) {
     state.hide_update_item().await;
 }
 
-/// Spawn the background scheduler. 60 s after launch if a check is due, then
-/// every 24 h while the app runs.
+/// Spawn the background scheduler: 10 s after launch if a check is due, then
+/// every 6 h while the app runs.
 pub fn setup(app: &tauri::AppHandle, config: ArcRwLockConfig, state: Arc<UpdaterState>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -455,6 +885,37 @@ pub fn setup(app: &tauri::AppHandle, config: ArcRwLockConfig, state: Arc<Updater
             let _ = check_once(&app, &config, &state, false).await;
             tokio::time::sleep(CHECK_INTERVAL).await;
         }
+    });
+}
+
+/// Force a check and show the result in the pet bubble. Used by the tray
+/// "Check for Updates…" item and Settings → Check now.
+pub async fn check_now_impl<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<UpdateStatus, String> {
+    let config = app.state::<ArcRwLockConfig>().inner().clone();
+    let state = app.state::<Arc<UpdaterState>>().inner().clone();
+    let status = check_once(app, &config, &state, true).await?;
+    if !status.available {
+        let msg = match (status.latest_version.as_deref(), status.message.as_str()) {
+            (Some(v), m) if m.contains("skipped") => format!("Xenon v{v} skipped"),
+            (_, m) if m.starts_with("Up to date") => {
+                format!("Xenon is up to date (v{})", status.current_version)
+            }
+            _ => status.message.clone(),
+        };
+        notify(Some(app), msg);
+    }
+    Ok(status)
+}
+
+/// Settings opening is a good moment to check without waiting for the timer.
+pub fn check_on_settings_open<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let config = app.state::<ArcRwLockConfig>().inner().clone();
+    let state = app.state::<Arc<UpdaterState>>().inner().clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = check_once(&app, &config, &state, false).await;
     });
 }
 
@@ -469,14 +930,11 @@ pub fn get_update_status(state: tauri::State<'_, Arc<UpdaterState>>) -> UpdateSt
     status
 }
 
-/// "Check now" button: force a check and return a human-readable result.
+/// "Check now" button / tray item: force a check and return a human-readable
+/// result (also emitted in the bubble).
 #[tauri::command]
-pub async fn check_now(
-    app: tauri::AppHandle,
-    config: tauri::State<'_, ArcRwLockConfig>,
-    state: tauri::State<'_, Arc<UpdaterState>>,
-) -> Result<UpdateStatus, String> {
-    check_once(&app, &config, &state, true).await
+pub async fn check_now(app: tauri::AppHandle) -> Result<UpdateStatus, String> {
+    check_now_impl(&app).await
 }
 
 /// "Skip this version" in Settings: record the pending version as skipped.
@@ -490,9 +948,10 @@ pub async fn skip_update(
 }
 
 /// Tray menu / Settings button: download the pending DMG to ~/Downloads,
-/// verify its SHA-256, and `open` it. Emits progress via `xenon-notice`.
-pub async fn install_update_impl(
-    app: &tauri::AppHandle,
+/// verify its SHA-256, install it in place (or open the DMG if the running
+/// app is not in writable /Applications). Emits progress via `xenon-notice`.
+pub async fn install_update_impl<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &UpdaterState,
 ) -> Result<(), String> {
     let pending = {
@@ -516,14 +975,14 @@ pub async fn install_update(
 
 // --- download + verify -------------------------------------------------------
 
-fn notify(app: Option<&tauri::AppHandle>, msg: impl Into<String>) {
+fn notify<R: tauri::Runtime>(app: Option<&tauri::AppHandle<R>>, msg: impl Into<String>) {
     if let Some(app) = app {
         let _ = app.emit("xenon-notice", msg.into());
     }
 }
 
-async fn download_and_open(
-    app: Option<&tauri::AppHandle>,
+async fn download_and_open<R: tauri::Runtime>(
+    app: Option<&tauri::AppHandle<R>>,
     p: &PendingUpdate,
 ) -> Result<(), String> {
     let downloads = std::env::var_os("XENON_UPDATE_DOWNLOAD_DIR")
@@ -556,25 +1015,35 @@ async fn download_and_open(
     let cfg = DownloadConfig::default();
     download_verified(&p.dmg_url, &dest, expected.as_deref(), &cfg, app, &p.version).await?;
 
-    notify(
-        app,
-        format!(
-            "Verified ({} MB). Opening — drag Xenon to Applications.",
-            (file_len(&dest) as f64 / 1_048_576.0).round() as u64
-        ),
+    log::info!(
+        "update DMG downloaded to {} ({} MB)",
+        dest.display(),
+        file_len(&dest) / 1_048_576
     );
 
-    if std::env::var_os("XENON_UPDATE_NO_OPEN").is_none() {
-        std::process::Command::new("open")
-            .arg(&dest)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-    } else {
-        log::info!("update harness: skipping `open` (XENON_UPDATE_NO_OPEN)");
+    // Install in place when possible. Any failure here leaves the old app
+    // untouched and the DMG in ~/Downloads.
+    let result = match app {
+        Some(app) => install_dmg(app, &dest, &p.version),
+        None => install_dmg_paths_only(&dest, &p.version),
+    };
+    if let Err(e) = result {
+        notify(app, format!("Update failed: {e} — the DMG is in Downloads"));
+        return Err(format!("{e} — the DMG is in Downloads"));
     }
-
-    log::info!("update DMG downloaded to {}", dest.display());
     Ok(())
+}
+
+/// Used by tests (no Tauri app handle): decide install vs. open fallback only.
+fn install_dmg_paths_only(dmg: &Path, version: &str) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("running bundle path: {e}"))?;
+    match install_paths(&exe, version) {
+        InstallTarget::Install { .. } => Err("in-place install needs a Tauri app handle".into()),
+        InstallTarget::Fallback(reason) => {
+            log::info!("in-place update unavailable: {reason}");
+            open_dmg(dmg)
+        }
+    }
 }
 
 fn file_len(path: &std::path::Path) -> u64 {
@@ -595,12 +1064,12 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
 /// when the server answers 206; if it answers 200 the partial file is
 /// discarded and the download restarts. The SHA-256 is hashed from the
 /// finished file and the `.part` is renamed only after it verifies.
-async fn download_verified(
+async fn download_verified<R: tauri::Runtime>(
     url: &str,
     dest: &std::path::Path,
     expected: Option<&str>,
     cfg: &DownloadConfig,
-    app: Option<&tauri::AppHandle>,
+    app: Option<&tauri::AppHandle<R>>,
     version: &str,
 ) -> Result<(), String> {
     use futures_util::StreamExt;
@@ -743,6 +1212,8 @@ async fn download_verified(
     }
     drop(file);
 
+    notify(app, "Verifying…");
+
     // Hash the finished file (works for both fresh and resumed downloads).
     let digest = {
         use std::io::Read;
@@ -838,15 +1309,15 @@ mod tests {
 
     #[test]
     fn test_should_check_schedule() {
-        let day = 24 * 60 * 60;
+        let six_hours = 6 * 60 * 60;
         // Never checked → check.
         assert!(should_check(1000, 0));
         // Just checked → don't.
         assert!(!should_check(1000 + 10, 1000));
-        // 23 h later → don't.
-        assert!(!should_check(1000 + day - 60, 1000));
-        // 24 h later → yes.
-        assert!(should_check(1000 + day, 1000));
+        // 5 h later → don't.
+        assert!(!should_check(1000 + six_hours - 60, 1000));
+        // 6 h later → yes.
+        assert!(should_check(1000 + six_hours, 1000));
         // Clock skew (last in the future) → don't.
         assert!(!should_check(1000, 2000));
     }
@@ -1028,7 +1499,7 @@ def456  Xenon_0.3.0_universal.app.zip
             dmg_url: dmg_asset.browser_download_url.clone(),
             checksums_url: find_checksums(&release).map(|a| a.browser_download_url.clone()),
         };
-        download_and_open(None, &p).await.expect("good hash downloads");
+        download_and_open::<tauri::Wry>(None, &p).await.expect("good hash downloads");
         assert_eq!(std::fs::read(dl.join(&p.dmg_name)).unwrap(), dmg);
         eprintln!("updater mock: correct hash accepted");
 
@@ -1049,7 +1520,7 @@ def456  Xenon_0.3.0_universal.app.zip
             dmg_url: dmg_asset.browser_download_url.clone(),
             checksums_url: find_checksums(&release).map(|a| a.browser_download_url.clone()),
         };
-        let err = download_and_open(None, &p).await.unwrap_err();
+        let err = download_and_open::<tauri::Wry>(None, &p).await.unwrap_err();
         assert!(err.contains("checksum mismatch"), "{err}");
         assert!(!dl.join(&p.dmg_name).exists(), "bad DMG must be removed");
         eprintln!("updater mock: wrong hash refused");
@@ -1108,7 +1579,7 @@ def456  Xenon_0.3.0_universal.app.zip
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("slow.dmg");
         let cfg = dl_config(5000, 0);
-        download_verified(
+        download_verified::<tauri::Wry>(
             &format!("http://{addr}/dmg"),
             &dest,
             Some(&hash),
@@ -1173,7 +1644,7 @@ def456  Xenon_0.3.0_universal.app.zip
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("resume.dmg");
         let cfg = dl_config(2000, 1);
-        download_verified(
+        download_verified::<tauri::Wry>(
             &format!("http://{addr}/dmg"),
             &dest,
             Some(&hash),
@@ -1223,7 +1694,7 @@ def456  Xenon_0.3.0_universal.app.zip
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("restart.dmg");
         let cfg = dl_config(2000, 1);
-        download_verified(
+        download_verified::<tauri::Wry>(
             &format!("http://{addr}/dmg"),
             &dest,
             Some(&hash),
@@ -1266,7 +1737,7 @@ def456  Xenon_0.3.0_universal.app.zip
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("stall.dmg");
         let cfg = dl_config(150, 1);
-        let err = download_verified(
+        let err = download_verified::<tauri::Wry>(
             &format!("http://{addr}/dmg"),
             &dest,
             None,
@@ -1321,7 +1792,7 @@ def456  Xenon_0.3.0_universal.app.zip
         std::env::set_var("XENON_UPDATE_NO_OPEN", "1");
 
         let started = std::time::Instant::now();
-        download_and_open(None, &p).await.expect("live download");
+        download_and_open::<tauri::Wry>(None, &p).await.expect("live download");
         eprintln!(
             "live: downloaded {} in {:?} ({} MB), SHA-256 verified",
             p.dmg_name,
@@ -1329,5 +1800,184 @@ def456  Xenon_0.3.0_universal.app.zip
             file_len(&dir.join(&p.dmg_name)) / 1_048_576
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_mount_points() {
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>system-entities</key>
+<array></array>
+<key>mount-point</key>
+<string>/private/tmp/xenon-dmg-123</string>
+<key>partition-name</key>
+<string>Xenon</string>
+<key>mount-point</key>
+<string>/private/tmp/xenon-dmg-456</string>
+</dict></plist>"#;
+        assert_eq!(
+            parse_mount_points(plist),
+            vec![
+                "/private/tmp/xenon-dmg-123".to_string(),
+                "/private/tmp/xenon-dmg-456".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_verify_bundle_plist() {
+        let good = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key>
+<string>com.xenon.app</string>
+<key>CFBundleShortVersionString</key>
+<string>0.3.4</string>
+</dict></plist>"#;
+        verify_bundle_plist(good, "v0.3.4").unwrap();
+
+        let wrong_id = good.replace("com.xenon.app", "com.example.app");
+        assert!(verify_bundle_plist(&wrong_id, "0.3.4").unwrap_err().contains("bundle identifier"));
+
+        let wrong_version = good.replace("0.3.4", "0.3.3");
+        assert!(verify_bundle_plist(&wrong_version, "0.3.4").unwrap_err().contains("bundle version"));
+
+        let missing = r#"<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.xenon.app</string></dict></plist>"#;
+        assert!(verify_bundle_plist(missing, "0.3.4").is_err());
+    }
+
+    #[test]
+    fn test_install_paths() {
+        let exe = Path::new("/Applications/Xenon.app/Contents/MacOS/xenon");
+        match install_paths(exe, "0.3.4") {
+            InstallTarget::Install { target, staged } => {
+                assert_eq!(target, PathBuf::from("/Applications/Xenon.app"));
+                assert_eq!(staged, PathBuf::from("/Applications/.Xenon-update-0.3.4.app"));
+            }
+            other => panic!("expected in-place install, got {other:?}"),
+        }
+        // A leading v is kept in the staging name; odd characters are replaced.
+        match install_paths(exe, "v0.3.4+build 2") {
+            InstallTarget::Install { staged, .. } => {
+                assert_eq!(staged, PathBuf::from("/Applications/.Xenon-update-v0.3.4_build_2.app"));
+            }
+            other => panic!("expected in-place install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_install_paths_fallbacks() {
+        let translocated =
+            Path::new("/private/var/folders/ab/AppTranslocation/xy/d/Xenon.app/Contents/MacOS/xenon");
+        match install_paths(translocated, "0.3.4") {
+            InstallTarget::Fallback(reason) => assert!(reason.contains("translocated"), "{reason}"),
+            other => panic!("expected translocated fallback, got {other:?}"),
+        }
+
+        let elsewhere = Path::new("/Users/me/Applications/Xenon.app/Contents/MacOS/xenon");
+        match install_paths(elsewhere, "0.3.4") {
+            InstallTarget::Fallback(reason) => assert!(reason.contains("not in /Applications"), "{reason}"),
+            other => panic!("expected /Applications fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_helper_script() {
+        let wait = "while kill -0 42 2>/dev/null; do sleep 0.2; done";
+        let trash = r#"mv "$target" "$dest""#;
+        let launch = r#"open -a "$target""#;
+        let restore = r#"if [ ! -e "$target" ] && [ -e "$dest" ]; then mv "$dest" "$target" || ditto "$dest" "$target"; fi"#;
+        let script = helper_script(wait, trash, launch, restore);
+        assert!(script.contains("staged=$1"));
+        assert!(script.contains("target=$2"));
+        assert!(script.contains("dest=$3"));
+        assert!(script.contains("log()"));
+        assert!(script.contains("Library/Logs/Xenon/update.log"));
+        assert!(script.contains(wait));
+        assert!(script.contains(trash));
+        assert!(script.contains(r#"mv "$staged" "$target""#));
+        assert!(script.contains("xattr -dr com.apple.quarantine"));
+        assert!(script.contains(launch));
+        assert!(script.contains(restore));
+        // Order: in the success path trash old app, move staged into place,
+        // strip quarantine, then relaunch. The restore branch (before relaunch
+        // on failure) also contains `launch`, so find the success-path launch.
+        let trash_at = script.find("log \"trash old ok\"").unwrap();
+        let move_at = script.find("log \"move staged ok\"").unwrap();
+        let xattr_at = script.find("xattr -dr").unwrap();
+        let launch_ok_at = script.find("log \"launch ok\"").unwrap();
+        let launch_at = script[..launch_ok_at].rfind(launch).unwrap();
+        assert!(trash_at < move_at && move_at < xattr_at && xattr_at < launch_at);
+    }
+
+    #[test]
+    fn test_sh_quote() {
+        assert_eq!(sh_quote("/Applications/Xenon.app"), "'/Applications/Xenon.app'");
+        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+    }
+
+    /// Swap helper end-to-end against fake app dirs (no /Applications, no
+    /// real Trash, no real relaunch). Injects a `launch` command that appends
+    /// to a marker file so the test can verify restore/relaunch calls.
+    /// Run with:
+    /// `cargo test -- --ignored swap_helper_installs_staged_copy`
+    #[test]
+    #[ignore = "runs the swap helper against a temp target; no /Applications or Trash"]
+    fn swap_helper_installs_staged_copy() {
+        let root = std::env::temp_dir().join(format!("xenon-swap-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        // Success: trash moves old away, staged moves into place.
+        let staged = root.join("staged.app");
+        let target = root.join("target.app");
+        let trash = root.join("old.app");
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(staged.join("Info.plist"), b"new").unwrap();
+        fs::write(target.join("Info.plist"), b"old").unwrap();
+        let trash_cmd = format!("mv \"$target\" {}", sh_quote(trash.to_str().unwrap()));
+        run_swap_helper(&staged, &target, &trash_cmd, ":", ":").unwrap();
+        assert_eq!(fs::read(target.join("Info.plist")).unwrap(), b"new");
+        assert_eq!(fs::read(trash.join("Info.plist")).unwrap(), b"old");
+        assert!(!staged.exists(), "staged copy should be renamed away");
+
+        // Trash failure: helper restores old app and calls launch.
+        let staged = root.join("staged2.app");
+        let target = root.join("target2.app");
+        let trash = root.join("old2.app");
+        let launch_marker = root.join("launch2.txt");
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(staged.join("Info.plist"), b"new2").unwrap();
+        fs::write(target.join("Info.plist"), b"old2").unwrap();
+        let trash_cmd = format!("mv \"$target\" {}", sh_quote(trash.to_str().unwrap()));
+        // Make the trash destination path invalid (file in the way).
+        fs::write(&trash, b"blocker").unwrap();
+        let launch = format!(": > {} && echo called >> {}", sh_quote(launch_marker.to_str().unwrap()), sh_quote(launch_marker.to_str().unwrap()));
+        let result = run_swap_helper_with_dest(&staged, &target, &trash, &trash_cmd, ":", &launch);
+        assert!(result.is_err(), "trash failure should make helper exit non-zero");
+        assert_eq!(fs::read(target.join("Info.plist")).unwrap(), b"old2");
+        assert!(launch_marker.exists(), "launch should have been called");
+
+        // Move-staged failure: helper restores old app and calls launch.
+        let staged = root.join("staged3.app");
+        let target = root.join("target3.app");
+        let trash = root.join("old3.app");
+        let launch_marker = root.join("launch3.txt");
+        // staged does not exist, so `mv "$staged" "$target"` fails after the
+        // old app was trashed; restore + relaunch must run.
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("Info.plist"), b"old3").unwrap();
+        let trash_cmd = format!("mv \"$target\" {}", sh_quote(trash.to_str().unwrap()));
+        let launch = format!(": > {} && echo called >> {}", sh_quote(launch_marker.to_str().unwrap()), sh_quote(launch_marker.to_str().unwrap()));
+        // Use `run_swap_helper_with_dest` so `$3` (trash dest) is the path the
+        // test's injected trash command expects; `run_swap_helper` derives it
+        // as `<target>.parent/old.app`.
+        let result = run_swap_helper_with_dest(&staged, &target, &trash, &trash_cmd, ":", &launch);
+        assert!(result.is_err(), "missing staged copy should make helper exit non-zero");
+        assert_eq!(fs::read(target.join("Info.plist")).unwrap(), b"old3");
+        assert!(launch_marker.exists(), "launch should have been called");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

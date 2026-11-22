@@ -175,6 +175,8 @@ pub async fn update_config(
 /// (and its ~20 MB) is spawned until the user actually opens Settings.
 /// Closing the window destroys it; the next open rebuilds it.
 pub fn show_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    // Opening Settings is a user-visible moment to check for updates.
+    crate::updater::check_on_settings_open(app);
     if let Some(window) = app.get_webview_window("settings") {
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;

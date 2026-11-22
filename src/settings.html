@@ -518,10 +518,11 @@
                 <input type="checkbox" id="auto_check_updates">
                 <label for="auto_check_updates">Check for updates automatically</label>
             </div>
-            <div class="hint">Checks GitHub Releases for a newer Xenon at launch and every 24 hours while running. You are always asked before downloading.</div>
+            <div class="hint">Checks GitHub Releases for a newer Xenon at launch, every 6 hours while running, and when Settings opens. You are always asked before downloading.</div>
             <div class="field" style="margin-top:12px;">
                 <div class="update-row">
                     <button class="secondary btn-sm" id="check-update">Check now</button>
+                    <button class="primary btn-sm" id="install-update" style="display:none;">Install & Restart</button>
                     <button class="secondary btn-sm" id="skip-update" style="display:none;">Skip this version</button>
                 </div>
                 <div class="hint" id="update-status" style="margin-top:8px;">Not checked yet.</div>
@@ -1446,17 +1447,20 @@
         async function refreshUpdateStatus() {
             const el = document.getElementById('update-status');
             const skipBtn = document.getElementById('skip-update');
+            const installBtn = document.getElementById('install-update');
             try {
                 const s = await invoke('get_update_status');
                 const last = config.last_update_check || 0;
                 const lastTxt = last ? new Date(last * 1000).toLocaleString() : 'never';
                 let txt = `Current: v${s.currentVersion}. Last checked: ${lastTxt}. `;
                 if (s.available) {
-                    txt += `Update available: v${s.latestVersion}.`;
+                    txt += `Update available: v${s.latestVersion}. Use Install & Restart to apply it.`;
                     skipBtn.style.display = '';
+                    installBtn.style.display = '';
                 } else {
                     txt += s.message || 'No update available.';
                     skipBtn.style.display = 'none';
+                    installBtn.style.display = 'none';
                 }
                 el.textContent = txt;
             } catch (e) {
@@ -1467,18 +1471,31 @@
         document.getElementById('check-update').addEventListener('click', async () => {
             const el = document.getElementById('update-status');
             const skipBtn = document.getElementById('skip-update');
+            const installBtn = document.getElementById('install-update');
             el.textContent = 'Checking…';
             try {
                 const s = await invoke('check_now');
                 if (s.available) {
-                    el.textContent = `Update available: v${s.latestVersion}. Use the tray menu to download and install.`;
+                    el.textContent = `Update available: v${s.latestVersion}. Use Install & Restart to apply it.`;
                     skipBtn.style.display = '';
+                    installBtn.style.display = '';
                 } else {
                     el.textContent = s.message || 'No update available.';
                     skipBtn.style.display = 'none';
+                    installBtn.style.display = 'none';
                 }
             } catch (e) {
                 el.textContent = 'Check failed: ' + e;
+            }
+        });
+
+        document.getElementById('install-update').addEventListener('click', async () => {
+            const el = document.getElementById('update-status');
+            el.textContent = 'Installing…';
+            try {
+                await invoke('install_update');
+            } catch (e) {
+                el.textContent = 'Update failed: ' + e;
             }
         });
 
@@ -1487,6 +1504,7 @@
                 await invoke('skip_update');
                 document.getElementById('update-status').textContent = 'This version will be skipped.';
                 document.getElementById('skip-update').style.display = 'none';
+                document.getElementById('install-update').style.display = 'none';
             } catch (e) {
                 showStatus('Could not skip: ' + e, true);
             }

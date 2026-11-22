@@ -79,15 +79,22 @@ Each release attaches:
 
 ## In-app updates
 
-The app checks `GET /releases/latest` on GitHub 60 s after launch (if the last
-check was > 24 h ago) and every 24 h while running. When a newer version exists:
+The app checks `GET /releases/latest` 10 s after launch (if the last check was >
+6 h ago), every 6 h while running, and whenever Settings opens. When a newer
+version exists:
 
-- the pet shows a bubble: **"Xenon vX.Y.Z is available"**;
+- the pet shows a bubble: **"Update to vX.Y.Z available"**;
 - a tray item **"Update to vX.Y.Z…"** appears; clicking it downloads the DMG to
-  `~/Downloads`, verifies its SHA-256 against `SHA256SUMS`, and `open`s it;
-- Settings → **Updates** can force a check, show the last result, and
-  **Skip this version**.
+  `~/Downloads`, verifies its SHA-256 against `SHA256SUMS`, mounts it read-only,
+  verifies the bundle identifier/version/signature, stages a copy beside the
+  running app, moves the old app to the Trash, swaps in the new bundle, strips
+  quarantine, and relaunches;
+- the tray always has **"Check for Updates…"**, which reports the result in the
+  bubble;
+- Settings → **Updates** can force a check, show the last result, **Install &
+  Restart**, and **Skip this version**.
 
-Nothing is installed silently — the user always confirms by dragging the app to
-Applications. The last-check timestamp and skipped version persist in the config
-file.
+If the running app is not in a writable `/Applications` (e.g. it was run from
+another folder or is AppTranslocated), the updater opens the DMG and asks the
+user to drag Xenon to Applications instead. The last-check timestamp and skipped
+version persist in the config file.
