@@ -96,7 +96,27 @@ OSA
 
 # Bless the layout so Finder re-opens it the same way on the user's Mac.
 touch "$MOUNT/.DS_Store" 2>/dev/null || true
-hdi_retry "detach $MOUNT" "-force" hdiutil detach "$MOUNT"
+# Detach, treating "already gone" as success: on CI the first detach can
+# report "Resource busy" yet still unmount, and later retries then fail with
+# "No such file or directory".
+detach_mount() {
+    local n
+    for n in 1 2 3 4 5; do
+        if ! mount | grep -qF " on $MOUNT ("; then return 0; fi
+        echo "hdiutil detach $MOUNT (attempt $n/5)..." >&2
+        if [ "$n" -eq 5 ]; then
+            hdiutil detach "$MOUNT" -force >/dev/null 2>&1 || true
+        else
+            hdiutil detach "$MOUNT" >/dev/null 2>&1 || true
+        fi
+        sleep $((2 * n))
+    done
+    if mount | grep -qF " on $MOUNT ("; then
+        echo "hdiutil detach $MOUNT failed after 5 attempts" >&2
+        return 1
+    fi
+}
+detach_mount
 MOUNT=""
 
 hdi_retry "convert $OUT" "" hdiutil create -srcfolder "$STAGE" -volname "$VOLNAME" \
