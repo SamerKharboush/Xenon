@@ -43,7 +43,8 @@ const SECRETS_FALLBACK_PATH: &str = "secrets.json";
 /// real Keychain.
 pub trait SecretStore {
     fn get(&self, account: &str) -> Option<String>;
-    fn set(&self, account: &str, secret: &str);
+    /// Returns whether the secret was durably stored (Keychain or fallback).
+    fn set(&self, account: &str, secret: &str) -> bool;
     fn delete(&self, account: &str);
 }
 
@@ -125,6 +126,11 @@ impl KeychainStore {
         }
     }
 
+    /// Store used by `XenonConfig::load` to migrate + hydrate in one pass.
+    pub fn for_migration() -> Self {
+        Self::with_backend(Arc::new(MacBackend), Self::fallback_path())
+    }
+
     fn fallback_path() -> PathBuf {
         let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         path.push("xenon");
@@ -161,7 +167,7 @@ impl KeychainStore {
     }
 
     /// Migrate legacy per-account Keychain items into the single JSON blob.
-    fn migrate_legacy_accounts(&self) {
+    pub fn migrate_legacy_accounts(&self) {
         for account in [PRIMARY_ACCOUNT, LEGACY_PRIMARY_ACCOUNT] {
             let Some(key) = self.backend.load_legacy(account) else {
                 continue;
@@ -231,22 +237,22 @@ impl KeychainStore {
         }
     }
 
-    fn write_fallback(&self, account: &str, secret: &str) {
+    fn write_fallback(&self, account: &str, secret: &str) -> bool {
         let mut fb = self.read_fallback();
         fb.insert(account.to_string(), secret.to_string());
-        self.write_fallback_map(&fb);
+        self.write_fallback_map(&fb)
     }
 
     /// Atomic, 0600-from-creation write of the fallback file: a temp file is
     /// created with mode 0600 in the same directory, fully written and
     /// `sync_all`ed, then renamed over the target. There is no window in which
     /// the plaintext secrets are world-readable.
-    fn write_fallback_map(&self, map: &HashMap<String, String>) {
+    fn write_fallback_map(&self, map: &HashMap<String, String>) -> bool {
         let path = &self.fallback;
         if let Some(parent) = path.parent() {
             if fs::create_dir_all(parent).is_err() {
                 log::error!("failed to create fallback dir: {}", parent.display());
-                return;
+                return false;
             }
         }
         let json = serde_json::to_string(map).unwrap_or_default();
@@ -269,15 +275,18 @@ impl KeychainStore {
             Ok(())
         })();
         match write_res {
-            Ok(()) => {
-                if let Err(e) = fs::rename(&tmp, path) {
+            Ok(()) => match fs::rename(&tmp, path) {
+                Ok(()) => true,
+                Err(e) => {
                     log::error!("failed to commit secrets fallback: {e}");
                     let _ = fs::remove_file(&tmp);
+                    false
                 }
-            }
+            },
             Err(e) => {
                 log::error!("failed to write secrets fallback: {e}");
                 let _ = fs::remove_file(&tmp);
+                false
             }
         }
     }
@@ -305,7 +314,7 @@ impl SecretStore for KeychainStore {
         }
     }
 
-    fn set(&self, account: &str, secret: &str) {
+    fn set(&self, account: &str, secret: &str) -> bool {
         match self.read_all() {
             Ok(mut map) => {
                 map.insert(account.to_string(), secret.to_string());
@@ -315,14 +324,14 @@ impl SecretStore for KeychainStore {
                 {
                     Ok(()) => {
                         self.write_cache(map);
-                        return;
+                        return true;
                     }
                     Err(e) => {
                         log::warn!("Keychain write failed ({e}); using fallback");
                     }
                 }
                 // Keychain write failed: persist to the file fallback (merged).
-                self.write_fallback(account, secret);
+                self.write_fallback(account, secret)
             }
             Err(e) => {
                 // Could not read the Keychain: do NOT overwrite the item.
@@ -331,7 +340,7 @@ impl SecretStore for KeychainStore {
                     "keychain read failed ({e}); storing {account} in {} fallback only",
                     SECRETS_FALLBACK_PATH
                 );
-                self.write_fallback(account, secret);
+                self.write_fallback(account, secret)
             }
         }
     }
@@ -363,21 +372,91 @@ impl SecretStore for KeychainStore {
     }
 }
 
-/// Move plaintext keys from an old `config.json` into *store* and clear them
-/// from the in-memory config. Empty keys are dropped.
-pub fn migrate_plaintext(cfg: &mut XenonConfig, store: &dyn SecretStore) {
+/// Move plaintext secrets from an old `config.json` into *store* and clear
+/// them from the in-memory config. Returns whether at least one secret was
+/// stored successfully; on storage failure the plaintext is kept (no loss).
+/// (Production uses `migrate_plaintext_checked`; this remains for tests.)
+#[allow(dead_code)]
+pub fn migrate_plaintext(cfg: &mut XenonConfig, store: &dyn SecretStore) -> bool {
+    migrate_plaintext_inner(cfg, store).0
+}
+
+/// Like `migrate_plaintext`, but also reports whether it is safe to rewrite
+/// config.json: only when something was migrated and nothing failed to store.
+pub fn migrate_plaintext_checked(cfg: &mut XenonConfig, store: &dyn SecretStore) -> bool {
+    let (migrated, all_stored) = migrate_plaintext_inner(cfg, store);
+    migrated && all_stored
+}
+
+fn migrate_plaintext_inner(cfg: &mut XenonConfig, store: &dyn SecretStore) -> (bool, bool) {
+    let mut migrated = false;
+    let mut all_stored = true;
     if let Some(key) = cfg.provider.provider_api_key.take() {
         if !key.trim().is_empty() {
-            store.set(PRIMARY_ACCOUNT, &key);
+            if store.set(PRIMARY_ACCOUNT, &key) {
+                migrated = true;
+            } else {
+                all_stored = false;
+                // No value logged: only the account is diagnostic.
+                log::warn!("could not store legacy flat provider key; keeping it in config.json");
+                cfg.provider.provider_api_key = Some(key);
+            }
         }
     }
     for profile in &mut cfg.providers {
         if let Some(key) = profile.api_key.take() {
-            if !key.trim().is_empty() {
-                store.set(&profile.name, &key);
+            if key.trim().is_empty() {
+                continue;
+            }
+            if store.set(&profile.name, &key) {
+                migrated = true;
+            } else {
+                all_stored = false;
+                log::warn!(
+                    "could not store key for profile {}; keeping it in config.json",
+                    profile.name
+                );
+                profile.api_key = Some(key);
             }
         }
     }
+    for server in &mut cfg.mcp_servers {
+        for name in &server.env_secrets {
+            let Some(value) = server.env.remove(name) else {
+                continue;
+            };
+            let account = crate::mcp::secret_account(&server.name, name);
+            if store.set(&account, &value) {
+                migrated = true;
+            } else {
+                all_stored = false;
+                log::warn!(
+                    "could not store MCP env secret {} for server {}; keeping it in config.json",
+                    name,
+                    server.name
+                );
+                server.env.insert(name.clone(), value);
+            }
+        }
+        for name in &server.header_secrets {
+            let Some(value) = server.headers.remove(name) else {
+                continue;
+            };
+            let account = crate::mcp::secret_account(&server.name, name);
+            if store.set(&account, &value) {
+                migrated = true;
+            } else {
+                all_stored = false;
+                log::warn!(
+                    "could not store MCP header secret {} for server {}; keeping it in config.json",
+                    name,
+                    server.name
+                );
+                server.headers.insert(name.clone(), value);
+            }
+        }
+    }
+    (migrated, all_stored)
 }
 
 /// Fill every blank API key from *store* (Keychain on a real run).
@@ -390,17 +469,6 @@ pub fn hydrate(cfg: &mut XenonConfig, store: &dyn SecretStore) {
             profile.api_key = store.get(&profile.name);
         }
     }
-}
-
-pub fn migrate_plaintext_keys(cfg: &mut XenonConfig) {
-    let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
-    store.migrate_legacy_accounts();
-    migrate_plaintext(cfg, &store);
-}
-
-pub fn hydrate_keys(cfg: &mut XenonConfig) {
-    let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
-    hydrate(cfg, &store);
 }
 
 /// Persist every non-empty key in *cfg* to the Keychain. Called by
@@ -654,11 +722,12 @@ mod tests {
         fn get(&self, account: &str) -> Option<String> {
             self.inner.lock().unwrap().get(account).cloned()
         }
-        fn set(&self, account: &str, secret: &str) {
+        fn set(&self, account: &str, secret: &str) -> bool {
             self.inner
                 .lock()
                 .unwrap()
                 .insert(account.to_string(), secret.to_string());
+            true
         }
         fn delete(&self, account: &str) {
             self.inner.lock().unwrap().remove(account);

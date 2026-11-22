@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 /// Default whisper STT model path: on Apple Silicon the large turbo model is
 /// fast enough (Metal); on Intel the GPU backend is broken for large models,
@@ -533,36 +536,86 @@ impl XenonConfig {
                 }
             };
             cfg.migrate();
-            // Plaintext keys written by older builds move into the Keychain;
-            // then every profile gets its key back from there.
-            crate::hub::migrate_plaintext_keys(&mut cfg);
-            crate::hub::hydrate_keys(&mut cfg);
+            // Plaintext secrets written by older builds move into the
+            // Keychain; then every profile gets its key back from there.
+            // If any were actually stored, rewrite config.json immediately so
+            // the plaintext copy does not linger until the next Settings save.
+            // Use one store for both migration and hydration (shared cache).
+            let store = crate::hub::KeychainStore::for_migration();
+            store.migrate_legacy_accounts();
+            let migrated = crate::hub::migrate_plaintext_checked(&mut cfg, &store);
+            if migrated {
+                if let Err(e) = cfg.save_to(&path) {
+                    log::warn!("failed to rewrite config after secret migration: {e}");
+                }
+            }
+            crate::hub::hydrate(&mut cfg, &store);
             cfg
         } else {
             Self::default()
         }
     }
 
-    /// Copy with every API key removed, so `save` can never write a secret to
-    /// disk (they live in the macOS Keychain).
+    /// Copy with every secret removed, so `save` can never write a secret to
+    /// disk (provider keys and MCP secret values live in the macOS Keychain).
     pub(crate) fn without_secrets(&self) -> Self {
         let mut c = self.clone();
         c.provider.provider_api_key = None;
         for p in &mut c.providers {
             p.api_key = None;
         }
+        for s in &mut c.mcp_servers {
+            for name in &s.env_secrets {
+                s.env.remove(name);
+            }
+            for name in &s.header_secrets {
+                s.headers.remove(name);
+            }
+        }
         c
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::config_path();
+        self.save_to(&Self::config_path())
+    }
+
+    /// Atomic, 0600-from-creation config write: temp file in the same
+    /// directory, fully written and `sync_all`ed, then renamed into place.
+    pub(crate) fn save_to(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let content =
             serde_json::to_string_pretty(&self.without_secrets()).map_err(|e| e.to_string())?;
-        fs::write(&path, content).map_err(|e| e.to_string())?;
-        Ok(())
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        let write_res = (|| -> std::io::Result<()> {
+            #[cfg(unix)]
+            let mut f = fs::OpenOptions::new()
+                .mode(0o600)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            #[cfg(not(unix))]
+            let mut f = fs::File::create(&tmp)?;
+            use std::io::Write;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        match write_res {
+            Ok(()) => match fs::rename(&tmp, path) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    Err(e.to_string())
+                }
+            },
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err(e.to_string())
+            }
+        }
     }
 
     /// Backfill fields that are empty on first load: flat provider config
@@ -677,6 +730,148 @@ impl XenonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use crate::hub::SecretStore;
+
+    #[derive(Default)]
+    struct FakeStore {
+        secrets: Mutex<std::collections::HashMap<String, String>>,
+        fail: bool,
+    }
+
+    impl SecretStore for FakeStore {
+        fn get(&self, account: &str) -> Option<String> {
+            self.secrets.lock().unwrap().get(account).cloned()
+        }
+        fn set(&self, account: &str, secret: &str) -> bool {
+            if self.fail {
+                return false;
+            }
+            self.secrets
+                .lock()
+                .unwrap()
+                .insert(account.to_string(), secret.to_string());
+            true
+        }
+        fn delete(&self, account: &str) {
+            self.secrets.lock().unwrap().remove(account);
+        }
+    }
+
+    fn temp_config_dir() -> std::path::PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "xenon-cfg-migrate-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn plaintext_config_json() -> &'static str {
+        r#"{
+            "pet_name": "Xenon",
+            "provider_url": "http://127.0.0.1:8080",
+            "provider_api_key": "sk-plaintext",
+            "model_name": "m",
+            "voice_enabled": true,
+            "wake_word_enabled": true,
+            "wake_word": "Xenon",
+            "system_prompt": "hi",
+            "mcp_servers": [{
+                "name": "demo",
+                "transport": "stdio",
+                "command": "demo",
+                "env": {"PLAIN": "keep", "API_TOKEN": "sk-env"},
+                "env_secrets": ["API_TOKEN"],
+                "headers": {"X-Key": "sk-header"},
+                "header_secrets": ["X-Key"]
+            }]
+        }"#
+    }
+
+    fn load_temp_config(path: &Path) -> XenonConfig {
+        let mut cfg: XenonConfig = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        cfg.migrate();
+        cfg
+    }
+
+    /// Legacy plaintext provider + MCP secrets move to the store, and load
+    /// rewrites config.json immediately instead of waiting for Settings save.
+    #[cfg(unix)]
+    #[test]
+    fn test_migration_strips_plaintext_and_rewrites_config_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_config_dir();
+        let path = dir.join("config.json");
+        fs::write(&path, plaintext_config_json()).unwrap();
+        let mut cfg = load_temp_config(&path);
+        let store = FakeStore::default();
+
+        assert!(crate::hub::migrate_plaintext(&mut cfg, &store));
+        cfg.save_to(&path).unwrap();
+
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("sk-plaintext"));
+        assert!(!on_disk.contains("sk-env"));
+        assert!(!on_disk.contains("sk-header"));
+        assert!(on_disk.contains("keep"));
+        assert_eq!(store.get("Primary").as_deref(), Some("sk-plaintext"));
+        assert_eq!(store.get("mcp:demo:API_TOKEN").as_deref(), Some("sk-env"));
+        assert_eq!(store.get("mcp:demo:X-Key").as_deref(), Some("sk-header"));
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// If the store refuses a secret, migration reports nothing migrated and
+    /// the plaintext remains on disk (no data loss).
+    #[test]
+    fn test_migration_store_failure_keeps_plaintext() {
+        let dir = temp_config_dir();
+        let path = dir.join("config.json");
+        fs::write(&path, plaintext_config_json()).unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut cfg = load_temp_config(&path);
+        let store = FakeStore {
+            fail: true,
+            ..Default::default()
+        };
+
+        assert!(!crate::hub::migrate_plaintext(&mut cfg, &store));
+
+        // Load only rewrites when migration succeeded.
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("sk-plaintext"));
+        assert!(on_disk.contains("sk-env"));
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+        assert_eq!(cfg.providers[0].api_key.as_deref(), Some("sk-plaintext"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Already-clean configs are never rewritten (mtime unchanged).
+    #[test]
+    fn test_no_plaintext_leaves_config_untouched() {
+        let dir = temp_config_dir();
+        let path = dir.join("config.json");
+        let clean = plaintext_config_json()
+            .replace("\"sk-plaintext\"", "null")
+            .replace("\"API_TOKEN\": \"sk-env\"", "\"PLAIN2\": \"safe\"")
+            .replace("\"env_secrets\": [\"API_TOKEN\"]", "\"env_secrets\": []")
+            .replace("\"X-Key\": \"sk-header\"", "\"X-Plain\": \"safe\"")
+            .replace("\"header_secrets\": [\"X-Key\"]", "\"header_secrets\": []");
+        fs::write(&path, clean).unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut cfg = load_temp_config(&path);
+        let store = FakeStore::default();
+
+        assert!(!crate::hub::migrate_plaintext(&mut cfg, &store));
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// Settings must survive a save/load round-trip, otherwise renaming the pet
     /// or pointing at a new provider silently does nothing.
