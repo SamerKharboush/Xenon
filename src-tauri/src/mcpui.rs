@@ -197,17 +197,31 @@ pub async fn mcp_set_secret(
     if value.trim().is_empty() {
         crate::hub::secret_delete(&account);
         guard.unpersisted_secrets.remove(&account);
-    } else if crate::hub::secret_set(&account, &value) {
-        guard.unpersisted_secrets.remove(&account);
-        // Now durable: if a prior failure parked it in env, drop the copy.
+        // Drop any value a prior failed write parked in the server env/headers,
+        // otherwise the stdio/http transport would keep sending the cleared
+        // credential to the child process / request.
         if let Some(s) = guard.mcp_servers.iter_mut().find(|s| s.name == server) {
             s.env.remove(&name);
+            s.headers.remove(&name);
+        }
+    } else if crate::hub::secret_set(&account, &value) {
+        guard.unpersisted_secrets.remove(&account);
+        // Now durable: if a prior failure parked it in env or headers, drop it.
+        if let Some(s) = guard.mcp_servers.iter_mut().find(|s| s.name == server) {
+            s.env.remove(&name);
+            s.headers.remove(&name);
         }
     } else {
-        // Could not persist: park the value in env so a later save writes it.
+        // Could not persist: park the value where the transport will read it.
+        // Header secrets are read from `headers` (HTTP transport ignores env);
+        // everything else is read from `env`.
         guard.unpersisted_secrets.insert(account.clone());
         if let Some(s) = guard.mcp_servers.iter_mut().find(|s| s.name == server) {
-            s.env.insert(name.clone(), value);
+            if s.header_secrets.contains(&name) {
+                s.headers.insert(name.clone(), value);
+            } else {
+                s.env.insert(name.clone(), value);
+            }
         }
     }
     // Ensure the name is registered so the client resolves it.

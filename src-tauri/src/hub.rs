@@ -140,7 +140,14 @@ impl KeychainStore {
     }
 
     fn fallback_path() -> PathBuf {
-        let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        let base = if cfg!(test) {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")))
+        } else {
+            dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
+        };
+        let mut path = base;
         path.push("xenon");
         path.push(SECRETS_FALLBACK_PATH);
         path
@@ -197,10 +204,14 @@ impl KeychainStore {
         }
     }
 
-    fn read_fallback(&self) -> HashMap<String, String> {
+    /// Read the fallback file. `Ok(None)` = the file is absent (nothing
+    /// stored); `Err` = a real read failure (callers must not treat it as
+    /// "absent" — the file may still hold a stale value).
+    fn read_fallback(&self) -> std::io::Result<Option<HashMap<String, String>>> {
         match fs::read_to_string(&self.fallback) {
-            Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
-            Err(_) => HashMap::new(),
+            Ok(json) => Ok(Some(serde_json::from_str(&json).unwrap_or_default())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -222,8 +233,29 @@ impl KeychainStore {
                 }
             }
         }
+        // Accounts MCP secrets occupy. A provider profile with the same name
+        // would overwrite (or be overwritten by) the MCP value under one
+        // account; refuse the write and keep the profile's plaintext instead.
+        let mcp_accounts: std::collections::HashSet<String> = cfg
+            .mcp_servers
+            .iter()
+            .flat_map(|s| {
+                s.env_secrets
+                    .iter()
+                    .chain(s.header_secrets.iter())
+                    .map(|n| crate::mcp::secret_account(&s.name, n))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let mut failed = std::collections::HashSet::new();
         for (account, key) in &wanted {
+            if mcp_accounts.contains(account) {
+                log::warn!(
+                    "provider account {account} collides with an MCP secret; keeping its plaintext"
+                );
+                failed.insert(account.clone());
+                continue;
+            }
             if !self.set(account, key) {
                 failed.insert(account.clone());
             }
@@ -251,17 +283,28 @@ impl KeychainStore {
     }
 
     fn write_fallback(&self, account: &str, secret: &str) -> bool {
-        let mut fb = self.read_fallback();
+        let mut fb = self.read_fallback().ok().flatten().unwrap_or_default();
         fb.insert(account.to_string(), secret.to_string());
         self.write_fallback_map(&fb)
     }
 
+    /// Remove *account* from the fallback file. Returns false on a read error
+    /// (the stale value could not be confirmed absent) or a failed rewrite.
+    /// Genuine absence (no file, or no entry) is success — nothing to write.
     fn remove_fallback(&self, account: &str) -> bool {
-        let mut fb = self.read_fallback();
-        if fb.remove(account).is_none() {
-            return true; // nothing to do
+        match self.read_fallback() {
+            Err(e) => {
+                log::warn!("fallback read failed ({e}); cannot confirm {account} absent");
+                false
+            }
+            Ok(Some(mut fb)) => {
+                if fb.remove(account).is_none() {
+                    return true; // nothing to do
+                }
+                self.write_fallback_map(&fb)
+            }
+            Ok(None) => true, // no file: account is genuinely absent
         }
-        self.write_fallback_map(&fb)
     }
 
     /// Atomic, exclusive, 0600-from-creation write of the fallback file: a
@@ -296,7 +339,8 @@ impl SecretStore for KeychainStore {
     fn get(&self, account: &str) -> Option<String> {
         // The fallback file takes precedence: when a Keychain write failed the
         // value landed here, and it must shadow any stale Keychain copy.
-        if let Some(v) = self.read_fallback().get(account) {
+        let fb = self.read_fallback().ok().flatten();
+        if let Some(v) = fb.as_ref().and_then(|m| m.get(account)) {
             return Some(v.clone());
         }
         match self.read_all() {
@@ -394,15 +438,44 @@ pub fn migrate_plaintext_checked(
 
 fn migrate_plaintext_inner(cfg: &mut XenonConfig, store: &dyn SecretStore) -> MigrationOutcome {
     let mut out = MigrationOutcome::default();
+    // Per-account bookkeeping so two secrets that share one account are
+    // reconciled correctly:
+    // - `stored`/`failed` record the last value written under each account.
+    //   A plaintext value is safe to scrub only when the value durably stored
+    //   under its account is the *same* value. A later successful store of a
+    //   *different* value (an account collision) means hydrate would return
+    //   the wrong secret, so the original plaintext must be kept (finding 5).
+    // - Reconciling same-account/same-value attempts clears a spurious failure
+    //   marker when the flat provider key and a "Primary" profile share one
+    //   account (finding 4).
+    let mut stored: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut failed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    // Accounts MCP secrets will occupy. A provider profile whose name equals
+    // one of these would overwrite (or be overwritten by) the MCP value under
+    // the same account; keep such a profile's key as plaintext rather than
+    // acknowledge a lossy migration.
+    let mcp_accounts: std::collections::HashSet<String> = cfg
+        .mcp_servers
+        .iter()
+        .flat_map(|s| {
+            s.env_secrets
+                .iter()
+                .chain(s.header_secrets.iter())
+                .map(|n| crate::mcp::secret_account(&s.name, n))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
     if let Some(key) = cfg.provider.provider_api_key.take() {
         if !key.trim().is_empty() {
             if store.set(PRIMARY_ACCOUNT, &key) {
-                out.stored.push(PRIMARY_ACCOUNT.to_string());
+                stored.insert(PRIMARY_ACCOUNT.to_string(), key);
             } else {
                 // No value logged: only the account is diagnostic.
                 log::warn!("could not store legacy flat provider key; keeping it in config.json");
-                cfg.provider.provider_api_key = Some(key);
-                out.failed.push(PRIMARY_ACCOUNT.to_string());
+                cfg.provider.provider_api_key = Some(key.clone());
+                failed.insert(PRIMARY_ACCOUNT.to_string(), key);
             }
         }
     }
@@ -411,15 +484,24 @@ fn migrate_plaintext_inner(cfg: &mut XenonConfig, store: &dyn SecretStore) -> Mi
             if key.trim().is_empty() {
                 continue;
             }
+            if mcp_accounts.contains(&profile.name) {
+                log::warn!(
+                    "profile {} name collides with an MCP secret account; keeping its key in config.json",
+                    profile.name
+                );
+                profile.api_key = Some(key.clone());
+                failed.insert(profile.name.clone(), key);
+                continue;
+            }
             if store.set(&profile.name, &key) {
-                out.stored.push(profile.name.clone());
+                stored.insert(profile.name.clone(), key);
             } else {
                 log::warn!(
                     "could not store key for profile {}; keeping it in config.json",
                     profile.name
                 );
-                profile.api_key = Some(key);
-                out.failed.push(profile.name.clone());
+                profile.api_key = Some(key.clone());
+                failed.insert(profile.name.clone(), key);
             }
         }
     }
@@ -430,15 +512,15 @@ fn migrate_plaintext_inner(cfg: &mut XenonConfig, store: &dyn SecretStore) -> Mi
             };
             let account = crate::mcp::secret_account(&server.name, name);
             if store.set(&account, &value) {
-                out.stored.push(account);
+                stored.insert(account, value);
             } else {
                 log::warn!(
                     "could not store MCP env secret {} for server {}; keeping it in config.json",
                     name,
                     server.name
                 );
-                server.env.insert(name.clone(), value);
-                out.failed.push(account);
+                server.env.insert(name.clone(), value.clone());
+                failed.insert(account, value);
             }
         }
         for name in &server.header_secrets {
@@ -447,16 +529,32 @@ fn migrate_plaintext_inner(cfg: &mut XenonConfig, store: &dyn SecretStore) -> Mi
             };
             let account = crate::mcp::secret_account(&server.name, name);
             if store.set(&account, &value) {
-                out.stored.push(account);
+                stored.insert(account, value);
             } else {
                 log::warn!(
                     "could not store MCP header secret {} for server {}; keeping it in config.json",
                     name,
                     server.name
                 );
-                server.headers.insert(name.clone(), value);
-                out.failed.push(account);
+                server.headers.insert(name.clone(), value.clone());
+                failed.insert(account, value);
             }
+        }
+    }
+
+    // Reconcile per account+value. An account is reported stored only when the
+    // value now durably under it matches every value that was stored for it
+    // (no collision overwrote a different secret); otherwise it stays failed
+    // so the plaintext is preserved.
+    for (account, value) in &stored {
+        if failed.get(account).map_or(true, |fv| fv == value) {
+            out.stored.push(account.clone());
+        }
+    }
+    for (account, value) in &failed {
+        let superseded = stored.get(account).is_some_and(|sv| sv == value);
+        if !superseded {
+            out.failed.push(account.clone());
         }
     }
     out
@@ -889,7 +987,7 @@ mod tests {
         assert!(store.set("A", "newest"));
         assert_eq!(store.get("A").as_deref(), Some("newest"));
         assert!(
-            !store.read_fallback().contains_key("A"),
+            !store.read_fallback().unwrap().unwrap().contains_key("A"),
             "stale fallback copy must be removed after a Keychain write"
         );
     }
@@ -1134,6 +1232,172 @@ mod tests {
         let mut cfg: XenonConfig = serde_json::from_str(json).unwrap();
         migrate_plaintext(&mut cfg, &store);
         assert_eq!(store.get(PRIMARY_ACCOUNT), Some("sk-flat".to_string()));
+    }
+
+    /// A store that fails the first `set` for each account, then succeeds.
+    struct FailFirstSetStore {
+        secrets: Mutex<HashMap<String, String>>,
+        attempted: Mutex<std::collections::HashSet<String>>,
+    }
+    impl SecretStore for FailFirstSetStore {
+        fn get(&self, account: &str) -> Option<String> {
+            self.secrets.lock().unwrap().get(account).cloned()
+        }
+        fn set(&self, account: &str, secret: &str) -> bool {
+            let mut attempted = self.attempted.lock().unwrap();
+            if attempted.insert(account.to_string()) {
+                return false; // first attempt for this account fails
+            }
+            drop(attempted);
+            self.secrets
+                .lock()
+                .unwrap()
+                .insert(account.to_string(), secret.to_string());
+            true
+        }
+        fn delete(&self, account: &str) {
+            self.secrets.lock().unwrap().remove(account);
+        }
+    }
+
+    /// Finding 4: the flat provider key and a "Primary" profile share one
+    /// account. When the first store fails and the second succeeds, the account
+    /// must be reported stored (not failed) so its plaintext is scrubbed.
+    #[test]
+    fn test_migration_same_account_later_success_clears_failure() {
+        let store = FailFirstSetStore {
+            secrets: Mutex::new(HashMap::new()),
+            attempted: Mutex::new(std::collections::HashSet::new()),
+        };
+        let json = r#"{
+            "pet_name": "Xenon",
+            "providers": [
+                {"name": "Primary", "base_url": "http://a/v1", "api_key": "sk-shared", "model": "m", "vision_model": "m"}
+            ],
+            "provider_api_key": "sk-shared",
+            "provider_url": "http://a/v1",
+            "model_name": "m",
+            "voice_enabled": true,
+            "wake_word_enabled": true,
+            "wake_word": "Xenon",
+            "system_prompt": "hi"
+        }"#;
+        let mut cfg: XenonConfig = serde_json::from_str(json).unwrap();
+        let outcome = migrate_plaintext_checked(&mut cfg, &store);
+        assert!(outcome.stored.contains(&"Primary".to_string()));
+        assert!(
+            !outcome.failed.contains(&"Primary".to_string()),
+            "a same-value later success must clear the earlier failure marker"
+        );
+        assert_eq!(store.get("Primary").as_deref(), Some("sk-shared"));
+        // No marker => without_secrets scrubs the plaintext.
+        assert!(cfg.without_secrets().provider.provider_api_key.is_none());
+    }
+
+    /// Finding 5: a provider profile named like an MCP secret account must not
+    /// be overwritten by the MCP value. Both plaintext values are retained so
+    /// neither is lost.
+    #[test]
+    fn test_migration_account_collision_keeps_both_values() {
+        let store = MockStore::default();
+        let json = r#"{
+            "pet_name": "Xenon",
+            "providers": [
+                {"name": "mcp:demo:TOKEN", "base_url": "http://a/v1", "api_key": "sk-provider", "model": "m", "vision_model": "m"}
+            ],
+            "provider_url": "http://a/v1",
+            "model_name": "m",
+            "voice_enabled": true,
+            "wake_word_enabled": true,
+            "wake_word": "Xenon",
+            "system_prompt": "hi",
+            "mcp_servers": [{
+                "name": "demo",
+                "transport": "stdio",
+                "command": "demo",
+                "env": {"TOKEN": "sk-mcp"},
+                "env_secrets": ["TOKEN"]
+            }]
+        }"#;
+        let mut cfg: XenonConfig = serde_json::from_str(json).unwrap();
+        let outcome = migrate_plaintext_checked(&mut cfg, &store);
+        // The MCP value is stored; the colliding account is NOT reported stored.
+        assert_eq!(store.get("mcp:demo:TOKEN").as_deref(), Some("sk-mcp"));
+        assert!(
+            !outcome.stored.contains(&"mcp:demo:TOKEN".to_string()),
+            "a colliding account must not be reported stored"
+        );
+        assert!(outcome.failed.contains(&"mcp:demo:TOKEN".to_string()));
+        // The provider key survives as plaintext (no loss).
+        let provider = cfg
+            .providers
+            .iter()
+            .find(|p| p.name == "mcp:demo:TOKEN")
+            .unwrap();
+        assert_eq!(provider.api_key.as_deref(), Some("sk-provider"));
+    }
+
+    /// Finding 5 (save path): `store_keys` must not overwrite an MCP secret
+    /// when a provider profile name collides with its account.
+    #[test]
+    fn test_store_keys_skips_mcp_collision() {
+        let store = KeychainStore::with_backend(Arc::new(FakeBackend::new(None)), temp_fallback());
+        let json = r#"{
+            "pet_name": "Xenon",
+            "providers": [
+                {"name": "mcp:demo:TOKEN", "base_url": "http://a/v1", "api_key": "sk-provider", "model": "m", "vision_model": "m"}
+            ],
+            "provider_url": "http://a/v1",
+            "model_name": "m",
+            "voice_enabled": true,
+            "wake_word_enabled": true,
+            "wake_word": "Xenon",
+            "system_prompt": "hi",
+            "mcp_servers": [{
+                "name": "demo", "transport": "stdio", "command": "demo",
+                "env": {"TOKEN": "sk-mcp"}, "env_secrets": ["TOKEN"]
+            }]
+        }"#;
+        let cfg: XenonConfig = serde_json::from_str(json).unwrap();
+        // The MCP secret is already stored under the shared account.
+        assert!(store.set("mcp:demo:TOKEN", "sk-mcp"));
+        let failed = store.store_keys(&cfg);
+        assert!(failed.contains("mcp:demo:TOKEN"));
+        // The MCP secret must be untouched, not overwritten by the provider key.
+        assert_eq!(store.get("mcp:demo:TOKEN").as_deref(), Some("sk-mcp"));
+    }
+
+    /// Finding 3: a fallback read error is not "account absent". Cleanup must
+    /// report failure rather than silently succeed.
+    #[test]
+    fn test_remove_fallback_read_error_is_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "xenon-fb-readerr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory where the fallback file should be => read error.
+        let store = KeychainStore::with_backend(Arc::new(FakeBackend::new(None)), dir.clone());
+        assert!(
+            !store.remove_fallback("A"),
+            "cleanup must fail when the fallback file cannot be read"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A genuinely absent fallback file (no file) is a successful cleanup.
+    #[test]
+    fn test_remove_fallback_absent_file_is_success() {
+        let store = KeychainStore::with_backend(Arc::new(FakeBackend::new(None)), temp_fallback());
+        assert!(
+            store.remove_fallback("A"),
+            "an absent account must be a no-op success"
+        );
     }
 
     /// Settings save → keys persisted → restart → keys present: simulate a

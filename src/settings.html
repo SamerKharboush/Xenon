@@ -962,8 +962,14 @@
             }
             try {
                 const added = await invoke('mcp_import_servers', { servers });
-                // Refresh local copy.
-                config.mcp_servers = (config.mcp_servers || []).concat(servers);
+                // Refresh local copy: add the imported servers to the
+                // authoritative list so a later save cannot overwrite the
+                // shared config with a stale snapshot (and lose the plaintext
+                // secret a failed Keychain write left behind).
+                for (const s of servers) {
+                    if (!mcpServers.some(x => x.name === s.name)) mcpServers.push(s);
+                }
+                config.mcp_servers = mcpServers;
                 await refreshMcpStatus();
                 updateConfigFieldFromInputs();
                 document.getElementById('mcp-import-panel').style.display = 'none';
@@ -1007,7 +1013,9 @@
                     return;
                 }
                 // Persist by writing the whole config (same save flow as the rest of settings).
-                config.mcp_servers = (config.mcp_servers || []).concat([server]);
+                // Push into the authoritative list so a later save keeps it.
+                if (!mcpServers.some(x => x.name === server.name)) mcpServers.push(server);
+                config.mcp_servers = mcpServers;
                 config.mcp_start_at_launch = document.getElementById('mcp_start_at_launch')?.checked ?? false;
                 config.max_mcp_tools = Number(document.getElementById('max_mcp_tools')?.value) || 40;
                 config.web_tools_enabled = document.getElementById('web_tools_enabled').checked;

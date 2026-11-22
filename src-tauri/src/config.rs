@@ -65,6 +65,17 @@ pub(crate) fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     fs::File::open(parent)?.sync_all()
 }
 
+/// Outcome of an atomic config save. The file is always fully written before
+/// this is returned; `CommittedUnsynced` distinguishes a save whose rename is
+/// on disk but whose directory entry could not be synced (so it may not
+/// survive a power loss) from a clean `Committed` save. Write and rename
+/// failures are still `Err` — nothing was committed in those cases.
+#[derive(Debug)]
+pub enum SaveOutcome {
+    Committed,
+    CommittedUnsynced(String),
+}
+
 /// Default whisper STT model path: on Apple Silicon the large turbo model is
 /// fast enough (Metal); on Intel the GPU backend is broken for large models,
 /// so use base.en (CPU) instead. First candidate that exists, else a placeholder.
@@ -570,7 +581,15 @@ impl Default for XenonConfig {
 
 impl XenonConfig {
     fn config_path() -> PathBuf {
-        let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        // Test builds honour XDG_CONFIG_HOME so the real
+        // ~/Library/Application Support/xenon/config.json is never touched.
+        let base = if cfg!(test) {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")))
+        } else {
+            dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
+        };
         let mut path = base;
         path.push("xenon");
         path.push("config.json");
@@ -661,7 +680,7 @@ impl XenonConfig {
         c
     }
 
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&self) -> Result<SaveOutcome, String> {
         self.save_to(&Self::config_path())
     }
 
@@ -669,7 +688,7 @@ impl XenonConfig {
     /// directory, fully written and flushed to stable storage, then renamed
     /// into place; finally the directory entry is flushed so the rename
     /// survives a power loss.
-    pub(crate) fn save_to(&self, path: &Path) -> Result<(), String> {
+    pub(crate) fn save_to(&self, path: &Path) -> Result<SaveOutcome, String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -680,14 +699,15 @@ impl XenonConfig {
         match write_res {
             Ok(()) => match fs::rename(&tmp, path) {
                 Ok(()) => {
-                    // Flush the directory entry (the rename) as well.
-                    if let Some(parent) = path.parent() {
-                        if let Err(e) = sync_parent_dir(parent) {
-                            log::warn!("config dir sync failed: {e}");
-                            return Err(e.to_string());
-                        }
+                    // Flush the directory entry holding the rename (the config
+                    // file's own directory) so it survives a power loss. The
+                    // rename is already committed: a sync failure here is a
+                    // durability warning, not a failed save.
+                    if let Err(e) = sync_parent_dir(path) {
+                        log::warn!("config dir sync failed: {e}");
+                        return Ok(SaveOutcome::CommittedUnsynced(e.to_string()));
                     }
-                    Ok(())
+                    Ok(SaveOutcome::Committed)
                 }
                 Err(e) => {
                     let _ = fs::remove_file(&tmp);
