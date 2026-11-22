@@ -579,18 +579,62 @@ impl Default for XenonConfig {
     }
 }
 
+/// Base directory for all per-user Xenon data (`<base>/xenon/...`).
+///
+/// In test builds this is ALWAYS a temp directory — never
+/// `dirs::config_dir()` — so no test can read or write the user's real
+/// `config.json` / `secrets.json`, regardless of which tests run in
+/// parallel. Tests needing a specific location set a thread-local override
+/// via [`ConfigDirGuard`]; the default is a per-process temp dir.
+pub(crate) fn config_base() -> PathBuf {
+    #[cfg(test)]
+    let base = TEST_BASE_OVERRIDE
+        .with(|o| o.borrow().clone())
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("xenon-test-{}", std::process::id()))
+        });
+    #[cfg(not(test))]
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    base
+}
+
+// Test-only per-thread override for `config_base`. Process-wide env vars
+// (`XDG_CONFIG_HOME`) are unusable here: `cargo test` runs tests on parallel
+// threads, so one test's `set_var` would leak into another's `config_path`.
+#[cfg(test)]
+thread_local! {
+    static TEST_BASE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard: redirect [`config_base`] (and therefore `config_path` and the
+/// hub's `secrets.json` fallback) to *dir* for the current thread only,
+/// restoring the previous value on drop. Safe under parallel `cargo test`.
+#[cfg(test)]
+pub(crate) struct ConfigDirGuard {
+    prev: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl ConfigDirGuard {
+    pub(crate) fn new(dir: PathBuf) -> Self {
+        let prev = TEST_BASE_OVERRIDE.with(|o| o.replace(Some(dir)));
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ConfigDirGuard {
+    fn drop(&mut self) {
+        TEST_BASE_OVERRIDE.with(|o| {
+            o.replace(self.prev.take());
+        });
+    }
+}
+
 impl XenonConfig {
     fn config_path() -> PathBuf {
-        // Test builds honour XDG_CONFIG_HOME so the real
-        // ~/Library/Application Support/xenon/config.json is never touched.
-        let base = if cfg!(test) {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")))
-        } else {
-            dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
-        };
-        let mut path = base;
+        let mut path = config_base();
         path.push("xenon");
         path.push("config.json");
         path
@@ -864,6 +908,20 @@ mod tests {
         }
     }
 
+    /// Test builds must never resolve config_path into the user's real config
+    /// dir, even with no thread-local override in place.
+    #[test]
+    fn test_config_path_never_real_dir_under_test() {
+        let path = XenonConfig::config_path();
+        let real = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        assert!(
+            !path.starts_with(&real),
+            "test config_path leaked into real config dir: {}",
+            path.display()
+        );
+        assert!(path.starts_with(std::env::temp_dir()));
+    }
+
     fn temp_config_dir() -> std::path::PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -1058,7 +1116,7 @@ mod tests {
     #[test]
     fn test_config_round_trip() {
         let dir = temp_config_dir();
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let _guard = crate::config::ConfigDirGuard::new(dir.clone());
 
         let mut cfg = XenonConfig {
             pet_name: "Jarvis".to_string(),
@@ -1084,7 +1142,6 @@ mod tests {
         assert_eq!(loaded.providers[0].model, "qwen3");
         assert_eq!(loaded.providers[0].vision_model, "qwen3");
 
-        std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

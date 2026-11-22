@@ -72,6 +72,30 @@ trait KeychainBackend: Send + Sync {
 /// Real macOS Keychain backend.
 struct MacBackend;
 
+/// In-memory backend used in test builds so tests can never touch the real
+/// Keychain. Behaviour matches MacBackend's happy path (always succeeds, no
+/// legacy entries).
+#[cfg(test)]
+#[derive(Default)]
+struct MemBackend {
+    blob: Mutex<Option<String>>,
+}
+
+#[cfg(test)]
+impl KeychainBackend for MemBackend {
+    fn load(&self) -> Result<Option<String>, String> {
+        Ok(self.blob.lock().unwrap().clone())
+    }
+    fn store(&self, json: &str) -> Result<(), String> {
+        *self.blob.lock().unwrap() = Some(json.to_string());
+        Ok(())
+    }
+    fn load_legacy(&self, _account: &str) -> Option<String> {
+        None
+    }
+    fn delete_legacy(&self, _account: &str) {}
+}
+
 impl KeychainBackend for MacBackend {
     fn load(&self) -> Result<Option<String>, String> {
         match keyring::Entry::new(KEYCHAIN_SERVICE, PROVIDER_KEYS_ACCOUNT) {
@@ -136,21 +160,28 @@ impl KeychainStore {
 
     /// Store used by `XenonConfig::load` to migrate + hydrate in one pass.
     pub fn for_migration() -> Self {
-        Self::with_backend(Arc::new(MacBackend), Self::fallback_path())
+        Self::default_store()
     }
 
     fn fallback_path() -> PathBuf {
-        let base = if cfg!(test) {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")))
-        } else {
-            dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
-        };
-        let mut path = base;
+        let mut path = crate::config::config_base();
         path.push("xenon");
         path.push(SECRETS_FALLBACK_PATH);
         path
+    }
+
+    /// Default store: real Keychain in production, in-memory fake in tests.
+    /// Tests that explicitly need the real backend must use `#[ignore]` and
+    /// construct it directly with a throwaway account name.
+    fn default_store() -> Self {
+        #[cfg(test)]
+        {
+            Self::with_backend(Arc::new(MemBackend::default()), Self::fallback_path())
+        }
+        #[cfg(not(test))]
+        {
+            Self::with_backend(Arc::new(MacBackend), Self::fallback_path())
+        }
     }
 
     /// Read the full key map, caching the decoded result for the process.
@@ -576,20 +607,18 @@ pub fn hydrate(cfg: &mut XenonConfig, store: &dyn SecretStore) {
 /// `update_config` before the config is written (stripped) to disk. Returns
 /// accounts that failed to persist (so `unpersisted_secrets` can keep them).
 pub fn store_keys(cfg: &XenonConfig) -> std::collections::HashSet<String> {
-    let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
-    store.store_keys(cfg)
+    KeychainStore::default_store().store_keys(cfg)
 }
 
 /// Read one named secret (MCP env/header values, search API keys).
 pub fn secret_get(account: &str) -> Option<String> {
-    let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
-    store.get(account)
+    KeychainStore::default_store().get(account)
 }
 
 /// Write one named secret (empty value deletes it). Returns `true` when a
 /// subsequent `get(account)` would return the new value (Keychain or fallback).
 pub fn secret_set(account: &str, value: &str) -> bool {
-    let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
+    let store = KeychainStore::default_store();
     if value.trim().is_empty() {
         store.delete(account);
         true
@@ -600,8 +629,7 @@ pub fn secret_set(account: &str, value: &str) -> bool {
 
 /// Remove one named secret.
 pub fn secret_delete(account: &str) {
-    let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
-    store.delete(account);
+    KeychainStore::default_store().delete(account);
 }
 
 /// Result of the Settings "Test" button for one profile.
@@ -1436,9 +1464,10 @@ mod tests {
     }
 
     /// Real-Keychain round-trip: store a throwaway key, read it back, delete
-    /// it. Skipped unless XENON_LIVE_KEYCHAIN_TEST=1 is set, so CI and normal
-    /// test runs never touch the Keychain.
+    /// it. `#[ignore]` and gated on XENON_LIVE_KEYCHAIN_TEST=1 so normal test
+    /// runs never touch the real Keychain.
     #[test]
+    #[ignore = "touches the real login Keychain; run with XENON_LIVE_KEYCHAIN_TEST=1"]
     fn real_keychain_round_trip() {
         if std::env::var("XENON_LIVE_KEYCHAIN_TEST").as_deref() != Ok("1") {
             eprintln!("skip: set XENON_LIVE_KEYCHAIN_TEST=1 to run");
@@ -1458,5 +1487,19 @@ mod tests {
         // Delete + verify gone.
         store.delete(account);
         assert_eq!(store.get(account), None);
+    }
+
+    /// Test builds must never resolve the secrets fallback into the user's real
+    /// config dir.
+    #[test]
+    fn test_fallback_path_never_real_dir_under_test() {
+        let path = KeychainStore::fallback_path();
+        let real = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        assert!(
+            !path.starts_with(&real),
+            "test fallback_path leaked into real config dir: {}",
+            path.display()
+        );
+        assert!(path.starts_with(std::env::temp_dir()));
     }
 }
