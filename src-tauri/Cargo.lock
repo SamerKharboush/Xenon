@@ -7341,6 +7341,7 @@ dependencies = [
  "htmd",
  "image",
  "keyring",
+ "libc",
  "log",
  "objc2",
  "objc2-app-kit",

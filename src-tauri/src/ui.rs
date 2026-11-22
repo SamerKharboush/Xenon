@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State, WebviewWindow, Window};
 use tokio::sync::RwLock;
 
-use crate::config::XenonConfig;
+use crate::config::{SaveOutcome, XenonConfig};
 use crate::events::{AudioEvent, PetState, Utterance};
 
 pub struct AppState {
@@ -110,10 +110,59 @@ pub async fn update_config(
     config: State<'_, ArcRwLockConfig>,
     new_config: XenonConfig,
 ) -> Result<(), String> {
-    new_config.save().map_err(|e| e.to_string())?;
-    // Persist non-empty API keys to the Keychain before the config (which is
-    // written with secrets stripped) replaces the shared one.
-    crate::hub::store_keys(&new_config);
+    // Persist non-empty API keys first, then strip secrets for disk. Keys the
+    // store could not persist stay in `unpersisted_secrets` so `save` keeps
+    // their plaintext instead of dropping them (F2).
+    let mut new_config = new_config;
+    {
+        let guard = config.read().await;
+        // Carry over retained-secret markers from the shared config: a value
+        // that failed to persist earlier exists only as plaintext in the shared
+        // config, so its marker must survive a Settings save.
+        new_config
+            .unpersisted_secrets
+            .extend(guard.unpersisted_secrets.iter().cloned());
+        // A Settings snapshot can predate an MCP mutation (import/add): it may
+        // omit a server whose secret could not be persisted and therefore lives
+        // only as plaintext in the shared config. Keep such a server so the
+        // save cannot drop the only copy of its secret (finding 8).
+        for shared_srv in &guard.mcp_servers {
+            let holds_retained = shared_srv
+                .env_secrets
+                .iter()
+                .chain(shared_srv.header_secrets.iter())
+                .any(|k| {
+                    guard
+                        .unpersisted_secrets
+                        .contains(&crate::mcp::secret_account(&shared_srv.name, k))
+                });
+            if holds_retained && !new_config.mcp_servers.iter().any(|s| s.name == shared_srv.name) {
+                new_config.mcp_servers.push(shared_srv.clone());
+            }
+        }
+    }
+    let failed = crate::hub::store_keys(&new_config);
+    // Provider accounts this save tried to persist: clear their marker when the
+    // write succeeded so `save` stops keeping the plaintext, and keep the
+    // marker for accounts that failed. MCP/search markers are managed
+    // independently and left untouched (finding 9).
+    let provider_accounts: std::collections::HashSet<String> =
+        std::iter::once(crate::hub::PRIMARY_ACCOUNT.to_string())
+            .chain(new_config.providers.iter().map(|p| p.name.clone()))
+            .collect();
+    for account in provider_accounts {
+        if failed.contains(&account) {
+            new_config.unpersisted_secrets.insert(account);
+        } else {
+            new_config.unpersisted_secrets.remove(&account);
+        }
+    }
+    match new_config.save().map_err(|e| e.to_string())? {
+        SaveOutcome::Committed => {}
+        SaveOutcome::CommittedUnsynced(e) => {
+            log::warn!("config committed but directory sync failed: {e}");
+        }
+    }
     let mut guard = config.write().await;
     *guard = new_config;
     let _ = app.emit("pet-config", &*guard);

@@ -478,7 +478,7 @@ impl McpManager {
 
 }
 
-fn secret_account(server: &str, name: &str) -> String {
+pub fn secret_account(server: &str, name: &str) -> String {
     format!("mcp:{server}:{name}")
 }
 

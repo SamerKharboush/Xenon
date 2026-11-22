@@ -69,6 +69,9 @@ base64 = "0.22"
 # Config directory
 dirs = "5.0"
 
+# F_FULLFSYNC + fcntl for durable writes (MIT/Apache-2.0; already in the tree).
+libc = "0.2"
+
 # Version comparison for the in-app update check.
 semver = "1.0"
 

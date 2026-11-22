@@ -128,12 +128,26 @@ pub async fn mcp_import_servers(
         // Move secret env/header values into the Keychain, never config.json.
         for name in &server.env_secrets {
             if let Some(val) = server.env.remove(name) {
-                crate::hub::secret_set(&format!("mcp:{}:{}", server.name, name), &val);
+                let account = format!("mcp:{}:{}", server.name, name);
+                if crate::hub::secret_set(&account, &val) {
+                    guard.unpersisted_secrets.remove(&account);
+                } else {
+                    // Could not persist: keep the value in the server env so a
+                    // later save writes it (never silently lost).
+                    guard.unpersisted_secrets.insert(account);
+                    server.env.insert(name.clone(), val);
+                }
             }
         }
         for name in &server.header_secrets {
             if let Some(val) = server.headers.remove(name) {
-                crate::hub::secret_set(&format!("mcp:{}:{}", server.name, name), &val);
+                let account = format!("mcp:{}:{}", server.name, name);
+                if crate::hub::secret_set(&account, &val) {
+                    guard.unpersisted_secrets.remove(&account);
+                } else {
+                    guard.unpersisted_secrets.insert(account);
+                    server.headers.insert(name.clone(), val);
+                }
             }
         }
         if guard.mcp_servers.iter().any(|s| s.name == server.name) {
@@ -154,11 +168,15 @@ pub async fn mcp_remove_server(
 ) -> Result<(), String> {
     let mut guard = config.write().await;
     if let Some(server) = guard.mcp_servers.iter().find(|s| s.name == name) {
-        for key in &server.env_secrets {
-            crate::hub::secret_delete(&format!("mcp:{name}:{key}"));
-        }
-        for key in &server.header_secrets {
-            crate::hub::secret_delete(&format!("mcp:{name}:{key}"));
+        let accounts: Vec<String> = server
+            .env_secrets
+            .iter()
+            .chain(server.header_secrets.iter())
+            .map(|key| format!("mcp:{name}:{key}"))
+            .collect();
+        for account in &accounts {
+            crate::hub::secret_delete(account);
+            guard.unpersisted_secrets.remove(account);
         }
     }
     guard.mcp_servers.retain(|s| s.name != name);
@@ -175,13 +193,38 @@ pub async fn mcp_set_secret(
     value: String,
 ) -> Result<(), String> {
     let account = format!("mcp:{server}:{name}");
+    let mut guard = config.write().await;
     if value.trim().is_empty() {
         crate::hub::secret_delete(&account);
+        guard.unpersisted_secrets.remove(&account);
+        // Drop any value a prior failed write parked in the server env/headers,
+        // otherwise the stdio/http transport would keep sending the cleared
+        // credential to the child process / request.
+        if let Some(s) = guard.mcp_servers.iter_mut().find(|s| s.name == server) {
+            s.env.remove(&name);
+            s.headers.remove(&name);
+        }
+    } else if crate::hub::secret_set(&account, &value) {
+        guard.unpersisted_secrets.remove(&account);
+        // Now durable: if a prior failure parked it in env or headers, drop it.
+        if let Some(s) = guard.mcp_servers.iter_mut().find(|s| s.name == server) {
+            s.env.remove(&name);
+            s.headers.remove(&name);
+        }
     } else {
-        crate::hub::secret_set(&account, &value);
+        // Could not persist: park the value where the transport will read it.
+        // Header secrets are read from `headers` (HTTP transport ignores env);
+        // everything else is read from `env`.
+        guard.unpersisted_secrets.insert(account.clone());
+        if let Some(s) = guard.mcp_servers.iter_mut().find(|s| s.name == server) {
+            if s.header_secrets.contains(&name) {
+                s.headers.insert(name.clone(), value);
+            } else {
+                s.env.insert(name.clone(), value);
+            }
+        }
     }
     // Ensure the name is registered so the client resolves it.
-    let mut guard = config.write().await;
     if let Some(s) = guard.mcp_servers.iter_mut().find(|s| s.name == server) {
         if !s.env_secrets.contains(&name) && !s.header_secrets.contains(&name) {
             s.env_secrets.push(name);
@@ -207,6 +250,7 @@ pub async fn set_search_key(
         crate::hub::secret_delete(&account);
     }
     let mut guard = config.write().await;
+    guard.unpersisted_secrets.remove(&account);
     match kind.as_str() {
         "brave" => guard.brave_key_set = present,
         "tavily" => guard.tavily_key_set = present,
