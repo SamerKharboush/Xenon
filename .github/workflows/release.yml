@@ -133,6 +133,9 @@ jobs:
             git log --pretty=format:'- %s (%h)' "$PREV..${GITHUB_REF}" >> "$GITHUB_OUTPUT"
             echo "" >> "$GITHUB_OUTPUT"
             echo "**Full Changelog**: https://github.com/SamerKharboush/Xenon/compare/$PREV...${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            echo "---" >> "$GITHUB_OUTPUT"
+            echo "♥ Support Xenon: [GitHub Sponsors](https://github.com/sponsors/SamerKharboush) · [PayPal](https://paypal.me/Samerelnady)" >> "$GITHUB_OUTPUT"
             echo "EOF" >> "$GITHUB_OUTPUT"
           else
             echo "body<<EOF" >> "$GITHUB_OUTPUT"
@@ -140,6 +143,8 @@ jobs:
             echo "" >> "$GITHUB_OUTPUT"
             git log --pretty=format:'- %s (%h)' "${GITHUB_REF}" >> "$GITHUB_OUTPUT"
             echo "" >> "$GITHUB_OUTPUT"
+            echo "---" >> "$GITHUB_OUTPUT"
+            echo "♥ Support Xenon: [GitHub Sponsors](https://github.com/sponsors/SamerKharboush) · [PayPal](https://paypal.me/Samerelnady)" >> "$GITHUB_OUTPUT"
             echo "EOF" >> "$GITHUB_OUTPUT"
           fi
 

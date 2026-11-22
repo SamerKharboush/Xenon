@@ -71,7 +71,7 @@ semver = "1.0"
 # SHA-256 verification of the downloaded DMG (against the release SHA256SUMS).
 sha2 = "0.10"
 # API keys in the macOS Keychain (never in config.json).
-keyring = "3"
+keyring = { version = "3", features = ["apple-native"] }
 
 # Global cursor position for click-through hit-testing.
 # CGEventGetLocation needs no Accessibility grant (unlike enigo input synthesis).
@@ -81,7 +81,8 @@ core-graphics = "0.24"
 # (AVCaptureDevice authorizationStatusForMediaType:) and requests it from the
 # onboarding/settings button. MIT/Apache; already in the tree via xcap/cpal.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSDictionary", "NSValue"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSDictionary", "NSValue", "NSArray", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSScreen"] }
 objc2-av-foundation = { version = "0.3", features = ["AVCaptureDevice", "AVMediaFormat", "block2"] }
 block2 = "0.6"
 

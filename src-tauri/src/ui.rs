@@ -166,6 +166,23 @@ pub fn show_onboarding<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(
     Ok(())
 }
 
+/// Dismiss onboarding for the current app version.
+#[tauri::command]
+pub fn dismiss_onboarding(
+    app: tauri::AppHandle,
+    config: State<'_, ArcRwLockConfig>,
+) -> Result<(), String> {
+    let version = env!("CARGO_PKG_VERSION");
+    let mut guard = config.blocking_write();
+    guard.onboarding_dismissed_for_version = version.to_string();
+    guard.save().map_err(|e| e.to_string())?;
+    drop(guard);
+    if let Some(win) = app.get_webview_window("onboarding") {
+        let _ = win.close();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
     show_settings(&app)
@@ -179,7 +196,9 @@ pub fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
 /// in Rust keeps the "click-through when idle" promise while the pet itself
 /// stays interactive.
 ///
-/// Uses CGEventGetLocation, which needs no Accessibility grant (unlike enigo).
+/// Uses `NSEvent::mouseLocation()` (thread-safe, no TCC permission) rather than
+/// the old `CGEventSource`+`CGEvent` pair, which triggered the Input Monitoring
+/// (`kTCCServiceListenEvent`) prompt just to read the cursor.
 static TYPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Typed-message input is up: keep the window interactive everywhere.
@@ -187,23 +206,16 @@ pub fn set_typing(active: bool) {
     TYPING.store(active, std::sync::atomic::Ordering::Relaxed);
 }
 fn spawn_hit_test(window: WebviewWindow) {
-    use core_graphics::event::{CGEvent, CGEventType};
-    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-
     std::thread::spawn(move || {
-        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).unwrap();
-
         let mut ignore: Option<bool> = None;
 
         loop {
             std::thread::sleep(std::time::Duration::from_millis(40));
 
-            let event = match CGEvent::new(source.clone()) {
-                Ok(e) => e,
-                Err(_) => continue,
+            let (cursor_x, cursor_y) = match crate::cursor::location() {
+                Some(p) => p,
+                None => continue,
             };
-            event.set_type(CGEventType::Null);
-            let cursor = event.location();
 
             let (wx, wy) = match window.outer_position() {
                 Ok(p) => (p.x as f64, p.y as f64),
@@ -218,8 +230,8 @@ fn spawn_hit_test(window: WebviewWindow) {
             // Pet is anchored bottom-center; its feet sit ~30px above the
             // window bottom. Center hit-test on that lower region.
             let cy = wy + size.1 - 100.0;
-            let dx = cursor.x - cx;
-            let dy = cursor.y - cy;
+            let dx = cursor_x - cx;
+            let dy = cursor_y - cy;
 
             // Pet body is ~120px tall / ~120px wide when drawn at 240px sprite.
             let hit_radius = 90.0_f64.max(size.0.min(size.1) / 2.0);
@@ -233,7 +245,7 @@ fn spawn_hit_test(window: WebviewWindow) {
                 }
                 log::info!(
                     "hit-test: cursor=({:.0},{:.0}) pet=({cx},{cy}) r={hit_radius:.0} -> click_through={should_ignore}",
-                    cursor.x, cursor.y
+                    cursor_x, cursor_y
                 );
                 ignore = Some(should_ignore);
             }
@@ -242,6 +254,9 @@ fn spawn_hit_test(window: WebviewWindow) {
 }
 
 pub fn setup_window(window: &WebviewWindow) -> Result<()> {
+    // Capture the primary screen height on the main thread so the off-thread
+    // hit-test can convert Cocoa coordinates (NSScreen is main-thread-only).
+    crate::cursor::init_primary_screen_height();
     window.set_always_on_top(true)?;
     window.set_decorations(false)?;
     // Start interactive; spawn_hit_test flips to click-through only while the

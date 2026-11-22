@@ -6,6 +6,8 @@
 
 [![Platform](https://img.shields.io/badge/platform-macOS%2012%2B-lightgrey)](#requirements)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink)](https://github.com/sponsors/SamerKharboush)
+[![PayPal](https://img.shields.io/badge/Donate-PayPal-blue)](https://paypal.me/Samerelnady)
 
 [Install](#install) · [Features](#features) · [Screenshots](#screenshots) · [Models](#models) · [Providers](#providers) · [Agent & browser](#agent--browser) · [Building](#building) · [Testing](#testing)
 
@@ -352,6 +354,14 @@ Settings → **Performance** exposes the three reductions, all **on** by default
 | `light_sprites` | `true` | 320×320 sprites in `src/sprites/light/`, rare poses decoded on first use. Off: full-size 448×448 originals in `src/sprites/`, all preloaded (applies immediately) |
 | `lazy_audio` | `true` | Mic, VAD and TTS stay unloaded until the hotkey; tokio runs on 2 workers. Off: capture + VAD preloaded at startup, TTS model loaded, default per-core tokio pool (applies after restart) |
 | `idle_power_saver` | `true` | Idle draws at 15 FPS. Off: Idle draws at 60 FPS (CPU only, no RAM effect) |
+
+## Support Xenon ♥
+
+Xenon is free and open source (MIT). If it is useful to you, consider supporting
+development:
+
+- [GitHub Sponsors](https://github.com/sponsors/SamerKharboush)
+- [PayPal](https://paypal.me/Samerelnady)
 
 ## Credits & license
 

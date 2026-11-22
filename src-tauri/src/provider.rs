@@ -312,6 +312,18 @@ impl OpenAICompatProvider {
         headers
     }
 
+    /// Format an API error for display. 401/403 get a friendly message
+    /// pointing to Settings; other errors show the raw status and body.
+    fn format_api_error(status: reqwest::StatusCode, body: &str) -> String {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            "API key missing or invalid — set it in Settings → Providers".to_string()
+        } else {
+            let max = 200;
+            let trimmed: String = body.chars().take(max).collect();
+            format!("API request failed: {} - {}", status, if body.chars().count() > max { format!("{}…", trimmed) } else { trimmed })
+        }
+    }
+
     /// POST a JSON body and turn any non-2xx into an Err carrying status + body.
     /// `stream` picks the timeout policy (idle read vs total cap).
     async fn send_json(&self, url: String, body: Value, stream: bool) -> Result<reqwest::Response> {
@@ -327,7 +339,7 @@ impl OpenAICompatProvider {
                 }
                 .into());
             }
-            return Err(anyhow!("API request failed: {} - {}", status, text));
+            return Err(anyhow!(Self::format_api_error(status, &text)));
         }
 
         Ok(response)
@@ -609,11 +621,61 @@ impl Provider for OpenAICompatProvider {
         let response = self
             .send_json_retry(self.endpoint(), body, false)
             .await?;
-        let json: Value = response.json().await?;
+
+        // Some providers (notably 9router combos with images) return an SSE
+        // body even when stream=false was requested. Detect and handle both.
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if content_type.contains("text/event-stream") {
+            return self.parse_sse_nonstream(response).await;
+        }
+
+        // Also check if the body starts with "data:" (SSE without the header).
+        let bytes = response.bytes().await?;
+        let text = String::from_utf8_lossy(&bytes);
+        if text.starts_with("data:") {
+            return self.parse_sse_nonstream_from_text(&text).await;
+        }
+
+        let json: Value = serde_json::from_str(&text)?;
         Ok(json["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
             .to_string())
+    }
+}
+
+impl OpenAICompatProvider {
+    /// Parse an SSE body as a non-streaming response (aggregate all deltas).
+    async fn parse_sse_nonstream(&self, response: reqwest::Response) -> Result<String> {
+        let bytes = response.bytes().await?;
+        let text = String::from_utf8_lossy(&bytes);
+        self.parse_sse_nonstream_from_text(&text).await
+    }
+
+    async fn parse_sse_nonstream_from_text(&self, text: &str) -> Result<String> {
+        let mut content = String::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim();
+                if data == "[DONE]" {
+                    break;
+                }
+                if let Ok(json) = serde_json::from_str::<Value>(data) {
+                    if let Some(delta) = json["choices"][0]["delta"]["content"].as_str() {
+                        content.push_str(delta);
+                    }
+                }
+            }
+        }
+        if content.is_empty() {
+            return Err(anyhow!("SSE response had no content deltas"));
+        }
+        Ok(content)
     }
 }
 

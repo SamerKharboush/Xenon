@@ -100,6 +100,16 @@
         </div>
 
         <div class="permission-card">
+            <div class="icon">⌨️</div>
+            <div class="permission-body">
+                <div class="permission-title">Input Monitoring <span style="font-size:12px;color:#9a8a9a;">(optional)</span></div>
+                <div class="permission-desc">Not required. Cursor position is read without it (NSEvent::mouseLocation). Only needed if you want Xenon to observe global key events; leave off otherwise.</div>
+                <span id="status-input" class="status-badge status-missing">Not needed</span><br>
+                <button class="open-settings-btn" onclick="openSettings('input')">Open Settings</button>
+            </div>
+        </div>
+
+        <div class="permission-card">
             <div class="icon">🎙️</div>
             <div class="permission-body">
                 <div class="permission-title">Microphone</div>
@@ -113,6 +123,9 @@
         <div class="actions">
             <button class="btn btn-secondary" onclick="checkAgain()">Check Again</button>
             <button class="btn btn-primary" id="done-btn" onclick="closeOnboarding()">Done</button>
+        </div>
+        <div style="text-align:center;margin-top:12px;font-size:12px;">
+            <a href="#" onclick="event.preventDefault(); invoke('open_support_link', {kind:'sponsors'}).catch(()=>{}); return false;" style="color:#ff7aa1;">♥ Support Xenon</a>
         </div>
     </div>
 
@@ -132,16 +145,24 @@
             }
         }
 
+        let allGranted = false;
+
         async function checkPermissions() {
             try {
                 const perms = await invoke('get_permissions');
                 setStatus('status-accessibility', perms.accessibility, '✓ Granted', '✗ Not granted');
                 setStatus('status-screen', perms.screenRecording, '✓ Granted', '✗ Not granted');
+                // Input Monitoring is optional / not needed; show a static label.
+                (function () {
+                    const el = document.getElementById('status-input');
+                    if (el) { el.textContent = 'Not needed'; el.className = 'status-badge status-ok'; }
+                })();
                 setStatus('status-microphone', perms.microphone, '✓ Granted', '✗ {state}');
 
-                // Auto-close if everything granted.
-                if (perms.accessibility.granted && perms.screenRecording.granted && perms.microphone.granted) {
-                    document.getElementById('done-btn').textContent = 'Done ✓';
+                allGranted = perms.accessibility.granted && perms.screenRecording.granted && perms.microphone.granted;
+                if (allGranted) {
+                    document.getElementById('done-btn').textContent = 'All set ✓';
+                    setTimeout(closeOnboarding, 1200);
                 }
             } catch (e) {
                 console.error('get_permissions failed:', e);
@@ -156,7 +177,7 @@
             }
         }
 
-        // Request the permission in-app where the OS allows it (mic, screen),
+        // Request the permission in-app where the OS allows it (mic, screen, input),
         // then re-read the real status. Accessibility only opens Settings.
         async function requestPermission(area) {
             const btn = document.getElementById('request-' + area);
@@ -175,10 +196,17 @@
         }
 
         function closeOnboarding() {
-            // Close the onboarding window.
+            // Dismiss for this version, then close.
+            invoke('dismiss_onboarding').catch(() => {});
             const win = window.__TAURI__?.window?.getCurrentWindow?.();
             if (win) { win.close(); }
         }
+
+        // Re-check on window focus (user returns from System Settings).
+        window.addEventListener('focus', checkPermissions);
+
+        // Re-check every 2 s while open.
+        setInterval(checkPermissions, 2000);
 
         checkPermissions();
     </script>

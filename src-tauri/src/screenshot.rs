@@ -194,16 +194,11 @@ fn pick_monitor(index: Option<usize>, monitors: &[Monitor]) -> Result<Monitor> {
         .ok_or_else(|| anyhow!("no primary monitor found"))
 }
 
-/// Cursor position in logical points, via CGEvent (same approach as the
-/// hit-test loop in `ui.rs`; needs no Accessibility grant).
+/// Cursor position in logical points (top-left global space), via
+/// `NSEvent::mouseLocation()` — permission-free and thread-safe (unlike the old
+/// CGEventSource, which triggered the Input Monitoring prompt).
 fn cursor_point() -> Option<(i32, i32)> {
-    use core_graphics::event::CGEvent;
-    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-
-    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
-    let event = CGEvent::new(source).ok()?;
-    let loc = event.location();
-    Some((loc.x as i32, loc.y as i32))
+    crate::cursor::location().map(|(x, y)| (x as i32, y as i32))
 }
 
 /// Test-only constructor for a Screenshot with a real image (512×320).

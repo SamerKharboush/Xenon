@@ -3,6 +3,7 @@ mod audio;
 mod audio_dsp;
 mod browser;
 mod config;
+mod cursor;
 mod events;
 mod grounding;
 mod headless;
@@ -56,6 +57,17 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(code);
     }
 
+    // `xenon --permissions` prints permission status and exits. Must run BEFORE
+    // the Tauri builder so no window/tray flashes.
+    if std::env::args().any(|a| a == "--permissions") {
+        let perms = permissions::get_permissions();
+        println!("Accessibility: {}", if perms.accessibility.granted { "✓ granted" } else { "✗ denied" });
+        println!("Screen Recording: {}", if perms.screen_recording.granted { "✓ granted" } else { "✗ denied" });
+        println!("Input Monitoring: {}", if perms.input_monitoring.state == "not-needed" { "— not needed" } else if perms.input_monitoring.granted { "✓ granted" } else { "✗ denied" });
+        println!("Microphone: {}", if perms.microphone.granted { "✓ granted" } else { "✗ not determined" });
+        std::process::exit(0);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(move |app| {
@@ -73,6 +85,8 @@ fn main() -> anyhow::Result<()> {
             // Shared config: owned by the Runtime, read by commands, written
             // by `update_config` so settings apply live.
             let lazy_audio = cfg.lazy_audio;
+            let dismissed = !cfg.onboarding_dismissed_for_version.is_empty()
+                && cfg.onboarding_dismissed_for_version == env!("CARGO_PKG_VERSION");
             let config: ui::ArcRwLockConfig = Arc::new(RwLock::new(cfg));
 
             let mut runtime = Runtime::new(config.clone());
@@ -159,10 +173,11 @@ fn main() -> anyhow::Result<()> {
                 let _ = ui::show_settings(app.handle());
             }
 
-            // If permissions are missing, show the onboarding window (created
-            // on demand so it costs no WebContent process until needed).
+            // If required permissions are missing AND the user hasn't dismissed
+            // onboarding for this version, show the onboarding window.
+            // Input Monitoring is NOT required (cursor via NSEvent::mouseLocation).
             let perms = permissions::get_permissions();
-            if !perms.accessibility.granted || !perms.screen_recording.granted {
+            if (!perms.accessibility.granted || !perms.screen_recording.granted) && !dismissed {
                 let _ = ui::show_onboarding(app.handle());
             }
 
@@ -179,6 +194,7 @@ fn main() -> anyhow::Result<()> {
             ui::get_config,
             ui::update_config,
             ui::open_settings,
+            ui::dismiss_onboarding,
             ui::stop_speaking,
             permissions::get_permissions,
             permissions::request_permission,
@@ -191,6 +207,7 @@ fn main() -> anyhow::Result<()> {
             hub::detect_local_providers,
             hub::list_provider_models,
             hub::test_provider_profile,
+            hub::open_support_link,
             voice::start_listening,
             voice::list_voices,
             voice::import_voice_folder,
@@ -214,6 +231,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     let talk_item = MenuItem::with_id(app, "talk", "Talk", true, None::<&str>)?;
     let type_item = MenuItem::with_id(app, "type", "Type a message…", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+    let support_item = MenuItem::with_id(app, "support", "Support Xenon ♥", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(
@@ -223,6 +241,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             &talk_item,
             &type_item,
             &settings_item,
+            &support_item,
             &sep,
             &quit_item,
         ],
@@ -264,6 +283,22 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             }
             "settings" => {
                 let _ = ui::open_settings(app.app_handle().clone());
+            }
+            "support" => {
+                // Open Settings scrolled to the Support section.
+                let win = app
+                    .get_webview_window("settings")
+                    .or_else(|| ui::show_settings(app.app_handle()).ok().and_then(|_| app.get_webview_window("settings")));
+                if let Some(win) = win {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                    let win2 = win.clone();
+                    std::thread::spawn(move || {
+                        // Give a freshly-created window time to render.
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        let _ = win2.eval("document.getElementById('support-github')?.scrollIntoView({behavior:'smooth',block:'center'})");
+                    });
+                }
             }
             "update" => {
                 // Same path as Settings → Update: download, verify, open DMG.

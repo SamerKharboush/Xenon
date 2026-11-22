@@ -265,6 +265,9 @@ pub struct XenonConfig {
     /// Version the user chose to skip (e.g. "v0.3.0"); None = skip nothing.
     #[serde(default)]
     pub skipped_version: Option<String>,
+    /// Onboarding dismissed for this app version. Empty = not dismissed.
+    #[serde(default)]
+    pub onboarding_dismissed_for_version: String,
     // --- agent ---
     /// Provider profile per agent role (chat / agent / vision). Empty = primary.
     #[serde(default)]
@@ -365,7 +368,7 @@ impl Default for XenonConfig {
             voice_enabled: true,
             wake_word_enabled: true,
             wake_word: "Xenon".to_string(),
-            system_prompt: "You are Xenon, a witty and intelligent desktop companion inspired by Jarvis. Be helpful, concise, and occasionally playful. You can control the computer, answer questions, and assist with tasks. Keep responses conversational and natural.".to_string(),
+            system_prompt: "You are Xenon, a witty and intelligent desktop companion. Be helpful, concise, and occasionally playful. You can control the computer, answer questions, and assist with tasks. Keep responses conversational and natural.".to_string(),
             listen_mode: default_listen_mode(),
             language: default_language(),
             silence_ms: default_silence_ms(),
@@ -386,6 +389,7 @@ impl Default for XenonConfig {
             auto_check_updates: true,
             last_update_check: 0,
             skipped_version: None,
+            onboarding_dismissed_for_version: String::new(),
             roles: AgentRoles::default(),
             allow_scripts: false,
             browser_eval_enabled: false,
@@ -491,6 +495,12 @@ impl XenonConfig {
             }
         }
         self.sync_flat_from_primary();
+
+        // Migrate old Jarvis default to new Xenon default.
+        const OLD_DEFAULT: &str = "You are Xenon, a witty and intelligent desktop companion inspired by Jarvis. Be helpful, concise, and occasionally playful. You can control the computer, answer questions, and assist with tasks. Keep responses conversational and natural.";
+        if self.system_prompt == OLD_DEFAULT {
+            self.system_prompt = "You are Xenon, a witty and intelligent desktop companion. Be helpful, concise, and occasionally playful. You can control the computer, answer questions, and assist with tasks. Keep responses conversational and natural.".to_string();
+        }
     }
 
     /// Keep the legacy flat fields mirroring the primary profile so old
@@ -696,6 +706,48 @@ mod tests {
         assert!(cfg.light_sprites);
         assert!(cfg.lazy_audio);
         assert!(cfg.idle_power_saver);
+    }
+
+    /// Old configs with the Jarvis default system prompt must be migrated to
+    /// the new Xenon default on load.
+    #[test]
+    fn test_old_jarvis_default_prompt_is_migrated() {
+        let old = r#"{
+            "pet_name": "Jarvis",
+            "provider_url": "http://127.0.0.1:8080",
+            "provider_api_key": null,
+            "model_name": "qwen3",
+            "voice_enabled": true,
+            "wake_word_enabled": true,
+            "wake_word": "Xenon",
+            "system_prompt": "You are Xenon, a witty and intelligent desktop companion inspired by Jarvis. Be helpful, concise, and occasionally playful. You can control the computer, answer questions, and assist with tasks. Keep responses conversational and natural."
+        }"#;
+        let mut cfg: XenonConfig = serde_json::from_str(old).unwrap();
+        cfg.migrate();
+        assert!(
+            !cfg.system_prompt.contains("Jarvis"),
+            "old Jarvis default should be replaced: {}",
+            cfg.system_prompt
+        );
+        assert!(cfg.system_prompt.starts_with("You are Xenon"));
+    }
+
+    /// Custom system prompts that are not the old default must NOT be touched.
+    #[test]
+    fn test_custom_prompt_not_migrated() {
+        let old = r#"{
+            "pet_name": "Xenon",
+            "provider_url": "http://127.0.0.1:8080",
+            "provider_api_key": null,
+            "model_name": "qwen3",
+            "voice_enabled": true,
+            "wake_word_enabled": true,
+            "wake_word": "Xenon",
+            "system_prompt": "You are a helpful pirate. Arrr."
+        }"#;
+        let mut cfg: XenonConfig = serde_json::from_str(old).unwrap();
+        cfg.migrate();
+        assert_eq!(cfg.system_prompt, "You are a helpful pirate. Arrr.");
     }
 
     /// Config files written before the Performance section existed must load

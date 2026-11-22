@@ -7,6 +7,11 @@
 //! - Microphone: AVCaptureDevice requestAccessForMediaType: (AVFoundation).
 //! - Accessibility: AXIsProcessTrustedWithOptions with the prompt option.
 //!
+//! Input Monitoring is NOT queried or requested: it is reported as a static
+//! "not-needed" entry. The cursor is read via `NSEvent::mouseLocation()`
+//! (see `cursor.rs`), which needs no TCC grant, and even a ListenEvent
+//! *preflight* would emit a kTCCServiceListenEvent request in the TCC log.
+//!
 //! The onboarding page and Settings → Permissions surface the real status and
 //! link to the matching System Settings panes. Nothing here writes TCC.
 
@@ -27,6 +32,20 @@ fn screen_capture_granted() -> bool {
     unsafe { CGPreflightScreenCaptureAccess() }
 }
 
+/// Input Monitoring is NOT required: the cursor is read via
+/// `NSEvent::mouseLocation()` (see `cursor.rs`), which needs no TCC grant.
+/// We deliberately do NOT call `CGPreflightListenEventAccess()` — even a
+/// preflight generates a `kTCCServiceListenEvent` request in the TCC log, which
+/// would re-introduce the prompt this change removes. The status line is a
+/// static informational "not needed".
+fn input_monitoring_entry() -> PermissionEntry {
+    PermissionEntry {
+        granted: false,
+        state: "not-needed",
+        requestable: false,
+    }
+}
+
 /// One permission's status: `granted` (bool from the OS), a short `state`
 /// string for the UI ("granted" / "denied" / "not-determined"), and whether
 /// this build can request it in-app (`requestable`).
@@ -45,6 +64,7 @@ pub struct PermissionEntry {
 pub struct PermissionStatus {
     pub accessibility: PermissionEntry,
     pub screen_recording: PermissionEntry,
+    pub input_monitoring: PermissionEntry,
     pub microphone: PermissionEntry,
 }
 
@@ -103,6 +123,7 @@ pub fn get_permissions() -> PermissionStatus {
             state: state_str(screen),
             requestable: true,
         },
+        input_monitoring: input_monitoring_entry(),
         microphone: PermissionEntry {
             granted: mic,
             state: mic_state,
@@ -129,6 +150,12 @@ pub fn request_permission(area: String) -> Result<PermissionEntry, String> {
             unsafe { CGRequestScreenCaptureAccess() };
             let granted = screen_capture_granted();
             Ok(PermissionEntry { granted, state: state_str(granted), requestable: true })
+        }
+        "input" => {
+            // Input Monitoring is NOT required (cursor via NSEvent::mouseLocation).
+            // Never call CGRequestListenEventAccess or CGPreflightListenEventAccess;
+            // report the static "not needed" entry.
+            Ok(input_monitoring_entry())
         }
         "accessibility" => {
             // Prompt the user via the trusted-options API; it opens the
@@ -183,6 +210,9 @@ pub fn open_permission_settings(area: String) -> Result<(), String> {
         "screen" => {
             "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
         }
+        "input" => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+        }
         "microphone" => {
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
         }
@@ -204,6 +234,9 @@ extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     /// Screen Recording request (shows the system prompt / adds the app row).
     fn CGRequestScreenCaptureAccess();
+    /// Input Monitoring is intentionally not queried: even a preflight
+    /// (`CGPreflightListenEventAccess`) emits a kTCCServiceListenEvent request.
+    /// Cursor location uses NSEvent, which needs no grant.
     /// AXIsProcessTrustedWithOptions: options dict with the prompt key.
     fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
 }
@@ -223,11 +256,13 @@ mod tests {
         let status = PermissionStatus {
             accessibility: PermissionEntry { granted: true, state: "granted", requestable: false },
             screen_recording: PermissionEntry { granted: false, state: "denied", requestable: true },
+            input_monitoring: PermissionEntry { granted: false, state: "not-needed", requestable: false },
             microphone: PermissionEntry { granted: false, state: "not-determined", requestable: true },
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("accessibility"));
         assert!(json.contains("screenRecording"));
+        assert!(json.contains("inputMonitoring"));
         assert!(json.contains("microphone"));
         assert!(json.contains("not-determined"));
     }
@@ -243,13 +278,16 @@ mod tests {
     /// The real get_permissions() runs against the OS; on the test host it must
     /// at least not panic and must return a consistent shape.
     #[test]
-    fn real_status_has_all_three_permissions() {
+    fn real_status_has_all_permissions() {
         let s = get_permissions();
         let _ = s.accessibility.granted;
         let _ = s.screen_recording.granted;
+        let _ = s.input_monitoring.granted;
         let _ = s.microphone.granted;
         assert!(!s.accessibility.state.is_empty());
         assert!(!s.screen_recording.state.is_empty());
+        assert!(!s.input_monitoring.state.is_empty());
+        assert_eq!(s.input_monitoring.state, "not-needed");
         assert!(!s.microphone.state.is_empty());
     }
 }

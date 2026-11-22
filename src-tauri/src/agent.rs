@@ -549,6 +549,26 @@ impl Agent {
                     }
                     continue;
                 }
+                // No native tool call: some models (9router combos) emit the
+                // tool call as JSON text in content. Try parsing it as a
+                // fallback before treating the text as the final reply.
+                if let Some(action) = parse_text_action(&content) {
+                    let tool_call = ToolCall {
+                        call_id: uuid::Uuid::new_v4().to_string(),
+                        name: action.name,
+                        args: action.args,
+                    };
+                    self.push_assistant(&mut messages, &content, &tool_call);
+                    let result = self.run_tool(&tool_call, &emit).await;
+                    self.notice_text_only(&emit, &result).await;
+                    let terminal = matches!(tool_call.name.as_str(), "done" | "fail");
+                    push_tool_result(&mut messages, &tool_call, &result, vision)?;
+                    if terminal {
+                        speak_terminal(&emit, &tool_call.name, &result).await;
+                        break;
+                    }
+                    continue;
+                }
                 // No tool call: the streamed text was the final reply.
                 break;
             }
