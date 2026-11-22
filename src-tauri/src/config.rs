@@ -4,6 +4,66 @@ use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-process sequence so concurrent/repeated saves never collide on a temp
+/// file name (`path.with_extension` only sees pid, which is constant).
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A unique temp path next to *path*: `<stem>.tmp.<pid>.<seq>`. Two saves in a
+/// row get different names, so neither can hit `AlreadyExists` on the other's
+/// leftover or an in-flight file.
+pub(crate) fn unique_tmp_path(path: &Path) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
+    path.with_extension(format!("json.tmp.{}.{}", std::process::id(), seq))
+}
+
+/// Create *tmp* exclusively (never truncating an existing file) with mode 0600
+/// on Unix, write *content*, flush it to stable storage (F_FULLFSYNC on macOS,
+/// `sync_all` elsewhere), and return the file.
+pub(crate) fn write_tmp_file(tmp: &Path, content: &[u8]) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    let mut f = fs::OpenOptions::new()
+        .mode(0o600)
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
+    #[cfg(not(unix))]
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
+    use std::io::Write;
+    f.write_all(content)?;
+    f.sync_all()?;
+    fsync_file(&f)?;
+    Ok(f)
+}
+
+/// macOS: force the file's data to stable storage (F_FULLFSYNC). Elsewhere
+/// `sync_all` already did that.
+#[cfg(target_os = "macos")]
+fn fsync_file(f: &fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_FULLFSYNC) };
+    if rc == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fsync_file(_f: &fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Flush the directory holding *path* so a preceding rename is durable. A
+/// failure is a real durability error and must be surfaced to the caller.
+pub(crate) fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)?.sync_all()
+}
 
 /// Default whisper STT model path: on Apple Silicon the large turbo model is
 /// fast enough (Metal); on Intel the GPU backend is broken for large models,
@@ -388,6 +448,12 @@ pub struct XenonConfig {
     pub tavily_key_set: bool,
     #[serde(default)]
     pub serper_key_set: bool,
+    /// Accounts whose plaintext secret could not be persisted to the Keychain
+    /// or fallback file (migration failed). In-memory only: `without_secrets`
+    /// keeps these values so a later `save` cannot drop them. Cleared as each
+    /// secret is stored successfully.
+    #[serde(skip)]
+    pub unpersisted_secrets: std::collections::HashSet<String>,
 }
 
 fn default_max_mcp_tools() -> usize {
@@ -497,6 +563,7 @@ impl Default for XenonConfig {
             brave_key_set: false,
             tavily_key_set: false,
             serper_key_set: false,
+            unpersisted_secrets: std::collections::HashSet::new(),
         }
     }
 }
@@ -539,12 +606,17 @@ impl XenonConfig {
             // Plaintext secrets written by older builds move into the
             // Keychain; then every profile gets its key back from there.
             // If any were actually stored, rewrite config.json immediately so
-            // the plaintext copy does not linger until the next Settings save.
+            // the stored plaintext does not linger until the next Settings
+            // save. Secrets that failed to store stay in the file (tracked in
+            // `unpersisted_secrets`) so no value is lost.
             // Use one store for both migration and hydration (shared cache).
             let store = crate::hub::KeychainStore::for_migration();
             store.migrate_legacy_accounts();
-            let migrated = crate::hub::migrate_plaintext_checked(&mut cfg, &store);
-            if migrated {
+            let outcome = crate::hub::migrate_plaintext_checked(&mut cfg, &store);
+            for account in &outcome.failed {
+                cfg.unpersisted_secrets.insert(account.clone());
+            }
+            if !outcome.stored.is_empty() {
                 if let Err(e) = cfg.save_to(&path) {
                     log::warn!("failed to rewrite config after secret migration: {e}");
                 }
@@ -558,18 +630,32 @@ impl XenonConfig {
 
     /// Copy with every secret removed, so `save` can never write a secret to
     /// disk (provider keys and MCP secret values live in the macOS Keychain).
+    ///
+    /// Exceptions: accounts in `unpersisted_secrets` (a migration/store write
+    /// failed) keep their plaintext value, because it exists nowhere else.
     pub(crate) fn without_secrets(&self) -> Self {
         let mut c = self.clone();
-        c.provider.provider_api_key = None;
+        let unpersisted = &c.unpersisted_secrets;
+        if !unpersisted.contains(crate::hub::PRIMARY_ACCOUNT) {
+            c.provider.provider_api_key = None;
+        }
         for p in &mut c.providers {
-            p.api_key = None;
+            if !unpersisted.contains(&p.name) {
+                p.api_key = None;
+            }
         }
         for s in &mut c.mcp_servers {
             for name in &s.env_secrets {
-                s.env.remove(name);
+                let account = crate::mcp::secret_account(&s.name, name);
+                if !unpersisted.contains(&account) {
+                    s.env.remove(name);
+                }
             }
             for name in &s.header_secrets {
-                s.headers.remove(name);
+                let account = crate::mcp::secret_account(&s.name, name);
+                if !unpersisted.contains(&account) {
+                    s.headers.remove(name);
+                }
             }
         }
         c
@@ -579,33 +665,30 @@ impl XenonConfig {
         self.save_to(&Self::config_path())
     }
 
-    /// Atomic, 0600-from-creation config write: temp file in the same
-    /// directory, fully written and `sync_all`ed, then renamed into place.
+    /// Atomic, 0600-from-creation config write: a unique temp file in the same
+    /// directory, fully written and flushed to stable storage, then renamed
+    /// into place; finally the directory entry is flushed so the rename
+    /// survives a power loss.
     pub(crate) fn save_to(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let content =
             serde_json::to_string_pretty(&self.without_secrets()).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        let write_res = (|| -> std::io::Result<()> {
-            #[cfg(unix)]
-            let mut f = fs::OpenOptions::new()
-                .mode(0o600)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)?;
-            #[cfg(not(unix))]
-            let mut f = fs::File::create(&tmp)?;
-            use std::io::Write;
-            f.write_all(content.as_bytes())?;
-            f.sync_all()?;
-            Ok(())
-        })();
+        let tmp = unique_tmp_path(path);
+        let write_res = write_tmp_file(&tmp, content.as_bytes()).map(|_| ());
         match write_res {
             Ok(()) => match fs::rename(&tmp, path) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    // Flush the directory entry (the rename) as well.
+                    if let Some(parent) = path.parent() {
+                        if let Err(e) = sync_parent_dir(parent) {
+                            log::warn!("config dir sync failed: {e}");
+                            return Err(e.to_string());
+                        }
+                    }
+                    Ok(())
+                }
                 Err(e) => {
                     let _ = fs::remove_file(&tmp);
                     Err(e.to_string())
@@ -738,6 +821,8 @@ mod tests {
     struct FakeStore {
         secrets: Mutex<std::collections::HashMap<String, String>>,
         fail: bool,
+        /// Account ids whose `set` fails (all fail when `fail` is true).
+        fail_accounts: std::collections::HashSet<String>,
     }
 
     impl SecretStore for FakeStore {
@@ -745,7 +830,7 @@ mod tests {
             self.secrets.lock().unwrap().get(account).cloned()
         }
         fn set(&self, account: &str, secret: &str) -> bool {
-            if self.fail {
+            if self.fail || self.fail_accounts.contains(account) {
                 return false;
             }
             self.secrets
@@ -852,6 +937,81 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Partial migration: the secrets that stored are scrubbed from the file,
+    /// the ones that failed stay (no data loss), and `without_secrets` keeps
+    /// exactly the unpersisted values on the next save.
+    #[test]
+    fn test_partial_migration_scrubs_stored_keeps_failed() {
+        let dir = temp_config_dir();
+        let path = dir.join("config.json");
+        fs::write(&path, plaintext_config_json()).unwrap();
+        let mut cfg = load_temp_config(&path);
+        // Only the env secret fails to store.
+        let store = FakeStore {
+            fail_accounts: ["mcp:demo:API_TOKEN".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let outcome = crate::hub::migrate_plaintext_checked(&mut cfg, &store);
+        assert!(outcome.stored.contains(&"Primary".to_string()));
+        assert!(outcome.failed.contains(&"mcp:demo:API_TOKEN".to_string()));
+
+        // Emulate load(): record failures as unpersisted, then rewrite.
+        for account in &outcome.failed {
+            cfg.unpersisted_secrets.insert(account.clone());
+        }
+        cfg.save_to(&path).unwrap();
+
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("sk-plaintext"), "stored provider key must be scrubbed");
+        assert!(!on_disk.contains("sk-header"), "stored header secret must be scrubbed");
+        assert!(on_disk.contains("sk-env"), "failed env secret must survive");
+        assert!(on_disk.contains("keep"));
+
+        // In-memory without_secrets keeps the failed value too.
+        let stripped = cfg.without_secrets();
+        let demo = stripped.mcp_servers.iter().find(|s| s.name == "demo").unwrap();
+        assert_eq!(demo.env.get("API_TOKEN").map(String::as_str), Some("sk-env"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A value that failed to persist must survive later saves, and stop being
+    /// kept once a later store succeeds.
+    #[test]
+    fn test_unpersisted_value_survives_later_saves() {
+        let mut cfg: XenonConfig = serde_json::from_str(plaintext_config_json()).unwrap();
+        cfg.migrate();
+        cfg.unpersisted_secrets.insert("Primary".to_string());
+        assert_eq!(
+            cfg.without_secrets().provider.provider_api_key.as_deref(),
+            Some("sk-plaintext"),
+            "unpersisted provider key must be kept"
+        );
+
+        // A later successful store of the same account clears the marker.
+        cfg.unpersisted_secrets.remove("Primary");
+        assert!(cfg.without_secrets().provider.provider_api_key.is_none());
+    }
+
+    /// F3: two saves in a row both succeed (unique temp names) and leave no
+    /// `.tmp` files behind.
+    #[test]
+    fn test_save_to_unique_temp_names_no_leftovers() {
+        let dir = temp_config_dir();
+        let path = dir.join("config.json");
+        let cfg = XenonConfig::default();
+        cfg.save_to(&path).expect("first save");
+        cfg.save_to(&path).expect("second save");
+        let leftover: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Already-clean configs are never rewritten (mtime unchanged).
     #[test]
     fn test_no_plaintext_leaves_config_untouched() {
@@ -877,8 +1037,7 @@ mod tests {
     /// or pointing at a new provider silently does nothing.
     #[test]
     fn test_config_round_trip() {
-        let dir = std::env::temp_dir().join(format!("xenon-cfg-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_config_dir();
         std::env::set_var("XDG_CONFIG_HOME", &dir);
 
         let mut cfg = XenonConfig {

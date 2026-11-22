@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -38,6 +37,15 @@ pub const PRIMARY_ACCOUNT: &str = "Primary";
 pub const LEGACY_PRIMARY_ACCOUNT: &str = "Primary";
 /// File fallback when Keychain writes fail.
 const SECRETS_FALLBACK_PATH: &str = "secrets.json";
+
+/// Result of moving plaintext secrets out of `config.json`: which accounts are
+/// now durably stored (safe to scrub from the file) and which failed (must
+/// stay in the file so the value is not lost).
+#[derive(Debug, Default)]
+pub struct MigrationOutcome {
+    pub stored: Vec<String>,
+    pub failed: Vec<String>,
+}
 
 /// Minimal secret storage, so migration is unit-testable without touching the
 /// real Keychain.
@@ -198,8 +206,9 @@ impl KeychainStore {
 
     /// Persist every non-empty key in *cfg*, and remove keys for profiles that
     /// no longer exist (deleted/renamed). Renamed profiles: the new name gets
-    /// the key; the old name's key is dropped here.
-    pub fn store_keys(&self, cfg: &XenonConfig) {
+    /// the key; the old name's key is dropped here. Returns the accounts whose
+    /// write failed (their plaintext must stay in config.json).
+    pub fn store_keys(&self, cfg: &XenonConfig) -> std::collections::HashSet<String> {
         let mut wanted: Vec<(String, String)> = Vec::new();
         if let Some(key) = &cfg.provider.provider_api_key {
             if !key.trim().is_empty() {
@@ -213,8 +222,11 @@ impl KeychainStore {
                 }
             }
         }
+        let mut failed = std::collections::HashSet::new();
         for (account, key) in &wanted {
-            self.set(account, key);
+            if !self.set(account, key) {
+                failed.insert(account.clone());
+            }
         }
         // Remove keys for accounts that are no longer present in the config.
         // Legacy "Primary" is allowed to coexist with profile keys.
@@ -235,6 +247,7 @@ impl KeychainStore {
                 }
             }
         }
+        failed
     }
 
     fn write_fallback(&self, account: &str, secret: &str) -> bool {
@@ -243,10 +256,18 @@ impl KeychainStore {
         self.write_fallback_map(&fb)
     }
 
-    /// Atomic, 0600-from-creation write of the fallback file: a temp file is
-    /// created with mode 0600 in the same directory, fully written and
-    /// `sync_all`ed, then renamed over the target. There is no window in which
-    /// the plaintext secrets are world-readable.
+    fn remove_fallback(&self, account: &str) -> bool {
+        let mut fb = self.read_fallback();
+        if fb.remove(account).is_none() {
+            return true; // nothing to do
+        }
+        self.write_fallback_map(&fb)
+    }
+
+    /// Atomic, exclusive, 0600-from-creation write of the fallback file: a
+    /// unique temp file in the same directory, fully written and flushed to
+    /// stable storage, then renamed over the target; the parent directory is
+    /// synced so the rename survives a crash.
     fn write_fallback_map(&self, map: &HashMap<String, String>) -> bool {
         let path = &self.fallback;
         if let Some(parent) = path.parent() {
@@ -256,35 +277,14 @@ impl KeychainStore {
             }
         }
         let json = serde_json::to_string(map).unwrap_or_default();
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        let write_res = (|| -> std::io::Result<()> {
-            #[cfg(unix)]
-            let mut f = {
-                use std::os::unix::fs::OpenOptionsExt;
-                fs::OpenOptions::new()
-                    .mode(0o600)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&tmp)?
-            };
-            #[cfg(not(unix))]
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(json.as_bytes())?;
-            f.sync_all()?;
-            Ok(())
-        })();
-        match write_res {
-            Ok(()) => match fs::rename(&tmp, path) {
-                Ok(()) => true,
-                Err(e) => {
-                    log::error!("failed to commit secrets fallback: {e}");
-                    let _ = fs::remove_file(&tmp);
-                    false
-                }
-            },
+        let tmp = crate::config::unique_tmp_path(path);
+        match crate::config::write_tmp_file(&tmp, json.as_bytes())
+            .and_then(|_| fs::rename(&tmp, path))
+            .and_then(|()| crate::config::sync_parent_dir(path))
+        {
+            Ok(()) => true,
             Err(e) => {
-                log::error!("failed to write secrets fallback: {e}");
+                log::error!("failed to commit secrets fallback: {e}");
                 let _ = fs::remove_file(&tmp);
                 false
             }
@@ -294,22 +294,21 @@ impl KeychainStore {
 
 impl SecretStore for KeychainStore {
     fn get(&self, account: &str) -> Option<String> {
+        // The fallback file takes precedence: when a Keychain write failed the
+        // value landed here, and it must shadow any stale Keychain copy.
+        if let Some(v) = self.read_fallback().get(account) {
+            return Some(v.clone());
+        }
         match self.read_all() {
-            Ok(map) => {
-                if let Some(key) = map.get(account) {
-                    return Some(key.clone());
-                }
-                // Not in the Keychain blob: check the file fallback (merged).
-                self.read_fallback().get(account).cloned()
-            }
+            Ok(map) => map.get(account).cloned(),
             Err(e) => {
-                // Keychain unreadable (e.g. Deny): read the fallback only and
-                // never touch the Keychain item.
+                // Keychain unreadable (e.g. Deny): reads fall back to the file
+                // (already checked above) and never touch the Keychain item.
                 log::warn!(
                     "keychain read failed ({e}); reading {} fallback",
                     SECRETS_FALLBACK_PATH
                 );
-                self.read_fallback().get(account).cloned()
+                None
             }
         }
     }
@@ -324,14 +323,23 @@ impl SecretStore for KeychainStore {
                 {
                     Ok(()) => {
                         self.write_cache(map);
-                        return true;
+                        // Keychain is now authoritative: a stale fallback copy
+                        // must be removed, otherwise `get` (fallback-first)
+                        // would return the old value.
+                        if !self.remove_fallback(account) {
+                            log::error!(
+                                "could not drop stale fallback for {account}; get() would return the old value"
+                            );
+                            return false;
+                        }
+                        true
                     }
                     Err(e) => {
                         log::warn!("Keychain write failed ({e}); using fallback");
+                        // Keychain write failed: persist to the file fallback.
+                        self.write_fallback(account, secret)
                     }
                 }
-                // Keychain write failed: persist to the file fallback (merged).
-                self.write_fallback(account, secret)
             }
             Err(e) => {
                 // Could not read the Keychain: do NOT overwrite the item.
@@ -356,19 +364,13 @@ impl SecretStore for KeychainStore {
                     Ok(()) => self.write_cache(map),
                     Err(e) => log::warn!("keychain delete write failed ({e})"),
                 }
-                // Also drop it from the file fallback so it cannot resurrect.
-                let mut fb = self.read_fallback();
-                fb.remove(account);
-                self.write_fallback_map(&fb);
             }
             Err(e) => {
-                // Unreadable Keychain: only clean the file fallback.
-                let mut fb = self.read_fallback();
-                fb.remove(account);
-                self.write_fallback_map(&fb);
                 log::warn!("keychain read failed ({e}); cleaned fallback only");
             }
         }
+        // Drop it from the file fallback too so it cannot resurrect.
+        self.remove_fallback(account);
     }
 }
 
@@ -378,28 +380,29 @@ impl SecretStore for KeychainStore {
 /// (Production uses `migrate_plaintext_checked`; this remains for tests.)
 #[allow(dead_code)]
 pub fn migrate_plaintext(cfg: &mut XenonConfig, store: &dyn SecretStore) -> bool {
-    migrate_plaintext_inner(cfg, store).0
+    !migrate_plaintext_inner(cfg, store).stored.is_empty()
 }
 
-/// Like `migrate_plaintext`, but also reports whether it is safe to rewrite
-/// config.json: only when something was migrated and nothing failed to store.
-pub fn migrate_plaintext_checked(cfg: &mut XenonConfig, store: &dyn SecretStore) -> bool {
-    let (migrated, all_stored) = migrate_plaintext_inner(cfg, store);
-    migrated && all_stored
+/// Like `migrate_plaintext`, but reports which accounts were stored (safe to
+/// scrub from config.json) and which failed (their plaintext must stay).
+pub fn migrate_plaintext_checked(
+    cfg: &mut XenonConfig,
+    store: &dyn SecretStore,
+) -> MigrationOutcome {
+    migrate_plaintext_inner(cfg, store)
 }
 
-fn migrate_plaintext_inner(cfg: &mut XenonConfig, store: &dyn SecretStore) -> (bool, bool) {
-    let mut migrated = false;
-    let mut all_stored = true;
+fn migrate_plaintext_inner(cfg: &mut XenonConfig, store: &dyn SecretStore) -> MigrationOutcome {
+    let mut out = MigrationOutcome::default();
     if let Some(key) = cfg.provider.provider_api_key.take() {
         if !key.trim().is_empty() {
             if store.set(PRIMARY_ACCOUNT, &key) {
-                migrated = true;
+                out.stored.push(PRIMARY_ACCOUNT.to_string());
             } else {
-                all_stored = false;
                 // No value logged: only the account is diagnostic.
                 log::warn!("could not store legacy flat provider key; keeping it in config.json");
                 cfg.provider.provider_api_key = Some(key);
+                out.failed.push(PRIMARY_ACCOUNT.to_string());
             }
         }
     }
@@ -409,14 +412,14 @@ fn migrate_plaintext_inner(cfg: &mut XenonConfig, store: &dyn SecretStore) -> (b
                 continue;
             }
             if store.set(&profile.name, &key) {
-                migrated = true;
+                out.stored.push(profile.name.clone());
             } else {
-                all_stored = false;
                 log::warn!(
                     "could not store key for profile {}; keeping it in config.json",
                     profile.name
                 );
                 profile.api_key = Some(key);
+                out.failed.push(profile.name.clone());
             }
         }
     }
@@ -427,15 +430,15 @@ fn migrate_plaintext_inner(cfg: &mut XenonConfig, store: &dyn SecretStore) -> (b
             };
             let account = crate::mcp::secret_account(&server.name, name);
             if store.set(&account, &value) {
-                migrated = true;
+                out.stored.push(account);
             } else {
-                all_stored = false;
                 log::warn!(
                     "could not store MCP env secret {} for server {}; keeping it in config.json",
                     name,
                     server.name
                 );
                 server.env.insert(name.clone(), value);
+                out.failed.push(account);
             }
         }
         for name in &server.header_secrets {
@@ -444,19 +447,19 @@ fn migrate_plaintext_inner(cfg: &mut XenonConfig, store: &dyn SecretStore) -> (b
             };
             let account = crate::mcp::secret_account(&server.name, name);
             if store.set(&account, &value) {
-                migrated = true;
+                out.stored.push(account);
             } else {
-                all_stored = false;
                 log::warn!(
                     "could not store MCP header secret {} for server {}; keeping it in config.json",
                     name,
                     server.name
                 );
                 server.headers.insert(name.clone(), value);
+                out.failed.push(account);
             }
         }
     }
-    (migrated, all_stored)
+    out
 }
 
 /// Fill every blank API key from *store* (Keychain on a real run).
@@ -472,10 +475,11 @@ pub fn hydrate(cfg: &mut XenonConfig, store: &dyn SecretStore) {
 }
 
 /// Persist every non-empty key in *cfg* to the Keychain. Called by
-/// `update_config` before the config is written (stripped) to disk.
-pub fn store_keys(cfg: &XenonConfig) {
+/// `update_config` before the config is written (stripped) to disk. Returns
+/// accounts that failed to persist (so `unpersisted_secrets` can keep them).
+pub fn store_keys(cfg: &XenonConfig) -> std::collections::HashSet<String> {
     let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
-    store.store_keys(cfg);
+    store.store_keys(cfg)
 }
 
 /// Read one named secret (MCP env/header values, search API keys).
@@ -484,13 +488,15 @@ pub fn secret_get(account: &str) -> Option<String> {
     store.get(account)
 }
 
-/// Write one named secret (empty value deletes it).
-pub fn secret_set(account: &str, value: &str) {
+/// Write one named secret (empty value deletes it). Returns `true` when a
+/// subsequent `get(account)` would return the new value (Keychain or fallback).
+pub fn secret_set(account: &str, value: &str) -> bool {
     let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
     if value.trim().is_empty() {
         store.delete(account);
+        true
     } else {
-        store.set(account, value);
+        store.set(account, value)
     }
 }
 
@@ -742,6 +748,7 @@ mod tests {
     struct FakeState {
         blob: Option<String>,
         load_fails: bool,
+        store_fails: bool,
         stores: Vec<String>,
     }
     impl FakeBackend {
@@ -750,6 +757,7 @@ mod tests {
                 inner: Mutex::new(FakeState {
                     blob: blob.map(|s| s.to_string()),
                     load_fails: false,
+                    store_fails: false,
                     stores: Vec::new(),
                 }),
             }
@@ -759,6 +767,18 @@ mod tests {
                 inner: Mutex::new(FakeState {
                     blob: None,
                     load_fails: true,
+                    store_fails: false,
+                    stores: Vec::new(),
+                }),
+            }
+        }
+        /// Reads succeed but writes fail (Keychain full/locked).
+        fn store_failing(blob: Option<&str>) -> Self {
+            Self {
+                inner: Mutex::new(FakeState {
+                    blob: blob.map(|s| s.to_string()),
+                    load_fails: false,
+                    store_fails: true,
                     stores: Vec::new(),
                 }),
             }
@@ -775,6 +795,9 @@ mod tests {
         }
         fn store(&self, json: &str) -> Result<(), String> {
             let mut st = self.inner.lock().unwrap();
+            if st.store_fails {
+                return Err("keychain write failed".into());
+            }
             st.blob = Some(json.to_string());
             st.stores.push(json.to_string());
             Ok(())
@@ -845,6 +868,57 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "fallback file must be 0600 from creation");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// F5: when a value is in the fallback file (a Keychain write had failed),
+    /// `get` returns the fallback value even though the Keychain holds a stale
+    /// one. A later successful Keychain write makes the Keychain authoritative
+    /// again by dropping the fallback copy.
+    #[test]
+    fn test_fallback_overrides_stale_keychain() {
+        let store = KeychainStore::with_backend(
+            Arc::new(FakeBackend::new(Some(r#"{"A":"old"}"#))),
+            temp_fallback(),
+        );
+        // A prior failed Keychain write parked the value in the fallback.
+        assert!(store.write_fallback("A", "new"));
+        assert_eq!(store.get("A").as_deref(), Some("new"), "fallback must win");
+
+        // A later Keychain write succeeds: Keychain becomes authoritative and
+        // the fallback copy is removed.
+        assert!(store.set("A", "newest"));
+        assert_eq!(store.get("A").as_deref(), Some("newest"));
+        assert!(
+            !store.read_fallback().contains_key("A"),
+            "stale fallback copy must be removed after a Keychain write"
+        );
+    }
+
+    /// F5: a failed Keychain write that lands in the fallback reports success,
+    /// and `get` returns the new value (fallback-first).
+    #[test]
+    fn test_set_fallback_reports_true_and_get_returns_it() {
+        let store = KeychainStore::with_backend(Arc::new(FakeBackend::store_failing(None)), temp_fallback());
+        assert!(store.set("A", "sk-new"), "fallback store should report success");
+        assert_eq!(store.get("A").as_deref(), Some("sk-new"));
+    }
+
+    /// F3: repeated fallback writes use unique temp names and leave no
+    /// `.tmp` files behind.
+    #[test]
+    fn test_fallback_unique_temp_names_no_leftovers() {
+        let path = temp_fallback();
+        let store = KeychainStore::with_backend(Arc::new(FakeBackend::store_failing(None)), path.clone());
+        assert!(store.set("A", "1"));
+        assert!(store.set("B", "2"));
+        let dir = path.parent().unwrap();
+        let leftover: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
     }
 
     /// R6: deleting/renaming a profile drops its key from the store.

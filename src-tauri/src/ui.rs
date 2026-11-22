@@ -110,10 +110,23 @@ pub async fn update_config(
     config: State<'_, ArcRwLockConfig>,
     new_config: XenonConfig,
 ) -> Result<(), String> {
+    // Persist non-empty API keys first, then strip secrets for disk. Keys the
+    // store could not persist stay in `unpersisted_secrets` so `save` keeps
+    // their plaintext instead of dropping them (F2).
+    let mut new_config = new_config;
+    // Carry over markers from the shared config: a value that failed to persist
+    // earlier (e.g. an MCP env secret) still exists only as plaintext here.
+    {
+        let guard = config.read().await;
+        new_config
+            .unpersisted_secrets
+            .extend(guard.unpersisted_secrets.iter().cloned());
+    }
+    let failed = crate::hub::store_keys(&new_config);
+    for account in failed {
+        new_config.unpersisted_secrets.insert(account);
+    }
     new_config.save().map_err(|e| e.to_string())?;
-    // Persist non-empty API keys to the Keychain before the config (which is
-    // written with secrets stripped) replaces the shared one.
-    crate::hub::store_keys(&new_config);
     let mut guard = config.write().await;
     *guard = new_config;
     let _ = app.emit("pet-config", &*guard);
