@@ -1,6 +1,6 @@
 # PRD conformance — Xenon
 
-Status as of 2026-11-20, branch `feature/xenon-vertical-slice`. Each row maps a
+Status as of 2026-11-22, branch `feature/mcp-and-web-tools`. Each row maps a
 PRD (`Xenon.txt`) requirement to its implementation and the evidence that it
 works. Evidence is either a source file, a passing test, or a measured number
 from `scripts/stress/` (see `docs/stress-report.md`).
@@ -142,6 +142,20 @@ on by default to hold this; turning them off raises it to ~90-94 MB.
 | Phase 2: Audio Pipeline (cpal, whisper-rs, TTS, lip-sync) | ✅ |
 | Phase 3: Xen-Agent (xcap, enigo, ReAct, grounding JSON) | ✅ (llama-cpp-rs native inference ❌) |
 | Phase 4: Optimization & Polish (VAD, hotkeys, build size) | ✅ |
+| Phase 5: Tool ecosystem (MCP + web tools) | ✅ (M1–M4 code-complete; live server suite in M5) |
+
+### Tool ecosystem (M1–M4, M5 partial)
+
+| Requirement | Status | Implementation | Evidence |
+| --- | --- | --- | --- |
+| MCP client (stdio + Streamable HTTP) | ✅ | Hand-rolled JSON-RPC (ADR-0008): `initialize` → `notifications/initialized` → `tools/list` → `tools/call`; stdio + Streamable HTTP; 60 s per-call timeout; restart on crash with 2 s/4 s/8 s backoff | `src-tauri/src/mcp.rs`, `docs/adr/0008-mcp-and-web-tools.md` |
+| Config schema for MCP servers | ✅ | `mcp_servers: Vec<McpServer>` with `name/enabled/transport/command/args/env/env_secrets/url/headers/header_secrets/source`; serde defaults; secrets in Keychain | `config.rs`, `hub.rs` |
+| Lazy start, shutdown on quit | ✅ | Managers built per turn (`build_agent_async`); `StdioConn::Drop` kills child; `mcp_start_at_launch` defaults off | `runtime.rs`, `mcp.rs` |
+| Tool bridging | ✅ | Each MCP tool exposed as `mcp__<server>__<tool>`; `max_mcp_tools` caps only MCP (default 40); built-ins always kept; only `enabled` servers run | `mcp.rs`, `agent.rs`, `tools.rs` |
+| Import from installed apps (read-only) | ✅ | Parsers for Claude Desktop, Claude Code, Cursor, Windsurf, VS Code, OpenCode; `source` retained; UI lists candidates with safe defaults checked; secrets moved to Keychain | `mcp_import.rs`, `settings.html` |
+| Built-in web tools (Hermes-style) | ✅ | `web_search`, `web_extract`, `web_research`, `wikipedia`, `fetch_json`; search order Brave → Tavily → Serper → SearXNG → DuckDuckGo; html→md via `htmd`; r.jina.ai fallback; 8 s timeout, 10 min cache; web_extract concurrency max 5, 10 s per URL, 2 MB cap | `webtools.rs`, `tools.rs`, `Cargo.toml` |
+| Settings UI (Tools & MCP) | ✅ | Toggles, SearXNG/Brave/Tavily/Serper key inputs (Keychain), server list (enable/Test/Remove), add-server form, import panel, `max_mcp_tools`, `mcp_start_at_launch`; vanilla JS, passes `node --check` | `settings.html` |
+| Agent loop calls an MCP tool | 🟡 | Mock stdio server (echo/add) built; `mcp__mock__echo` invoked in unit test; headless live probe (≤10 requests to 9router) **not yet run** — run with: `cargo run --bin xenon -- --agent-task "Search the web: what is the latest stable Rust version? Answer with the version and source."` with `XENON_HOME=/tmp/xenon-mcp-home` and a `9router` profile configured | `src/bin/mcp_mock_server.rs`, `tests/mcp_mock.rs`, `mcp.rs::mock_tests` |
 
 ---
 
@@ -159,9 +173,9 @@ on by default to hold this; turning them off raises it to ~90-94 MB.
 
 | Status | Count |
 | --- | --- |
-| ✅ Done | 34 |
+| ✅ Done | 35 |
 | 🟰 Equivalent | 5 (TTS engine, agent brain, VAD, token→sentence streaming, RAM target) |
-| 🟡 Partial | 2 (RAM total vs < 40 MB process-only; scroll task no `done`) |
+| 🟡 Partial | 3 (RAM total vs < 40 MB process-only; scroll task no `done`; headless MCP probe not yet run) |
 | ❌ Missing | 2 (`llama-cpp-rs` native inference; desktop tasks blocked on test host — code works, permission missing) |
 
 ### Missing / proposed
@@ -175,3 +189,9 @@ on by default to hold this; turning them off raises it to ~90-94 MB.
    Recording permission (code path verified via keyboard/remember tasks). On a
    host with Screen Recording granted, the look/click/grounding tasks should reach
    `done` unchanged.
+3. **Live MCP probe** (M5, optional): run a real server
+   (`npx -y @modelcontextprotocol/server-everything`) and/or headless
+   `9router` agent turn that must call `mcp__mock__echo` / `web_search`. Not
+   blocking — mock-server tests pass and the agent tool loop is exercised in unit
+   tests. To run manually: start `9router`, write a config with the `mcp_mock_server`
+   path, then `--agent-task`.

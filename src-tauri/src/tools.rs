@@ -29,6 +29,8 @@ pub struct ToolContext {
     pub allow_scripts: bool,
     /// `browser_eval` (arbitrary JavaScript) is off by default.
     pub browser_eval: bool,
+    /// Built-in web tools configuration. `None` (tests) registers none.
+    pub web: Option<crate::webtools::WebConfig>,
 }
 
 impl ToolContext {
@@ -1046,6 +1048,13 @@ pub fn create_default_tools(ctx: ToolContext) -> Vec<Box<dyn Tool>> {
         tools.push(Box::new(BrowserTool::new(ctx.clone(), action)));
     }
 
+    // Built-in web tools (web_search / web_extract / web_research / …).
+    if let Some(web) = &ctx.web {
+        if web.enabled {
+            tools.extend(crate::webtools::create_web_tools(web.clone()));
+        }
+    }
+
     if ctx.allow_scripts {
         tools.push(Box::new(crate::scripts::RunScriptTool::new(
             ctx.clone(),
@@ -1080,6 +1089,7 @@ mod tests {
             notes: Arc::new(Mutex::new(Vec::new())),
             allow_scripts: false,
             browser_eval: false,
+            web: None,
         }
     }
 

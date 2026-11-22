@@ -387,6 +387,69 @@
             </div>
         </div>
 
+        <div class="section" id="tools-mcp-section">
+            <h2>Tools &amp; MCP</h2>
+            <div class="hint" style="margin-bottom:12px;">Built-in web tools and Model Context Protocol servers. MCP servers start on the first agent turn; every tool appears as <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>.</div>
+
+            <div class="checkbox-field">
+                <input type="checkbox" id="web_tools_enabled">
+                <label for="web_tools_enabled">Enable built-in web tools (web_search, web_extract, web_research, wikipedia, fetch_json)</label>
+            </div>
+
+            <div class="field">
+                <label for="searxng_url">SearXNG URL (optional)</label>
+                <input type="text" id="searxng_url" placeholder="http://localhost:8080">
+                <div class="hint">Tested before DuckDuckGo. Leave empty to use the public fallback.</div>
+            </div>
+
+            <div class="field">
+                <label>Search API keys (optional, stored in Keychain)</label>
+                <div class="hint">When set, tried before SearXNG / DuckDuckGo. Leave empty to keep using the free fallbacks.</div>
+                <div style="display:grid;gap:8px;margin-top:8px;">
+                    <input type="password" id="brave_key_input" placeholder="Brave Search API key">
+                    <input type="password" id="tavily_key_input" placeholder="Tavily API key">
+                    <input type="password" id="serper_key_input" placeholder="Serper API key">
+                    <button class="secondary btn-sm" id="save-search-keys">Save Search Keys</button>
+                    <div class="hint" id="search-keys-status"></div>
+                </div>
+            </div>
+
+            <div style="margin:16px 0 8px;font-weight:600;">MCP servers</div>
+            <div id="mcp-list"></div>
+            <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+                <button class="secondary btn-sm" id="mcp-refresh">Refresh status</button>
+                <button class="secondary btn-sm" id="mcp-import-toggle">Import from installed apps…</button>
+            </div>
+            <div id="mcp-import-panel" style="display:none;margin-top:12px;padding:12px;background:rgba(255,245,250,0.9);border-radius:8px;border:1px solid rgba(255,170,190,0.4);">
+                <div id="mcp-import-list"></div>
+                <button class="primary btn-sm" id="mcp-import-apply" style="margin-top:8px;">Import selected</button>
+            </div>
+
+            <div class="field" style="margin-top:16px;">
+                <label>Add MCP server</label>
+                <input type="text" id="mcp-new-name" placeholder="Name (e.g. everything)" style="margin-bottom:6px;">
+                <select id="mcp-new-transport" style="margin-bottom:6px;">
+                    <option value="stdio">stdio (command)</option>
+                    <option value="http">Streamable HTTP (url)</option>
+                </select>
+                <input type="text" id="mcp-new-command" placeholder="command (stdio)" style="margin-bottom:6px;">
+                <input type="text" id="mcp-new-args" placeholder="args (space separated, stdio)" style="margin-bottom:6px;">
+                <input type="text" id="mcp-new-url" placeholder="https://example.com/mcp (http)" style="margin-bottom:6px;">
+                <button class="secondary btn-sm" id="mcp-add">Add server</button>
+                <div class="hint" id="mcp-add-status"></div>
+            </div>
+            <div class="field">
+                <label for="max_mcp_tools">Max MCP tools per request</label>
+                <input type="number" id="max_mcp_tools" min="1" max="200" step="1">
+                <div class="hint">Built-in tools are never dropped. Default 40.</div>
+            </div>
+            <div class="checkbox-field">
+                <input type="checkbox" id="mcp_start_at_launch">
+                <label for="mcp_start_at_launch">Start MCP servers at launch (instead of first agent turn)</label>
+            </div>
+            <div class="hint">Secrets (env vars, HTTP headers) live in the Keychain, never in config.json. Use env_names / header_names in the config file and set the values with <code>mcp_set_secret</code> if needed.</div>
+        </div>
+
         <div class="section">
             <h2>Performance</h2>
             <div class="checkbox-field">
@@ -764,6 +827,229 @@
             renderProfiles();
         }
 
+        // ---- Tools & MCP -------------------------------------------------------
+
+        let mcpServers = [];
+
+        function renderMcpList(statuses) {
+            const container = document.getElementById('mcp-list');
+            container.innerHTML = '';
+            if (!mcpServers.length) {
+                container.innerHTML = '<div class="hint">No MCP servers configured yet.</div>';
+                return;
+            }
+            for (let i = 0; i < mcpServers.length; i++) {
+                const s = mcpServers[i];
+                const st = statuses.find(x => x.name === s.name) || {};
+                const card = document.createElement('div');
+                card.className = 'perm-section';
+                card.style.display = 'block';
+
+                const top = document.createElement('div');
+                top.style.display = 'flex';
+                top.style.justifyContent = 'space-between';
+                top.style.gap = '8px';
+
+                const title = document.createElement('div');
+                title.innerHTML = `<div class="perm-label">${s.name} <span style="font-weight:400;color:#9a8a9a;">(${s.transport || 'stdio'})</span></div>
+                    <div class="perm-desc">${st.status || 'unknown'} • ${st.tool_count || 0} tool(s)${st.error ? ' • ' + st.error : ''}</div>`;
+                top.appendChild(title);
+
+                const actions = document.createElement('div');
+                actions.style.display = 'flex';
+                actions.style.gap = '6px';
+
+                const toggle = document.createElement('input');
+                toggle.type = 'checkbox';
+                toggle.checked = s.enabled !== false;
+                toggle.title = 'Enabled';
+                toggle.onchange = () => {
+                    s.enabled = toggle.checked;
+                    updateConfigFieldFromInputs();
+                };
+                actions.appendChild(toggle);
+
+                const testBtn = document.createElement('button');
+                testBtn.className = 'btn-sm secondary';
+                testBtn.textContent = 'Test';
+                testBtn.onclick = () => testMcpServer(s, card);
+                actions.appendChild(testBtn);
+
+                const removeBtn = document.createElement('button');
+                removeBtn.className = 'btn-sm secondary';
+                removeBtn.textContent = '✕';
+                removeBtn.title = 'Remove server';
+                removeBtn.onclick = () => removeMcpServer(s.name, i);
+                actions.appendChild(removeBtn);
+
+                top.appendChild(actions);
+                card.appendChild(top);
+                container.appendChild(card);
+            }
+        }
+
+        async function refreshMcpStatus() {
+            try {
+                const statuses = await invoke('mcp_status');
+                renderMcpList(statuses);
+            } catch (e) {
+                showStatus('MCP status failed: ' + e, true);
+            }
+        }
+
+        async function testMcpServer(server, card) {
+            const desc = card.querySelector('.perm-desc');
+            if (desc) desc.textContent = 'Testing…';
+            try {
+                const r = await invoke('mcp_test', { server });
+                const bits = [r.ok ? 'ok' : 'error', `${r.tool_count} tool(s)`];
+                if (r.error) bits.push(r.error);
+                if (desc) desc.textContent = bits.join(' · ');
+            } catch (e) {
+                if (desc) desc.textContent = 'Test failed: ' + e;
+            }
+        }
+
+        async function removeMcpServer(name, index) {
+            try {
+                await invoke('mcp_remove_server', { name });
+                mcpServers.splice(index, 1);
+                await refreshMcpStatus();
+                updateConfigFieldFromInputs();
+            } catch (e) {
+                showStatus('Remove failed: ' + e, true);
+            }
+        }
+
+        async function loadMcpImportCandidates() {
+            const list = document.getElementById('mcp-import-list');
+            list.innerHTML = '<div class="hint">Loading…</div>';
+            try {
+                const candidates = await invoke('mcp_import_candidates');
+                list.innerHTML = '';
+                if (!candidates.length) {
+                    list.innerHTML = '<div class="hint">No MCP servers found in Claude Desktop, Cursor, VS Code, OpenCode, etc.</div>';
+                    return;
+                }
+                for (const c of candidates) {
+                    const row = document.createElement('label');
+                    row.style.display = 'flex';
+                    row.style.gap = '8px';
+                    row.style.marginBottom = '6px';
+                    const cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.className = 'mcp-import-cb';
+                    cb.checked = c.safe === true;
+                    cb.dataset.payload = JSON.stringify(c.server);
+                    const span = document.createElement('span');
+                    span.innerHTML = `<strong>${c.name}</strong> <span style="color:#9a8a9a;">(${c.source_label})</span><br><span class="hint" style="display:block;">${c.detail}</span>`;
+                    row.appendChild(cb);
+                    row.appendChild(span);
+                    list.appendChild(row);
+                }
+            } catch (e) {
+                list.innerHTML = `<div class="hint">Import discovery failed: ${e}</div>`;
+            }
+        }
+
+        async function applyMcpImport() {
+            const servers = [...document.querySelectorAll('.mcp-import-cb')]
+                .filter(cb => cb.checked)
+                .map(cb => JSON.parse(cb.dataset.payload));
+            if (!servers.length) {
+                showStatus('No servers selected.', true);
+                return;
+            }
+            try {
+                const added = await invoke('mcp_import_servers', { servers });
+                // Refresh local copy.
+                config.mcp_servers = (config.mcp_servers || []).concat(servers);
+                await refreshMcpStatus();
+                updateConfigFieldFromInputs();
+                document.getElementById('mcp-import-panel').style.display = 'none';
+                showStatus(`Imported ${added} server(s).`);
+            } catch (e) {
+                showStatus('Import failed: ' + e, true);
+            }
+        }
+
+        async function addMcpServer() {
+            const name = document.getElementById('mcp-new-name').value.trim();
+            const transport = document.getElementById('mcp-new-transport').value;
+            const command = document.getElementById('mcp-new-command').value.trim();
+            const argsRaw = document.getElementById('mcp-new-args').value.trim();
+            const url = document.getElementById('mcp-new-url').value.trim();
+            const status = document.getElementById('mcp-add-status');
+
+            if (!name) { status.textContent = 'Name required.'; return; }
+            const server = {
+                name,
+                enabled: true,
+                transport,
+                command,
+                args: argsRaw ? argsRaw.split(/\s+/) : [],
+                env: {},
+                env_secrets: [],
+                url,
+                headers: {},
+                header_secrets: [],
+                source: 'manual',
+            };
+            if (transport === 'stdio' && !command) { status.textContent = 'Command required for stdio.'; return; }
+            if (transport === 'http' && !url) { status.textContent = 'URL required for http.'; return; }
+
+            // Test first.
+            status.textContent = 'Testing…';
+            try {
+                const r = await invoke('mcp_test', { server });
+                if (!r.ok) {
+                    status.textContent = 'Test failed: ' + (r.error || 'unknown');
+                    return;
+                }
+                // Persist by writing the whole config (same save flow as the rest of settings).
+                config.mcp_servers = (config.mcp_servers || []).concat([server]);
+                config.mcp_start_at_launch = document.getElementById('mcp_start_at_launch')?.checked ?? false;
+                config.max_mcp_tools = Number(document.getElementById('max_mcp_tools')?.value) || 40;
+                config.web_tools_enabled = document.getElementById('web_tools_enabled').checked;
+                config.searxng_url = document.getElementById('searxng_url').value.trim();
+                await invoke('update_config', { newConfig: config });
+                await refreshMcpStatus();
+                updateConfigFieldFromInputs();
+                status.textContent = `Added ${name} (${r.tool_count} tools).`;
+                document.getElementById('mcp-new-name').value = '';
+                document.getElementById('mcp-new-command').value = '';
+                document.getElementById('mcp-new-args').value = '';
+                document.getElementById('mcp-new-url').value = '';
+            } catch (e) {
+                status.textContent = 'Add failed: ' + e;
+            }
+        }
+
+        async function saveSearchKeys() {
+            const status = document.getElementById('search-keys-status');
+            try {
+                for (const kind of ['brave', 'tavily', 'serper']) {
+                    const input = document.getElementById(`${kind}_key_input`);
+                    await invoke('set_search_key', { kind, value: input.value });
+                    input.value = '';
+                }
+                status.textContent = 'Saved to Keychain.';
+            } catch (e) {
+                status.textContent = 'Save failed: ' + e;
+            }
+        }
+
+        function updateConfigFieldFromInputs() {
+            if (!config) return;
+            config.mcp_servers = mcpServers;
+            config.web_tools_enabled = document.getElementById('web_tools_enabled').checked;
+            config.searxng_url = document.getElementById('searxng_url').value.trim();
+            const maxInput = document.getElementById('max_mcp_tools');
+            if (maxInput) config.max_mcp_tools = Number(maxInput.value) || 40;
+            const startInput = document.getElementById('mcp_start_at_launch');
+            if (startInput) config.mcp_start_at_launch = startInput.checked;
+        }
+
         // ---- Config load / save ----------------------------------------------
 
         async function loadConfig() {
@@ -812,6 +1098,18 @@
                 document.getElementById('auto_check_updates').checked = config.auto_check_updates !== false;
                 document.getElementById('browser_eval_enabled').checked = config.browser_eval_enabled === true;
                 document.getElementById('allow_scripts').checked = config.allow_scripts === true;
+                document.getElementById('web_tools_enabled').checked = config.web_tools_enabled !== false;
+                document.getElementById('searxng_url').value = config.searxng_url || '';
+
+                // Tools & MCP
+                mcpServers.length = 0;
+                mcpServers.push(...(config.mcp_servers || []));
+                const startEl = document.getElementById('mcp_start_at_launch');
+                if (startEl) startEl.checked = config.mcp_start_at_launch === true;
+                const maxEl = document.getElementById('max_mcp_tools');
+                if (maxEl) maxEl.value = config.max_mcp_tools ?? 40;
+                renderMcpList([]);
+                refreshMcpStatus();
 
                 renderRoleSelects();
                 renderProfiles();
@@ -898,6 +1196,9 @@
             config.auto_check_updates = document.getElementById('auto_check_updates').checked;
             config.browser_eval_enabled = document.getElementById('browser_eval_enabled').checked;
             config.allow_scripts = document.getElementById('allow_scripts').checked;
+            config.web_tools_enabled = document.getElementById('web_tools_enabled').checked;
+            config.searxng_url = document.getElementById('searxng_url').value.trim();
+            updateConfigFieldFromInputs();
             collectRoles();
 
             try {
@@ -1058,6 +1359,26 @@
                 status.textContent = 'Saved ' + result.wav + ' — transcript: ' + result.transcript;
             } catch (e) { status.textContent = 'Clone recording failed: ' + e; }
         });
+
+        // ---- Tools & MCP handlers --------------------------------------------
+
+        document.getElementById('mcp-refresh').addEventListener('click', refreshMcpStatus);
+        document.getElementById('save-search-keys').addEventListener('click', saveSearchKeys);
+        document.getElementById('mcp-add').addEventListener('click', addMcpServer);
+        document.getElementById('mcp-import-toggle').addEventListener('click', () => {
+            const panel = document.getElementById('mcp-import-panel');
+            const showing = panel.style.display !== 'none';
+            panel.style.display = showing ? 'none' : 'block';
+            if (!showing) loadMcpImportCandidates();
+        });
+        document.getElementById('mcp-import-apply').addEventListener('click', applyMcpImport);
+        document.getElementById('mcp-new-transport').addEventListener('change', (e) => {
+            const isHttp = e.target.value === 'http';
+            document.getElementById('mcp-new-command').style.display = isHttp ? 'none' : '';
+            document.getElementById('mcp-new-args').style.display = isHttp ? 'none' : '';
+            document.getElementById('mcp-new-url').style.display = isHttp ? '' : 'none';
+        });
+
         // ---- Permissions ------------------------------------------------------
 
         function permText(entry) {

@@ -151,6 +151,7 @@ mod tests {
             notes: Arc::new(Mutex::new(Vec::new())),
             allow_scripts: false,
             browser_eval: false,
+            web: None,
         }
     }
 

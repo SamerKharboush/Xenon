@@ -14,10 +14,39 @@ use crate::tts::Tts;
 /// Build the agent used by both the pet runtime and the headless task runner.
 /// Each role gets its assigned profile first, then the remaining profiles as
 /// fallbacks (fallback order is preserved, ADR-0003).
+#[allow(dead_code)]
 pub fn build_agent(
     cfg: &XenonConfig,
     app: Option<AppHandle>,
     abort: Arc<AtomicBool>,
+) -> Agent {
+    build_agent_inner(cfg, app, abort, Vec::new())
+}
+
+/// Like [`build_agent`], but also connects enabled MCP servers and bridges
+/// their tools. Used by the pet runtime and the headless runner; tests use the
+/// sync `build_agent` (no MCP) or construct `Agent` directly.
+pub async fn build_agent_async(
+    cfg: &XenonConfig,
+    app: Option<AppHandle>,
+    abort: Arc<AtomicBool>,
+) -> Agent {
+    let mut extra: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+    if cfg.mcp_servers.iter().any(|s| s.enabled) {
+        let manager = crate::mcp::build_manager(cfg.mcp_servers.clone(), cfg.max_mcp_tools);
+        let descs = manager.discover().await;
+        if !descs.is_empty() {
+            extra = crate::mcp::build_tools(manager, descs);
+        }
+    }
+    build_agent_inner(cfg, app, abort, extra)
+}
+
+fn build_agent_inner(
+    cfg: &XenonConfig,
+    app: Option<AppHandle>,
+    abort: Arc<AtomicBool>,
+    extra_tools: Vec<Box<dyn crate::tools::Tool>>,
 ) -> Agent {
     let chain = |role: crate::config::Role| -> Arc<dyn Provider> {
         let profiles = cfg.role_profiles(role);
@@ -45,6 +74,17 @@ pub fn build_agent(
     ));
 
     let notes: tools::Notes = Arc::new(Mutex::new(Vec::new()));
+    let web = if cfg.web_tools_enabled {
+        Some(crate::webtools::WebConfig {
+            enabled: true,
+            searxng_url: cfg.searxng_url.clone(),
+            brave_key: crate::hub::secret_get("search:brave"),
+            tavily_key: crate::hub::secret_get("search:tavily"),
+            serper_key: crate::hub::secret_get("search:serper"),
+        })
+    } else {
+        None
+    };
     let ctx = tools::ToolContext {
         app,
         provider: Some(vision_provider),
@@ -53,11 +93,14 @@ pub fn build_agent(
         notes: notes.clone(),
         allow_scripts: cfg.allow_scripts,
         browser_eval: cfg.browser_eval_enabled,
+        web,
     };
+    let mut all_tools = tools::create_default_tools(ctx);
+    all_tools.extend(extra_tools);
     Agent::with_roles(
         agent_provider,
         chat_provider,
-        tools::create_default_tools(ctx),
+        all_tools,
         cfg.clone(),
         abort,
         notes,
@@ -344,7 +387,7 @@ impl Runtime {
         app: &Option<AppHandle>,
     ) {
         let cfg = config.read().await.clone();
-        let agent = build_agent(&cfg, app.clone(), abort.clone());
+        let agent = build_agent_async(&cfg, app.clone(), abort.clone()).await;
 
         if let Err(e) = agent.run_utterance(text, action_tx.clone()).await {
             log::error!("Agent error: {}", e);

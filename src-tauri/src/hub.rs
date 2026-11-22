@@ -219,6 +219,11 @@ impl KeychainStore {
                 if account == LEGACY_PRIMARY_ACCOUNT || account == PRIMARY_ACCOUNT {
                     continue;
                 }
+                // MCP / search-API secrets are managed independently (Settings),
+                // never dropped by a provider-profile save.
+                if account.starts_with("mcp:") || account.starts_with("search:") {
+                    continue;
+                }
                 if !keep.contains(account.as_str()) {
                     self.delete(account);
                 }
@@ -403,6 +408,28 @@ pub fn hydrate_keys(cfg: &mut XenonConfig) {
 pub fn store_keys(cfg: &XenonConfig) {
     let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
     store.store_keys(cfg);
+}
+
+/// Read one named secret (MCP env/header values, search API keys).
+pub fn secret_get(account: &str) -> Option<String> {
+    let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
+    store.get(account)
+}
+
+/// Write one named secret (empty value deletes it).
+pub fn secret_set(account: &str, value: &str) {
+    let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
+    if value.trim().is_empty() {
+        store.delete(account);
+    } else {
+        store.set(account, value);
+    }
+}
+
+/// Remove one named secret.
+pub fn secret_delete(account: &str) {
+    let store = KeychainStore::with_backend(Arc::new(MacBackend), KeychainStore::fallback_path());
+    store.delete(account);
 }
 
 /// Result of the Settings "Test" button for one profile.

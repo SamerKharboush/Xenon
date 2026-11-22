@@ -8,6 +8,9 @@ mod events;
 mod grounding;
 mod headless;
 mod hub;
+mod mcp;
+mod mcp_import;
+mod mcpui;
 mod permissions;
 mod presets;
 mod provider;
@@ -19,6 +22,7 @@ mod tts;
 mod ui;
 mod updater;
 mod voice;
+mod webtools;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager, Runtime as TauriRuntime};
@@ -30,6 +34,13 @@ use runtime::Runtime;
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Built-in mock MCP server (tests spawn `xenon --mcp-mock-server` and speak
+    // JSON-RPC over stdin/stdout). Must run before any config or Tauri init.
+    if std::env::args().any(|a| a == "--mcp-mock-server") {
+        mcp::mock::run();
+        std::process::exit(0);
+    }
 
     // Loaded here (not only in setup) so the Performance toggles can pick the
     // tokio worker count before any async runtime exists.
@@ -215,6 +226,14 @@ fn main() -> anyhow::Result<()> {
             voice::record_clone,
             voice::open_typed_message,
             voice::set_typing,
+            mcpui::mcp_status,
+            mcpui::mcp_test,
+            mcpui::mcp_import_candidates,
+            mcpui::mcp_import_servers,
+            mcpui::mcp_remove_server,
+            mcpui::mcp_set_secret,
+            mcpui::set_search_key,
+            mcpui::tools_config,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

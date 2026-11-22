@@ -150,6 +150,65 @@ impl ProviderProfile {
     }
 }
 
+/// One MCP (Model Context Protocol) server the user enabled. Secrets (env
+/// values, HTTP headers) are never stored here: `env_secrets` / `header_secrets`
+/// name the keys whose values live in the Keychain (`mcp:<server>:<NAME>`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServer {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// "stdio" or "http".
+    #[serde(default = "default_mcp_transport")]
+    pub transport: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Plain env values (safe to keep in config.json).
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Env var names whose values live in the Keychain, not in config.json.
+    #[serde(default)]
+    pub env_secrets: Vec<String>,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Header names whose values live in the Keychain.
+    #[serde(default)]
+    pub header_secrets: Vec<String>,
+    /// "manual", or the app this server was imported from ("claude-desktop"…).
+    #[serde(default = "default_mcp_source")]
+    pub source: String,
+}
+
+fn default_mcp_transport() -> String {
+    "stdio".to_string()
+}
+
+fn default_mcp_source() -> String {
+    "manual".to_string()
+}
+
+impl Default for McpServer {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            transport: default_mcp_transport(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            env_secrets: Vec::new(),
+            url: String::new(),
+            headers: Default::default(),
+            header_secrets: Vec::new(),
+            source: default_mcp_source(),
+        }
+    }
+}
+
 /// Which profile fills which agent role. Empty string = use the primary
 /// (first in fallback order) profile.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -302,6 +361,34 @@ pub struct XenonConfig {
     /// macOS system voice for the `say` fallback (empty = system default).
     #[serde(default)]
     pub system_voice: String,
+    // --- tools ---
+    /// MCP servers the user enabled. Empty = built-in tools only.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServer>,
+    /// Start enabled MCP servers at launch instead of on the first agent turn.
+    #[serde(default)]
+    pub mcp_start_at_launch: bool,
+    /// Cap on MCP tools sent per request (built-ins are never dropped).
+    #[serde(default = "default_max_mcp_tools")]
+    pub max_mcp_tools: usize,
+    /// Built-in web tools (web_search / web_extract / web_research / …).
+    #[serde(default = "default_true")]
+    pub web_tools_enabled: bool,
+    /// Optional SearXNG base URL used before the public fallbacks.
+    #[serde(default)]
+    pub searxng_url: String,
+    /// Search API keys live in the Keychain; these hold only the fact that one
+    /// is configured (`true`) so Settings can show "key set" without a value.
+    #[serde(default)]
+    pub brave_key_set: bool,
+    #[serde(default)]
+    pub tavily_key_set: bool,
+    #[serde(default)]
+    pub serper_key_set: bool,
+}
+
+fn default_max_mcp_tools() -> usize {
+    40
 }
 
 fn default_true() -> bool {
@@ -399,6 +486,14 @@ impl Default for XenonConfig {
             click_to_talk: true,
             wake_model_path: default_wake_model_path(),
             system_voice: String::new(),
+            mcp_servers: Vec::new(),
+            mcp_start_at_launch: false,
+            max_mcp_tools: default_max_mcp_tools(),
+            web_tools_enabled: true,
+            searxng_url: String::new(),
+            brave_key_set: false,
+            tavily_key_set: false,
+            serper_key_set: false,
         }
     }
 }

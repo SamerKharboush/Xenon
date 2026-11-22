@@ -6,6 +6,10 @@ authors = ["Xenon contributors"]
 license = "MIT"
 edition = "2021"
 rust-version = "1.75"
+# Only the package binary (`xenon`, from `src/main.rs`) is built into bundles.
+# The mock MCP server runs in-process via `current_exe() --mcp-mock-server`,
+# so no extra bins exist to leak into `Xenon.app/Contents/MacOS/`.
+autobins = false
 
 [lib]
 name = "xenon_lib"
@@ -72,6 +76,11 @@ semver = "1.0"
 sha2 = "0.10"
 # API keys in the macOS Keychain (never in config.json).
 keyring = { version = "3", features = ["apple-native"] }
+
+# MCP (Model Context Protocol) client: stdio + Streamable HTTP, hand-rolled
+# JSON-RPC (no GPL, no heavy framework; rmcp would add ~336 crates).
+# HTML -> Markdown for the web_extract tool (Apache-2.0, NOT GPL html2md).
+htmd = "0.6"
 
 # Global cursor position for click-through hit-testing.
 # CGEventGetLocation needs no Accessibility grant (unlike enigo input synthesis).

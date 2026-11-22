@@ -27,8 +27,12 @@ fn tool_hint(tools: &[Box<dyn Tool>], vision: bool) -> String {
     format!(
         "\n\nYou have computer-control tools: {}. \
          Call look to see the screen. Describe click targets in words (e.g. \"the blue \
-         Spotify icon\"). {verify} Keep going until the user's request is done, then call done \
-         with a short summary (or fail with the reason).",
+         Spotify icon\"). {verify} \
+         Web tools: prefer web_research for factual or current questions — it reads \
+         several sources and returns cited findings; use web_search for a quick list of \
+         results, web_extract to read a page, wikipedia for background, fetch_json for APIs. \
+         Keep going until the user's request is done, then call done with a short summary \
+         (or fail with the reason).",
         names.join(", ")
     )
 }
@@ -58,6 +62,9 @@ fn action_protocol_hint(tools: &[Box<dyn Tool>], vision: bool) -> String {
          for text descriptions, and each tool's summary to verify. Call \"done\" with a short \
          summary when the task is complete, or \"fail\" with the reason if it cannot be done."
     });
+    if tools.iter().any(|t| t.name() == "web_research") {
+        s.push_str(" For factual or current questions prefer web_research; it returns cited sources you must mention.");
+    }
     s
 }
 

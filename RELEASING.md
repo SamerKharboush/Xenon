@@ -52,6 +52,11 @@ match it. The release workflow **fails** if a tag's version differs from
     scripts/make-dmg.sh src-tauri/target/release/bundle/macos/Xenon.app dist/Xenon_local.dmg
     ```
 
+    Only the `xenon` binary is bundled (`autobins = false` in `Cargo.toml`);
+    the mock MCP server used by tests runs via `xenon --mcp-mock-server`, so
+    `Xenon.app/Contents/MacOS/` stays clean and `codesign` succeeds. CI runs
+    `cargo test` (mock tests included) before any bundle step.
+
     > Users upgrading from v0.2.0 must re-grant Microphone and Screen Recording
     > once: the earlier build was cdhash-signed, so macOS treats it as a
     > different app. This is a one-time step.

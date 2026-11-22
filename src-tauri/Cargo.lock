@@ -1398,6 +1398,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "ego-tree"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bd50d24b1b75aa817bb0339cb9f2e0e664bdfab1e160a69a0fda9145b77fab2"
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2228,6 +2234,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
+]
+
+[[package]]
+name = "htmd"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d39c7ad9c654a43bdc1235259b4e78c84406576b231c1ac37cd06e0af878250"
+dependencies = [
+ "ego-tree",
+ "html5ever 0.40.1",
 ]
 
 [[package]]
@@ -7322,6 +7338,7 @@ dependencies = [
  "futures",
  "futures-core",
  "futures-util",
+ "htmd",
  "image",
  "keyring",
  "log",

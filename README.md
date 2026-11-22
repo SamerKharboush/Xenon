@@ -57,6 +57,12 @@ in [`docs/prd-conformance.md`](docs/prd-conformance.md).
 - **Provider Hub** — OpenAI-compatible profiles with configurable fallback
   order, vision model per profile, and one-click presets (see
   [Providers](#providers)).
+- **Tool ecosystem** — MCP client (stdio + Streamable HTTP) with lazy start,
+  per-server secrets in Keychain, and read-only import from Claude Desktop,
+  Claude Code, Cursor, Windsurf, VS Code and OpenCode; built-in web tools
+  (`web_search`, `web_extract`, `web_research`, `wikipedia`, `fetch_json`)
+  with no key needed (DuckDuckGo → Brave/Tavily/Serper/SearXNG order).
+  Settings → **Tools & MCP**. See [docs/adr/0008](docs/adr/0008-mcp-and-web-tools.md).
 - **Performance-minded by default** — 320×320 light sprites, lazy audio, a
   15 FPS idle canvas, 2-worker tokio, and on-demand Settings/Onboarding
   windows. Idle footprint lands under 100 MB (see [Memory](#memory)).
@@ -265,6 +271,11 @@ Real-model tests are marked `#[ignore]`:
 ```bash
 cargo test -- --ignored
 ```
+
+The mock MCP server (used by `mcp.rs` unit tests and `tests/mcp_mock.rs`) is
+not a separate binary: tests spawn `xenon --mcp-mock-server` (the test-built
+`xenon` bin) and speak JSON-RPC over stdio. This keeps `Xenon.app/Contents/
+MacOS/` clean — only `xenon` is bundled, so codesign succeeds.
 
 ### Stress harnesses
 

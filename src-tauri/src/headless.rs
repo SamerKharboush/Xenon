@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use crate::agent::Agent;
 use crate::config::XenonConfig;
 use crate::events::{AgentAction, PetState};
-use crate::runtime::build_agent;
+use crate::runtime::build_agent_async;
 
 /// Parse `--agent-task` / `--profile`. `Some(code)` means headless mode ran and
 /// this is the process exit code.
@@ -63,7 +63,7 @@ fn run(task: &str, profile: Option<&str>, cfg: &XenonConfig) -> i32 {
     let outcome_reader = outcome.clone();
 
     rt.block_on(async move {
-        let agent: Agent = build_agent(&cfg, None, Arc::new(AtomicBool::new(false)));
+        let agent: Agent = build_agent_async(&cfg, None, Arc::new(AtomicBool::new(false))).await;
         let (tx, rx) = async_channel::bounded(64);
 
         let printer_outcome = outcome.clone();
